@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::Read,
+    io::{ErrorKind, Read},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread::{self, JoinHandle},
@@ -11,7 +11,8 @@ use signal_listener::{
 };
 
 use crate::{
-    Configuration, Error, RecordingAudioFormat, RecordingLogHeader, RecordingLogWriter, Result,
+    Configuration, Error, RecordingAudioFormat, RecordingLog, RecordingLogHeader,
+    RecordingLogWriter, RecoveredRecordingLog, Result,
 };
 
 pub trait AudioCaptureBackend {
@@ -86,6 +87,14 @@ impl CaptureStore {
         Ok(())
     }
 
+    pub fn recover_recording_logs(&self) -> Result<RecoveredCaptureRecordings> {
+        self.recording_logs()?.recover()
+    }
+
+    pub fn next_session_value_after_existing_artifacts(&self) -> Result<u64> {
+        self.recording_logs()?.next_session_value()
+    }
+
     pub fn artifact_for_session(&self, session: &CaptureSession) -> DurableAudioArtifact {
         let file_name = format!("capture-{}.listenerlog", session.value());
         DurableAudioArtifact::new(AudioArtifactPath::new(WirePath::new(
@@ -100,6 +109,127 @@ impl CaptureStore {
         let mut path = PathBuf::from(artifact.path().as_str());
         path.set_extension("raw.s16le");
         path
+    }
+
+    fn recording_logs(&self) -> Result<CaptureStoreRecordingLogs> {
+        let entries = match fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok(CaptureStoreRecordingLogs::empty());
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if CaptureArtifactPathCandidate::new(&path).is_listener_log() {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        Ok(CaptureStoreRecordingLogs::new(paths))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveredCaptureRecordings {
+    recordings: Vec<RecoveredRecordingLog>,
+    next_session_value: u64,
+}
+
+impl RecoveredCaptureRecordings {
+    pub fn empty() -> Self {
+        Self {
+            recordings: Vec::new(),
+            next_session_value: 1,
+        }
+    }
+
+    fn new(recordings: Vec<RecoveredRecordingLog>, next_session_value: u64) -> Self {
+        Self {
+            recordings,
+            next_session_value,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[RecoveredRecordingLog] {
+        self.recordings.as_slice()
+    }
+
+    pub fn next_session_value(&self) -> u64 {
+        self.next_session_value
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaptureStoreRecordingLogs {
+    paths: Vec<PathBuf>,
+}
+
+impl CaptureStoreRecordingLogs {
+    fn empty() -> Self {
+        Self { paths: Vec::new() }
+    }
+
+    fn new(paths: Vec<PathBuf>) -> Self {
+        Self { paths }
+    }
+
+    fn recover(&self) -> Result<RecoveredCaptureRecordings> {
+        let next_session_value = self.next_session_value()?;
+        let mut recordings = Vec::new();
+        for path in &self.paths {
+            if path.is_file() {
+                recordings.push(RecordingLog::new(path).recover()?);
+            }
+        }
+        Ok(RecoveredCaptureRecordings::new(
+            recordings,
+            next_session_value,
+        ))
+    }
+
+    fn next_session_value(&self) -> Result<u64> {
+        let latest_session_value = self
+            .paths
+            .iter()
+            .filter_map(|path| CaptureArtifactPathCandidate::new(path).session_value())
+            .max();
+        match latest_session_value {
+            Some(value) => value
+                .checked_add(1)
+                .ok_or(Error::CaptureSessionSequenceExhausted {
+                    last_session: value,
+                }),
+            None => Ok(1),
+        }
+    }
+}
+
+struct CaptureArtifactPathCandidate<'a> {
+    path: &'a Path,
+}
+
+impl<'a> CaptureArtifactPathCandidate<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self { path }
+    }
+
+    fn is_listener_log(&self) -> bool {
+        self.path
+            .extension()
+            .is_some_and(|extension| extension == "listenerlog")
+    }
+
+    fn session_value(&self) -> Option<u64> {
+        let file_name = self.path.file_name()?.to_str()?;
+        file_name
+            .strip_prefix("capture-")?
+            .strip_suffix(".listenerlog")?
+            .parse()
+            .ok()
     }
 }
 

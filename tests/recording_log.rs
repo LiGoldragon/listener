@@ -5,7 +5,7 @@ use std::{
 };
 
 use listener::{
-    RecordingAudioFormat, RecordingInputSource, RecordingLog, RecordingLogHeader,
+    Error, RecordingAudioFormat, RecordingInputSource, RecordingLog, RecordingLogHeader,
     RecordingLogWriter, RecordingSampleFormat, RecordingStartTime,
 };
 use signal_listener::CaptureSession;
@@ -77,6 +77,31 @@ fn header_and_complete_records_recover() {
     assert_eq!(
         fs::read(export.path()).expect("raw bytes"),
         vec![0, 1, 2, 3, 4, 5, 6, 7]
+    );
+}
+
+#[test]
+fn create_refuses_existing_listenerlog_without_truncating() {
+    let fixture = RecordingLogFixture::new();
+    let path = fixture.path();
+    let mut writer = RecordingLogWriter::create(&path, fixture.header()).expect("create log");
+    writer
+        .append_record(&[0, 1, 2, 3])
+        .expect("append complete record");
+    writer.finish().expect("finish log");
+    let original_bytes = fs::read(&path).expect("original log bytes");
+
+    match RecordingLogWriter::create(&path, fixture.header()) {
+        Err(Error::RecordingLogAlreadyExists { path: error_path }) => {
+            assert_eq!(error_path, path.display().to_string());
+        }
+        Err(error) => panic!("expected existing recording log error, got {error}"),
+        Ok(_) => panic!("expected existing recording log creation to fail"),
+    }
+
+    assert_eq!(
+        fs::read(&path).expect("log bytes after refused create"),
+        original_bytes
     );
 }
 

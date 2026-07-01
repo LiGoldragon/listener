@@ -48,6 +48,9 @@ pub enum Error {
     #[error("capture session mismatch: active {active}, requested {requested}")]
     CaptureSessionMismatch { active: u64, requested: u64 },
 
+    #[error("capture session sequence exhausted after {last_session}")]
+    CaptureSessionSequenceExhausted { last_session: u64 },
+
     #[error("audio backend unavailable: {message}")]
     AudioBackendUnavailable { message: String },
 
@@ -62,6 +65,9 @@ pub enum Error {
 
     #[error("invalid recording log at {path}: {message}")]
     InvalidRecordingLog { path: String, message: String },
+
+    #[error("recording log already exists: {path}")]
+    RecordingLogAlreadyExists { path: String },
 
     #[error(
         "incomplete PCM frame: {remaining_bytes} trailing bytes for {bytes_per_frame}-byte frames"
@@ -99,5 +105,15 @@ impl Error {
             path: path.display().to_string(),
             message: message.into(),
         }
+    }
+
+    pub fn recording_log_already_exists(path: &Path) -> Self {
+        Self::RecordingLogAlreadyExists {
+            path: path.display().to_string(),
+        }
+    }
+
+    pub fn is_recording_log_already_exists(&self) -> bool {
+        matches!(self, Self::RecordingLogAlreadyExists { .. })
     }
 }

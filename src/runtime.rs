@@ -7,7 +7,8 @@ use signal_listener::{
 
 use crate::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureStore, Configuration,
-    ConfiguredBatchTranscriber, Error, OutputTargetDispatcher, RecordingLog, Result,
+    ConfiguredBatchTranscriber, Error, OutputTargetDispatcher, RecordingLog,
+    RecoveredCaptureRecordings, Result,
 };
 use crate::{
     BatchTranscriber, BatchTranscriptionInput, BatchTranscriptionRequest,
@@ -22,6 +23,7 @@ pub struct ListenerRuntime {
     output_target_dispatcher: OutputTargetDispatcher,
     session_sequence: CaptureSessionSequence,
     active_capture: Option<RuntimeActiveCapture>,
+    orphaned_recordings: RecoveredCaptureRecordings,
 }
 
 impl ListenerRuntime {
@@ -49,6 +51,7 @@ impl ListenerRuntime {
             output_target_dispatcher,
             session_sequence: CaptureSessionSequence::new(1),
             active_capture: None,
+            orphaned_recordings: RecoveredCaptureRecordings::empty(),
         }
     }
 
@@ -74,22 +77,8 @@ impl ListenerRuntime {
         }
 
         self.capture_store.prepare()?;
-        let session = self.session_sequence.next_session();
-        let artifact = self.capture_store.artifact_for_session(&session);
-        let capture = self.capture_backend.start(AudioCaptureStart::new(
-            session.clone(),
-            artifact.clone(),
-            self.configuration.input_source(),
-        ))?;
-        self.active_capture = Some(RuntimeActiveCapture::new(
-            session.clone(),
-            artifact,
-            capture,
-        ));
-
-        Ok(Output::Started(CaptureStarted::new(StartedSession::new(
-            session,
-        ))))
+        self.recover_orphaned_recordings()?;
+        self.start_next_available_capture()
     }
 
     pub fn stop(&mut self, request: StopCapture) -> Result<Output> {
@@ -135,13 +124,60 @@ impl ListenerRuntime {
         }))
     }
 
-    pub fn status(&self, _request: StatusRequest) -> Result<Output> {
+    pub fn status(&mut self, _request: StatusRequest) -> Result<Output> {
+        if self.active_capture.is_none() {
+            self.recover_orphaned_recordings()?;
+        }
+
         Ok(Output::status_reported(
             self.active_capture
                 .as_ref()
                 .map(RuntimeActiveCapture::status)
                 .unwrap_or(CaptureStatus::Idle),
         ))
+    }
+
+    pub fn orphaned_recordings(&self) -> &RecoveredCaptureRecordings {
+        &self.orphaned_recordings
+    }
+
+    fn recover_orphaned_recordings(&mut self) -> Result<()> {
+        let orphaned_recordings = self.capture_store.recover_recording_logs()?;
+        self.session_sequence
+            .advance_to_at_least(orphaned_recordings.next_session_value());
+        self.orphaned_recordings = orphaned_recordings;
+        Ok(())
+    }
+
+    fn start_next_available_capture(&mut self) -> Result<Output> {
+        loop {
+            let session = self.session_sequence.next_session()?;
+            let artifact = self.capture_store.artifact_for_session(&session);
+            match self.capture_backend.start(AudioCaptureStart::new(
+                session.clone(),
+                artifact.clone(),
+                self.configuration.input_source(),
+            )) {
+                Ok(capture) => {
+                    self.active_capture = Some(RuntimeActiveCapture::new(
+                        session.clone(),
+                        artifact,
+                        capture,
+                    ));
+                    return Ok(Output::Started(CaptureStarted::new(StartedSession::new(
+                        session,
+                    ))));
+                }
+                Err(error) if error.is_recording_log_already_exists() => {
+                    let next_session_value = self
+                        .capture_store
+                        .next_session_value_after_existing_artifacts()?;
+                    self.session_sequence
+                        .advance_to_at_least(next_session_value);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 
@@ -155,10 +191,19 @@ impl CaptureSessionSequence {
         Self { next: first }
     }
 
-    pub fn next_session(&mut self) -> CaptureSession {
+    pub fn next_session(&mut self) -> Result<CaptureSession> {
         let session = CaptureSession::new(self.next);
-        self.next += 1;
-        session
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or(Error::CaptureSessionSequenceExhausted {
+                last_session: self.next,
+            })?;
+        Ok(session)
+    }
+
+    pub fn advance_to_at_least(&mut self, next: u64) {
+        self.next = self.next.max(next);
     }
 }
 
@@ -246,6 +291,8 @@ impl Error {
             Self::Io(_)
             | Self::InvalidAudioFormat { .. }
             | Self::InvalidRecordingLog { .. }
+            | Self::RecordingLogAlreadyExists { .. }
+            | Self::CaptureSessionSequenceExhausted { .. }
             | Self::IncompletePcmFrame { .. }
             | Self::SystemClockBeforeUnixEpoch { .. } => UnimplementedReason::StoreUnavailable,
             _ => UnimplementedReason::NotBuiltYet,

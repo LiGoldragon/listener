@@ -60,11 +60,12 @@ store directly, or bypass the daemon path.
 - `src/command.rs` is the thin ordinary CLI client.
 - `src/daemon.rs` owns the blocking Unix-socket daemon loop.
 - `src/runtime.rs` lowers `signal-listener` operations into runtime state and
-  effects.
+  effects, including idle orphan recording-log discovery.
 - `src/capture.rs`, `src/transcription.rs`, and `src/delivery.rs` hold the
   explicit effect seams.
 - `src/recording_log.rs` owns the one-file append-only Listener recording log,
-  recovery scanner, idempotent truncation, and raw PCM export.
+  exclusive creation, recovery scanner, idempotent truncation, and raw PCM
+  export.
 - `src/meta.rs` is still an owner/meta CLI scaffold.
 - `tests/configuration.rs` proves the shared typed configuration archive.
 - `tests/recording_log.rs` proves header recovery, torn-tail recovery, and
@@ -83,14 +84,18 @@ header records version, `s16le` sample format, sample rate, channel count,
 frame size, input source, session, and start time. Each PCM record carries
 sequence, cumulative frame and byte offsets, payload length, CRC32 checksum,
 payload bytes, and a commit trailer. The writer flushes and `fdatasync`s after
-the header and each record, and fsyncs the parent directory after creating the
-file so the path is discoverable after a crash.
+the header and each record, creates the log path exclusively, and fsyncs the
+parent directory after creating the file so the path is discoverable after a
+crash.
 
 On stop, Listener scans the log from the header, accepts only complete records
 with matching sequence, offsets, checksums, and commit trailers, and truncates
 the first incomplete or corrupt tail to the last valid record boundary.
-Recovery is idempotent. The configured transcription program receives a
-recovered raw `s16le` PCM export path, not the custom `.listenerlog` path.
-Without `LISTENER_TRANSCRIPTION_PROGRAM`, Listener returns an explicit
-not-configured stub transcript. Clipboard delivery uses `wl-copy` by default
-through the typed output-target dispatcher.
+Recovery is idempotent. While idle, Listener also scans existing `.listenerlog`
+files, recovers crash-survived orphan logs, and advances new capture sessions
+past existing `capture-<session>.listenerlog` names before starting another
+recording. The configured transcription program receives a recovered raw
+`s16le` PCM export path, not the custom `.listenerlog` path. Without
+`LISTENER_TRANSCRIPTION_PROGRAM`, Listener returns an explicit not-configured
+stub transcript. Clipboard delivery uses `wl-copy` by default through the typed
+output-target dispatcher.

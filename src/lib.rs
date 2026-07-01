@@ -21,7 +21,7 @@ pub mod transport;
 
 pub use capture::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureStore,
-    ProcessAudioCaptureBackend,
+    ProcessAudioCaptureBackend, RecoveredCaptureRecordings,
 };
 pub use client::ListenerClient;
 #[cfg(feature = "nota-text")]

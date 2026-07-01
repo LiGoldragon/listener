@@ -1,8 +1,8 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
     io::{Read, Write},
     os::unix::net::UnixStream,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -10,15 +10,16 @@ use listener::daemon::ListenerSocketServer;
 use listener::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, BatchTranscriber,
     BatchTranscriptionInput, BatchTranscriptionInputFormat, BatchTranscriptionRequest,
-    Configuration, ListenerRuntime, OutputTargetDispatcher, RecordingAudioFormat, RecordingLog,
-    RecordingLogHeader, RecordingLogWriter, TranscriptDelivery, TranscriptDeliveryRequest,
+    Configuration, ListenerRuntime, OutputTargetDispatcher, RecordingAudioFormat,
+    RecordingInputSource, RecordingLog, RecordingLogHeader, RecordingLogWriter, RecordingStartTime,
+    TranscriptDelivery, TranscriptDeliveryRequest,
 };
 use signal_frame::{ExchangeIdentifier, ExchangeLane, LaneSequence, Reply, SessionEpoch, SubReply};
 use signal_listener::{
-    ActiveCapture, CaptureStatus, DeliveryOutcome, DurableAudioArtifact, Frame, FrameBody, Input,
-    InputSource, ListenerDaemonConfiguration, MetaSocketMode, MetaSocketPath, Output, OutputTarget,
-    OutputTargets, SocketMode, StartCapture, StatusRequest, TranscriptText, TranscriptionMode,
-    WirePath, WorkingSocketMode, WorkingSocketPath,
+    ActiveCapture, CaptureSession, CaptureStatus, DeliveryOutcome, DurableAudioArtifact, Frame,
+    FrameBody, Input, InputSource, ListenerDaemonConfiguration, MetaSocketMode, MetaSocketPath,
+    Output, OutputTarget, OutputTargets, SocketMode, StartCapture, StatusRequest, TranscriptText,
+    TranscriptionMode, WirePath, WorkingSocketMode, WorkingSocketPath,
 };
 use tempfile::TempDir;
 
@@ -38,9 +39,16 @@ impl RuntimeFixture {
     }
 
     fn runtime(&self) -> ListenerRuntime {
+        self.runtime_with_capture_backend(Box::new(FileAudioCaptureBackend))
+    }
+
+    fn runtime_with_capture_backend(
+        &self,
+        capture_backend: Box<dyn AudioCaptureBackend>,
+    ) -> ListenerRuntime {
         ListenerRuntime::with_dependencies(
             self.configuration(),
-            Box::new(FileAudioCaptureBackend),
+            capture_backend,
             Box::new(FixedBatchTranscriber::new(
                 "transcribed text",
                 Arc::clone(&self.transcription_inputs),
@@ -72,6 +80,30 @@ impl RuntimeFixture {
 
     fn wire_path(path: impl AsRef<Path>) -> WirePath {
         WirePath::new(path.as_ref().to_string_lossy().into_owned())
+    }
+
+    fn capture_path(&self, session_value: u64) -> PathBuf {
+        self.directory
+            .path()
+            .join("captures")
+            .join(format!("capture-{session_value}.listenerlog"))
+    }
+
+    fn write_recording_log(&self, session_value: u64, payload: &[u8]) -> PathBuf {
+        let path = self.capture_path(session_value);
+        fs::create_dir_all(path.parent().expect("capture parent")).expect("create capture parent");
+        let header = RecordingLogHeader::new(
+            CaptureSession::new(session_value),
+            RecordingAudioFormat::signed_sixteen_bit_little_endian_mono_16khz(),
+            RecordingInputSource::SystemDefault,
+            RecordingStartTime::from_unix_parts(1_700_000_002, 0),
+            8192,
+        )
+        .expect("recording header");
+        let mut writer = RecordingLogWriter::create(&path, header).expect("create recording log");
+        writer.append_record(payload).expect("append recording log");
+        writer.finish().expect("finish recording log");
+        path
     }
 
     fn delivered_texts(&self) -> Vec<String> {
@@ -108,6 +140,41 @@ impl AudioCaptureBackend for FileAudioCaptureBackend {
 
 const ACTIVE_AUDIO_BYTES: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7];
 const STOPPED_AUDIO_BYTES: &[u8] = &[8, 9, 10, 11];
+
+struct RacingCollisionAudioCaptureBackend {
+    collided: Arc<Mutex<bool>>,
+}
+
+impl RacingCollisionAudioCaptureBackend {
+    fn new() -> Self {
+        Self {
+            collided: Arc::new(Mutex::new(false)),
+        }
+    }
+}
+
+impl AudioCaptureBackend for RacingCollisionAudioCaptureBackend {
+    fn start(&self, request: AudioCaptureStart) -> listener::Result<Box<dyn ActiveAudioCapture>> {
+        let mut collided = self.collided.lock().expect("collision state");
+        if !*collided {
+            *collided = true;
+            let artifact_path = request.artifact_path();
+            fs::create_dir_all(artifact_path.parent().expect("artifact parent"))?;
+            let header = RecordingLogHeader::from_capture_start(
+                request.session(),
+                request.input_source(),
+                RecordingAudioFormat::signed_sixteen_bit_little_endian_mono_16khz(),
+            )?;
+            let mut writer = RecordingLogWriter::create(&artifact_path, header)?;
+            writer.append_record(&[40, 41, 42, 43])?;
+            writer.finish()?;
+            return Err(listener::Error::recording_log_already_exists(
+                &artifact_path,
+            ));
+        }
+        FileAudioCaptureBackend.start(request)
+    }
+}
 
 struct FileAudioCapture {
     artifact: DurableAudioArtifact,
@@ -222,6 +289,130 @@ fn start_writes_active_capture_artifact_before_stop() {
     expected.extend_from_slice(ACTIVE_AUDIO_BYTES);
     expected.extend_from_slice(STOPPED_AUDIO_BYTES);
     assert_eq!(stopped_bytes, expected);
+}
+
+#[test]
+fn fresh_runtime_start_preserves_existing_listenerlog_and_allocates_next_artifact() {
+    let fixture = RuntimeFixture::new();
+    let existing_path = fixture.write_recording_log(1, &[20, 21, 22, 23]);
+    let original_bytes = fs::read(&existing_path).expect("existing log bytes");
+    let mut runtime = fixture.runtime();
+
+    let session = match runtime.handle_input(Input::Start(StartCapture {})) {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected started reply, got {other:?}"),
+    };
+    assert_eq!(session.value(), 2);
+    assert_eq!(runtime.orphaned_recordings().as_slice().len(), 1);
+
+    let status_reply = runtime.handle_input(Input::Status(StatusRequest {}));
+    let artifact = match status_reply {
+        Output::StatusReported(report) => match report.status() {
+            CaptureStatus::Capturing(ActiveCapture {
+                durable_audio_artifact,
+                ..
+            }) => durable_audio_artifact.clone(),
+            other => panic!("expected active capture status, got {other:?}"),
+        },
+        other => panic!("expected status reply, got {other:?}"),
+    };
+    let active_path = PathBuf::from(artifact.path().as_str());
+    assert_eq!(active_path, fixture.capture_path(2));
+    assert_ne!(active_path, existing_path);
+    assert_eq!(
+        fs::read(&existing_path).expect("existing log after start"),
+        original_bytes
+    );
+
+    runtime.handle_input(Input::stop(session));
+}
+
+#[test]
+fn start_retries_when_artifact_appears_after_allocation() {
+    let fixture = RuntimeFixture::new();
+    let mut runtime =
+        fixture.runtime_with_capture_backend(Box::new(RacingCollisionAudioCaptureBackend::new()));
+
+    let session = match runtime.handle_input(Input::Start(StartCapture {})) {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected started reply, got {other:?}"),
+    };
+
+    assert_eq!(session.value(), 2);
+    assert!(
+        fixture.capture_path(1).exists(),
+        "expected simulated racing artifact to exist"
+    );
+    match runtime.handle_input(Input::Status(StatusRequest {})) {
+        Output::StatusReported(report) => match report.status() {
+            CaptureStatus::Capturing(ActiveCapture {
+                durable_audio_artifact,
+                ..
+            }) => {
+                assert_eq!(
+                    PathBuf::from(durable_audio_artifact.path().as_str()),
+                    fixture.capture_path(2)
+                );
+            }
+            other => panic!("expected active capture status, got {other:?}"),
+        },
+        other => panic!("expected status reply, got {other:?}"),
+    }
+
+    runtime.handle_input(Input::stop(session));
+}
+
+#[test]
+fn idle_status_recovers_orphaned_listenerlog_idempotently_and_leaves_it_exportable() {
+    let fixture = RuntimeFixture::new();
+    let existing_path = fixture.write_recording_log(1, &[30, 31, 32, 33]);
+    OpenOptions::new()
+        .append(true)
+        .open(&existing_path)
+        .expect("open orphan log for torn tail")
+        .write_all(b"torn listener tail")
+        .expect("append torn tail");
+    let torn_length = fs::metadata(&existing_path).expect("torn metadata").len();
+    let mut runtime = fixture.runtime();
+
+    match runtime.handle_input(Input::Status(StatusRequest {})) {
+        Output::StatusReported(report) => assert_eq!(report.status(), &CaptureStatus::Idle),
+        other => panic!("expected idle status reply, got {other:?}"),
+    }
+
+    let length_after_first_recovery = fs::metadata(&existing_path)
+        .expect("metadata after first recovery")
+        .len();
+    {
+        let recordings = runtime.orphaned_recordings();
+        assert_eq!(recordings.next_session_value(), 2);
+        assert_eq!(recordings.as_slice().len(), 1);
+        let recovered = &recordings.as_slice()[0];
+        assert_eq!(recovered.path(), existing_path.as_path());
+        assert_eq!(recovered.truncated_from(), Some(torn_length));
+        assert_eq!(recovered.records().len(), 1);
+        let export = recovered
+            .export_raw_pcm(fixture.directory.path().join("orphan.raw.s16le"))
+            .expect("export recovered orphan");
+        assert_eq!(
+            fs::read(export.path()).expect("orphan raw bytes"),
+            vec![30, 31, 32, 33]
+        );
+    }
+
+    match runtime.handle_input(Input::Status(StatusRequest {})) {
+        Output::StatusReported(report) => assert_eq!(report.status(), &CaptureStatus::Idle),
+        other => panic!("expected second idle status reply, got {other:?}"),
+    }
+    let recordings = runtime.orphaned_recordings();
+    assert_eq!(recordings.as_slice().len(), 1);
+    assert_eq!(recordings.as_slice()[0].truncated_from(), None);
+    assert_eq!(
+        fs::metadata(&existing_path)
+            .expect("metadata after second recovery")
+            .len(),
+        length_after_first_recovery
+    );
 }
 
 #[test]

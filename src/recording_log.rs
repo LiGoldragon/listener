@@ -474,9 +474,12 @@ impl RecordingLogWriter {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| match error.kind() {
+                ErrorKind::AlreadyExists => Error::recording_log_already_exists(&path),
+                _ => Error::Io(error),
+            })?;
         file.write_all(&header.to_bytes())?;
 
         let mut writer = Self {
