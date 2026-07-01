@@ -129,6 +129,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastrand"
+version = "2.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -223,6 +229,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "getrandom"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "r-efi",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -300,6 +317,7 @@ dependencies = [
  "nota",
  "rkyv",
  "signal-listener",
+ "tempfile",
  "thiserror",
 ]
 
@@ -311,8 +329,8 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
 name = "meta-signal-listener"
-version = "0.1.0"
-source = "git+https://github.com/LiGoldragon/meta-signal-listener.git?branch=main#a4c8b4d6609f97e7b452328c1aeeb874de5201e5"
+version = "0.2.0"
+source = "git+https://github.com/LiGoldragon/meta-signal-listener.git?branch=main#30ed27707ea792ac8b6fa371ec250d1e220ef5bd"
 dependencies = [
  "nota",
  "rkyv",
@@ -437,6 +455,12 @@ checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "r-efi"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rancor"
@@ -605,8 +629,8 @@ dependencies = [
 
 [[package]]
 name = "signal-listener"
-version = "0.1.0"
-source = "git+https://github.com/LiGoldragon/signal-listener.git?branch=main#1b61a61c92e8734a7d0dad6dbc5dfd77418df976"
+version = "0.2.0"
+source = "git+https://github.com/LiGoldragon/signal-listener.git?branch=main#e2a390b0ae56fcf38a0a3749731b3290d2db5630"
 dependencies = [
  "nota",
  "rkyv",
@@ -646,6 +670,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom",
+ "once_cell",
+ "rustix",
+ "windows-sys",
 ]
 
 [[package]]

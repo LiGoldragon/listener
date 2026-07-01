@@ -1,7 +1,7 @@
 # listener - architecture
 
-`listener` is the speech-to-text component runtime. It is born as a fresh
-component family, separate from the forked Whisrs repository.
+`listener` is the speech-to-text component runtime. It is a fresh component
+family, separate from the forked Whisrs repository.
 
 ## Direction
 
@@ -36,7 +36,7 @@ store directly, or bypass the daemon path.
 - `meta-listener` thin owner/meta CLI entry point.
 - `listener-daemon` runtime entry point.
 - Runtime implementation of audio capture, durable capture writes,
-  transcription execution, and output delivery once later slices implement them.
+  transcription execution, and output delivery.
 - Typed configuration archive helpers over
   `signal_listener::ListenerDaemonConfiguration`.
 
@@ -57,12 +57,22 @@ store directly, or bypass the daemon path.
 - `src/bin/listener_daemon.rs` is the daemon entry point.
 - `src/configuration.rs` wraps the shared daemon configuration contract and
   proves binary archive round trips.
-- `src/command.rs`, `src/meta.rs`, and `src/daemon.rs` are skeleton-honest
-  runtime surfaces.
+- `src/command.rs` is the thin ordinary CLI client.
+- `src/daemon.rs` owns the blocking Unix-socket daemon loop.
+- `src/runtime.rs` lowers `signal-listener` operations into runtime state and
+  effects.
+- `src/capture.rs`, `src/transcription.rs`, and `src/delivery.rs` hold the
+  explicit effect seams.
+- `src/meta.rs` is still an owner/meta CLI scaffold.
 - `tests/configuration.rs` proves the shared typed configuration archive.
+- `tests/runtime.rs` proves active durable artifact writes, stop reply shape,
+  and output-target dispatch.
 
 ## Status
 
-The repo is a scaffold. The binaries compile and report that transport/runtime
-behavior is not implemented. Later implementation workers should add the daemon
-transport spine before adding audio capture behavior.
+The first vertical slice is implemented with a blocking local Unix socket and
+one active capture. Capture uses a parecord-compatible process against the
+system default source and streams raw `s16le` bytes to disk. Transcription uses
+`LISTENER_TRANSCRIPTION_PROGRAM` when configured; otherwise it returns an
+explicit not-configured stub transcript. Clipboard delivery uses `wl-copy` by
+default through the typed output-target dispatcher.

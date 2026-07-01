@@ -37,6 +37,9 @@ rkyv                 = { version = "0.8", default-features = false, features = [
 signal-listener      = { git = "https://github.com/LiGoldragon/signal-listener.git", branch = "main", default-features = false }
 thiserror            = "2"
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints.rust]
 unsafe_code = "forbid"
 unused      = { level = "warn", priority = -1 }
