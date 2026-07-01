@@ -23,6 +23,10 @@ The writer creates `.listenerlog` files exclusively. On daemon restart, Listener
 scans existing capture logs, recovers idle orphan logs, and allocates the next
 active artifact after the existing `capture-<session>.listenerlog` names.
 
+Start/stop state conflicts are returned as typed public replies from
+`signal-listener`: already-active capture, no active capture, and active versus
+requested session mismatch.
+
 Transcription is a narrow backend seam. Set `LISTENER_TRANSCRIPTION_PROGRAM` to
 a batch command that accepts the recovered raw `s16le` PCM export path and
 writes transcript text to stdout. Without that variable, Listener returns an

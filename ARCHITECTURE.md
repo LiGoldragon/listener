@@ -99,3 +99,9 @@ recording. The configured transcription program receives a recovered raw
 `LISTENER_TRANSCRIPTION_PROGRAM`, Listener returns an explicit not-configured
 stub transcript. Clipboard delivery uses `wl-copy` by default through the typed
 output-target dispatcher.
+
+Ordinary lifecycle conflicts stay on the public reply surface as typed
+`signal-listener` outcomes: start while recording reports the active session,
+stop while idle reports no active capture, and stop with a different session
+reports both active and requested sessions. These are not lowered to
+`RequestUnimplemented`.

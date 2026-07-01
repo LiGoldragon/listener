@@ -1,6 +1,7 @@
 use signal_listener::{
-    ActiveCapture, ActiveCaptureSession, CaptureSession, CaptureStarted, CaptureStatus,
-    CaptureStopped, Input, OperationKind, Output, Reason, RequestUnimplemented, StartCapture,
+    ActiveCapture, ActiveCaptureSession, CaptureAlreadyActive, CaptureSession,
+    CaptureSessionMismatch, CaptureStarted, CaptureStatus, CaptureStopped, Input, NoActiveCapture,
+    OperationKind, Output, Reason, RequestUnimplemented, RequestedCaptureSession, StartCapture,
     StartedSession, StatusRequest, StopCapture, StoppedSession, UnimplementedOperationKind,
     UnimplementedReason,
 };
@@ -57,12 +58,8 @@ impl ListenerRuntime {
 
     pub fn handle_input(&mut self, input: Input) -> Output {
         match input {
-            Input::Start(start) => self
-                .start(start)
-                .unwrap_or_else(|error| error.into_unimplemented_reply(OperationKind::Start)),
-            Input::Stop(stop) => self
-                .stop(stop)
-                .unwrap_or_else(|error| error.into_unimplemented_reply(OperationKind::Stop)),
+            Input::Start(start) => self.start(start).unwrap_or_else(Error::into_start_reply),
+            Input::Stop(stop) => self.stop(stop).unwrap_or_else(Error::into_stop_reply),
             Input::Status(status) => self
                 .status(status)
                 .unwrap_or_else(|error| error.into_unimplemented_reply(OperationKind::Status)),
@@ -272,6 +269,30 @@ impl StoppedCapture {
 }
 
 impl Error {
+    pub fn into_start_reply(self) -> Output {
+        match self {
+            Self::CaptureAlreadyActive { session } => Output::CaptureAlreadyActive(
+                CaptureAlreadyActive::new(ActiveCaptureSession::new(CaptureSession::new(session))),
+            ),
+            error => error.into_unimplemented_reply(OperationKind::Start),
+        }
+    }
+
+    pub fn into_stop_reply(self) -> Output {
+        match self {
+            Self::NoActiveCapture => Output::NoActiveCapture(NoActiveCapture {}),
+            Self::CaptureSessionMismatch { active, requested } => {
+                Output::CaptureSessionMismatch(CaptureSessionMismatch {
+                    active_capture_session: ActiveCaptureSession::new(CaptureSession::new(active)),
+                    requested_capture_session: RequestedCaptureSession::new(CaptureSession::new(
+                        requested,
+                    )),
+                })
+            }
+            error => error.into_unimplemented_reply(OperationKind::Stop),
+        }
+    }
+
     pub fn into_unimplemented_reply(self, operation_kind: OperationKind) -> Output {
         Output::RequestUnimplemented(RequestUnimplemented {
             unimplemented_operation_kind: UnimplementedOperationKind::new(operation_kind),

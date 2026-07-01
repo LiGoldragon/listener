@@ -320,7 +320,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "listener"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crc32fast",
  "meta-signal-listener",
@@ -640,8 +640,8 @@ dependencies = [
 
 [[package]]
 name = "signal-listener"
-version = "0.2.0"
-source = "git+https://github.com/LiGoldragon/signal-listener.git?branch=main#e2a390b0ae56fcf38a0a3749731b3290d2db5630"
+version = "0.3.0"
+source = "git+https://github.com/LiGoldragon/signal-listener.git?branch=main#16b54472f43c9e3cf20b5bef726617156ce8b3a4"
 dependencies = [
  "nota",
  "rkyv",

@@ -468,6 +468,73 @@ fn stop_returns_artifact_transcript_and_delivery_outcome() {
 }
 
 #[test]
+fn start_while_active_returns_typed_conflict_reply() {
+    let fixture = RuntimeFixture::new();
+    let mut runtime = fixture.runtime();
+
+    let session = match runtime.handle_input(Input::Start(StartCapture {})) {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected started reply, got {other:?}"),
+    };
+
+    match runtime.handle_input(Input::Start(StartCapture {})) {
+        Output::CaptureAlreadyActive(conflict) => {
+            assert_eq!(conflict.payload().payload(), &session);
+        }
+        other => panic!("expected active-capture conflict, got {other:?}"),
+    }
+
+    runtime.handle_input(Input::stop(session));
+}
+
+#[test]
+fn stop_while_idle_returns_typed_conflict_reply() {
+    let fixture = RuntimeFixture::new();
+    let mut runtime = fixture.runtime();
+
+    match runtime.handle_input(Input::stop(CaptureSession::new(1))) {
+        Output::NoActiveCapture(_) => {}
+        other => panic!("expected no-active-capture conflict, got {other:?}"),
+    }
+}
+
+#[test]
+fn stop_with_wrong_session_returns_typed_conflict_reply_and_preserves_active_capture() {
+    let fixture = RuntimeFixture::new();
+    let mut runtime = fixture.runtime();
+
+    let session = match runtime.handle_input(Input::Start(StartCapture {})) {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected started reply, got {other:?}"),
+    };
+    let requested_session = CaptureSession::new(session.value() + 1);
+
+    match runtime.handle_input(Input::stop(requested_session.clone())) {
+        Output::CaptureSessionMismatch(conflict) => {
+            assert_eq!(conflict.active_capture_session.payload(), &session);
+            assert_eq!(
+                conflict.requested_capture_session.payload(),
+                &requested_session
+            );
+        }
+        other => panic!("expected session-mismatch conflict, got {other:?}"),
+    }
+
+    match runtime.handle_input(Input::Status(StatusRequest {})) {
+        Output::StatusReported(report) => match report.status() {
+            CaptureStatus::Capturing(ActiveCapture {
+                active_capture_session,
+                ..
+            }) => assert_eq!(active_capture_session.payload(), &session),
+            other => panic!("expected active capture after wrong stop, got {other:?}"),
+        },
+        other => panic!("expected status reply, got {other:?}"),
+    }
+
+    runtime.handle_input(Input::stop(session));
+}
+
+#[test]
 fn output_target_dispatch_returns_one_outcome_per_configured_target() {
     let deliveries = Arc::new(Mutex::new(Vec::new()));
     let dispatcher =
@@ -531,6 +598,56 @@ fn socket_server_answers_public_status_frame_with_matching_exchange() {
                             assert_eq!(report.status(), &CaptureStatus::Idle);
                         }
                         other => panic!("expected idle status reply, got {other:?}"),
+                    }
+                }
+                other => panic!("expected accepted reply, got {other:?}"),
+            }
+        }
+        other => panic!("expected public reply frame, got {other:?}"),
+    }
+}
+
+#[test]
+fn socket_server_answers_public_conflict_frame_with_matching_exchange() {
+    let fixture = RuntimeFixture::new();
+    let (mut client_stream, server_stream) = UnixStream::pair().expect("socket pair");
+    let mut server = ListenerSocketServer::new(fixture.configuration(), fixture.runtime());
+    let exchange = ExchangeIdentifier::new(
+        SessionEpoch::new(5),
+        ExchangeLane::Connector,
+        LaneSequence::new(14),
+    );
+
+    let request = Input::stop(CaptureSession::new(1))
+        .into_frame(exchange)
+        .encode_length_prefixed()
+        .expect("public request frame encodes");
+    client_stream
+        .write_all(&request)
+        .expect("write public request frame");
+    server
+        .handle_connection(server_stream)
+        .expect("server reply");
+    let response = read_length_prefixed_frame_bytes(&mut client_stream);
+    let frame = Frame::decode_length_prefixed(&response).expect("public reply frame decodes");
+
+    match frame.into_body() {
+        FrameBody::Reply {
+            exchange: reply_exchange,
+            reply,
+        } => {
+            assert_eq!(reply_exchange, exchange);
+            match reply {
+                Reply::Accepted { per_operation, .. } => {
+                    let (reply, additional_replies) = per_operation.into_head_and_tail();
+                    assert!(
+                        additional_replies.is_empty(),
+                        "expected one reply payload, got {}",
+                        1 + additional_replies.len()
+                    );
+                    match reply {
+                        SubReply::Ok(Output::NoActiveCapture(_)) => {}
+                        other => panic!("expected no-active-capture reply, got {other:?}"),
                     }
                 }
                 other => panic!("expected accepted reply, got {other:?}"),
