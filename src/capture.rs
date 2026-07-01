@@ -1,6 +1,6 @@
 use std::{
-    fs::{self, File},
-    io::{BufReader, BufWriter, Write},
+    fs,
+    io::Read,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread::{self, JoinHandle},
@@ -10,7 +10,9 @@ use signal_listener::{
     AudioArtifactPath, CaptureSession, DurableAudioArtifact, InputSource, WirePath,
 };
 
-use crate::{Configuration, Error, Result};
+use crate::{
+    Configuration, Error, RecordingAudioFormat, RecordingLogHeader, RecordingLogWriter, Result,
+};
 
 pub trait AudioCaptureBackend {
     fn start(&self, request: AudioCaptureStart) -> Result<Box<dyn ActiveAudioCapture>>;
@@ -85,13 +87,19 @@ impl CaptureStore {
     }
 
     pub fn artifact_for_session(&self, session: &CaptureSession) -> DurableAudioArtifact {
-        let file_name = format!("capture-{}.s16le", session.value());
+        let file_name = format!("capture-{}.listenerlog", session.value());
         DurableAudioArtifact::new(AudioArtifactPath::new(WirePath::new(
             self.directory
                 .join(file_name)
                 .to_string_lossy()
                 .into_owned(),
         )))
+    }
+
+    pub fn raw_pcm_export_for_artifact(&self, artifact: &DurableAudioArtifact) -> PathBuf {
+        let mut path = PathBuf::from(artifact.path().as_str());
+        path.set_extension("raw.s16le");
+        path
     }
 }
 
@@ -120,6 +128,7 @@ impl AudioCaptureBackend for ProcessAudioCaptureBackend {
 pub struct AudioCaptureCommand {
     program: String,
     arguments: Vec<String>,
+    audio_format: RecordingAudioFormat,
 }
 
 impl AudioCaptureCommand {
@@ -139,9 +148,22 @@ impl AudioCaptureCommand {
     }
 
     pub fn new(program: impl Into<String>, arguments: Vec<String>) -> Self {
+        Self::new_with_audio_format(
+            program,
+            arguments,
+            RecordingAudioFormat::signed_sixteen_bit_little_endian_mono_16khz(),
+        )
+    }
+
+    pub fn new_with_audio_format(
+        program: impl Into<String>,
+        arguments: Vec<String>,
+        audio_format: RecordingAudioFormat,
+    ) -> Self {
         Self {
             program: program.into(),
             arguments,
+            audio_format,
         }
     }
 
@@ -163,7 +185,12 @@ impl AudioCaptureCommand {
             })?;
         fs::create_dir_all(parent)?;
 
-        let file = File::create(&artifact_path)?;
+        let header = RecordingLogHeader::from_capture_start(
+            request.session(),
+            request.input_source(),
+            self.audio_format,
+        )?;
+        let recording_log = RecordingLogWriter::create(&artifact_path, header)?;
         let mut child = Command::new(&self.program)
             .args(&self.arguments)
             .stdout(Stdio::piped())
@@ -177,7 +204,7 @@ impl AudioCaptureCommand {
             .stdout
             .take()
             .ok_or(Error::CaptureProcessStdoutUnavailable)?;
-        let writer = CaptureWriter::new(stdout, file).spawn();
+        let writer = CaptureWriter::new(stdout, recording_log).spawn();
 
         Ok(Box::new(ProcessAudioCapture {
             artifact: request.artifact().clone(),
@@ -210,27 +237,83 @@ impl ActiveAudioCapture for ProcessAudioCapture {
     }
 }
 
-pub struct CaptureWriter {
-    stdout: std::process::ChildStdout,
-    file: File,
+pub struct CaptureWriter<Input> {
+    input: Input,
+    recording_log: RecordingLogWriter,
+    pending_pcm: CaptureWriterPendingPcm,
+    read_buffer_bytes: usize,
 }
 
-impl CaptureWriter {
-    pub fn new(stdout: std::process::ChildStdout, file: File) -> Self {
-        Self { stdout, file }
+impl<Input: Read> CaptureWriter<Input> {
+    pub fn new(input: Input, recording_log: RecordingLogWriter) -> Self {
+        let pending_pcm = CaptureWriterPendingPcm::new(recording_log.audio_format());
+        let read_buffer_bytes = recording_log.maximum_record_payload_bytes() as usize;
+        Self {
+            input,
+            recording_log,
+            pending_pcm,
+            read_buffer_bytes,
+        }
     }
 
+    pub fn write_until_capture_stops(mut self) -> Result<()> {
+        let mut read_buffer = vec![0_u8; self.read_buffer_bytes];
+        loop {
+            let read_count = self.input.read(&mut read_buffer)?;
+            if read_count == 0 {
+                break;
+            }
+            self.pending_pcm
+                .push_bytes(&read_buffer[..read_count], &mut self.recording_log)?;
+        }
+        self.pending_pcm.finish()?;
+        self.recording_log.finish()
+    }
+}
+
+impl<Input: Read + Send + 'static> CaptureWriter<Input> {
     pub fn spawn(self) -> JoinHandle<Result<()>> {
         thread::spawn(move || self.write_until_capture_stops())
     }
+}
 
-    fn write_until_capture_stops(self) -> Result<()> {
-        let mut reader = BufReader::new(self.stdout);
-        let mut writer = BufWriter::new(self.file);
-        std::io::copy(&mut reader, &mut writer)?;
-        writer.flush()?;
-        let file = writer.into_inner().map_err(|error| error.into_error())?;
-        file.sync_all()?;
+struct CaptureWriterPendingPcm {
+    audio_format: RecordingAudioFormat,
+    bytes: Vec<u8>,
+}
+
+impl CaptureWriterPendingPcm {
+    fn new(audio_format: RecordingAudioFormat) -> Self {
+        Self {
+            audio_format,
+            bytes: Vec::new(),
+        }
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8], recording_log: &mut RecordingLogWriter) -> Result<()> {
+        self.bytes.extend_from_slice(bytes);
+        let bytes_per_frame = usize::from(self.audio_format.bytes_per_frame());
+        let complete_length = self.bytes.len() - (self.bytes.len() % bytes_per_frame);
+        if complete_length == 0 {
+            return Ok(());
+        }
+
+        let complete_bytes: Vec<u8> = self.bytes.drain(..complete_length).collect();
+        for payload in complete_bytes.chunks(recording_log.maximum_record_payload_bytes() as usize)
+        {
+            recording_log.append_record(payload)?;
+        }
         Ok(())
+    }
+
+    fn finish(&self) -> Result<()> {
+        if self.bytes.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::IncompletePcmFrame {
+                remaining_bytes: self.bytes.len(),
+                bytes_per_frame: self.audio_format.bytes_per_frame(),
+            })
+        }
     }
 }

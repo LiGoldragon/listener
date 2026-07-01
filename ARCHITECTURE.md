@@ -35,8 +35,8 @@ store directly, or bypass the daemon path.
 - `listener` thin CLI entry point.
 - `meta-listener` thin owner/meta CLI entry point.
 - `listener-daemon` runtime entry point.
-- Runtime implementation of audio capture, durable capture writes,
-  transcription execution, and output delivery.
+- Runtime implementation of audio capture, durable capture-log writes,
+  transcription-input export, transcription execution, and output delivery.
 - Typed configuration archive helpers over
   `signal_listener::ListenerDaemonConfiguration`.
 
@@ -63,16 +63,34 @@ store directly, or bypass the daemon path.
   effects.
 - `src/capture.rs`, `src/transcription.rs`, and `src/delivery.rs` hold the
   explicit effect seams.
+- `src/recording_log.rs` owns the one-file append-only Listener recording log,
+  recovery scanner, idempotent truncation, and raw PCM export.
 - `src/meta.rs` is still an owner/meta CLI scaffold.
 - `tests/configuration.rs` proves the shared typed configuration archive.
-- `tests/runtime.rs` proves active durable artifact writes, stop reply shape,
-  and output-target dispatch.
+- `tests/recording_log.rs` proves header recovery, torn-tail recovery, and
+  idempotent truncation.
+- `tests/capture.rs` proves the production capture writer commits a payload
+  record before capture stop through the writer sync boundary.
+- `tests/runtime.rs` proves active durable artifact writes, stop-time recovery
+  export, stop reply shape, and output-target dispatch.
 
 ## Status
 
 The first vertical slice is implemented with a blocking local Unix socket and
 one active capture. Capture uses a parecord-compatible process against the
-system default source and streams raw `s16le` bytes to disk. Transcription uses
-`LISTENER_TRANSCRIPTION_PROGRAM` when configured; otherwise it returns an
-explicit not-configured stub transcript. Clipboard delivery uses `wl-copy` by
-default through the typed output-target dispatcher.
+system default source and writes one growing `.listenerlog` artifact. The log
+header records version, `s16le` sample format, sample rate, channel count,
+frame size, input source, session, and start time. Each PCM record carries
+sequence, cumulative frame and byte offsets, payload length, CRC32 checksum,
+payload bytes, and a commit trailer. The writer flushes and `fdatasync`s after
+the header and each record, and fsyncs the parent directory after creating the
+file so the path is discoverable after a crash.
+
+On stop, Listener scans the log from the header, accepts only complete records
+with matching sequence, offsets, checksums, and commit trailers, and truncates
+the first incomplete or corrupt tail to the last valid record boundary.
+Recovery is idempotent. The configured transcription program receives a
+recovered raw `s16le` PCM export path, not the custom `.listenerlog` path.
+Without `LISTENER_TRANSCRIPTION_PROGRAM`, Listener returns an explicit
+not-configured stub transcript. Clipboard delivery uses `wl-copy` by default
+through the typed output-target dispatcher.

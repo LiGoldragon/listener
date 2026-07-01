@@ -14,6 +14,7 @@ pub mod delivery;
 pub mod error;
 #[cfg(feature = "nota-text")]
 pub mod meta;
+pub mod recording_log;
 pub mod runtime;
 pub mod transcription;
 pub mod transport;
@@ -33,8 +34,14 @@ pub use delivery::{
 pub use error::{Error, Result};
 #[cfg(feature = "nota-text")]
 pub use meta::MetaCommandLine;
+pub use recording_log::{
+    RawPcmExport, RecordingAudioFormat, RecordingInputSource, RecordingLog, RecordingLogDurability,
+    RecordingLogDurabilityPolicy, RecordingLogHeader, RecordingLogRecordCommit, RecordingLogWriter,
+    RecordingSampleFormat, RecordingStartTime, RecoveredRecordingLog,
+};
 pub use runtime::ListenerRuntime;
 pub use transcription::{
-    BatchTranscriber, BatchTranscriptionRequest, ConfiguredBatchTranscriber, HonestStubTranscriber,
+    BatchTranscriber, BatchTranscriptionInput, BatchTranscriptionInputFormat,
+    BatchTranscriptionRequest, ConfiguredBatchTranscriber, HonestStubTranscriber,
 };
 pub use transport::{ContractFrameCodec, ContractFrameStream, MaximumFrameLength};

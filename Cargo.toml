@@ -1,6 +1,6 @@
 [package]
 name         = "listener"
-version      = "0.1.0"
+version      = "0.2.0"
 edition      = "2024"
 rust-version = "1.89"
 license      = "MIT OR Apache-2.0"
@@ -31,6 +31,7 @@ default = ["nota-text"]
 nota-text = ["dep:nota", "signal-frame/nota-text", "signal-listener/nota-text", "meta-signal-listener/nota-text"]
 
 [dependencies]
+crc32fast            = "1"
 meta-signal-listener = { git = "https://github.com/LiGoldragon/meta-signal-listener.git", branch = "main", default-features = false }
 nota                 = { package = "nota", git = "https://github.com/LiGoldragon/nota-next.git", branch = "main", optional = true }
 rkyv                 = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }

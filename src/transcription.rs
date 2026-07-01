@@ -2,7 +2,7 @@ use std::{path::PathBuf, process::Command};
 
 use signal_listener::{DurableAudioArtifact, TranscriptText};
 
-use crate::{Error, Result};
+use crate::{Error, RecordingAudioFormat, Result};
 
 pub trait BatchTranscriber {
     fn transcribe(&self, request: BatchTranscriptionRequest) -> Result<TranscriptText>;
@@ -11,20 +11,75 @@ pub trait BatchTranscriber {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatchTranscriptionRequest {
     artifact: DurableAudioArtifact,
+    input: BatchTranscriptionInput,
 }
 
 impl BatchTranscriptionRequest {
     pub fn new(artifact: DurableAudioArtifact) -> Self {
-        Self { artifact }
+        let input = BatchTranscriptionInput::listener_recording_log(PathBuf::from(
+            artifact.path().as_str(),
+        ));
+        Self { artifact, input }
+    }
+
+    pub fn new_with_input(artifact: DurableAudioArtifact, input: BatchTranscriptionInput) -> Self {
+        Self { artifact, input }
     }
 
     pub fn artifact(&self) -> &DurableAudioArtifact {
         &self.artifact
     }
 
+    pub fn input(&self) -> &BatchTranscriptionInput {
+        &self.input
+    }
+
     pub fn artifact_path(&self) -> PathBuf {
         PathBuf::from(self.artifact.path().as_str())
     }
+
+    pub fn input_path(&self) -> &PathBuf {
+        self.input.path()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchTranscriptionInput {
+    path: PathBuf,
+    format: BatchTranscriptionInputFormat,
+}
+
+impl BatchTranscriptionInput {
+    pub fn listener_recording_log(path: PathBuf) -> Self {
+        Self {
+            path,
+            format: BatchTranscriptionInputFormat::ListenerRecordingLog,
+        }
+    }
+
+    pub fn signed_sixteen_bit_little_endian_pcm(
+        path: PathBuf,
+        audio_format: RecordingAudioFormat,
+    ) -> Self {
+        Self {
+            path,
+            format: BatchTranscriptionInputFormat::SignedSixteenBitLittleEndianPcm { audio_format },
+        }
+    }
+
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    pub fn format(&self) -> &BatchTranscriptionInputFormat {
+        &self.format
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchTranscriptionInputFormat {
+    ListenerRecordingLog,
+    SignedSixteenBitLittleEndianPcm { audio_format: RecordingAudioFormat },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,7 +126,7 @@ impl BatchTranscriptionCommand {
 
     pub fn transcribe(&self, request: BatchTranscriptionRequest) -> Result<TranscriptText> {
         let output = Command::new(&self.program)
-            .arg(request.artifact_path())
+            .arg(request.input_path())
             .output()
             .map_err(|error| Error::TranscriptionBackendUnavailable {
                 message: format!("failed to start {}: {error}", self.program),

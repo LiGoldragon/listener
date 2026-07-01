@@ -7,9 +7,12 @@ use signal_listener::{
 
 use crate::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureStore, Configuration,
-    ConfiguredBatchTranscriber, Error, OutputTargetDispatcher, Result,
+    ConfiguredBatchTranscriber, Error, OutputTargetDispatcher, RecordingLog, Result,
 };
-use crate::{BatchTranscriber, BatchTranscriptionRequest, ProcessAudioCaptureBackend};
+use crate::{
+    BatchTranscriber, BatchTranscriptionInput, BatchTranscriptionRequest,
+    ProcessAudioCaptureBackend,
+};
 
 pub struct ListenerRuntime {
     configuration: Configuration,
@@ -105,9 +108,21 @@ impl ListenerRuntime {
         }
 
         let stopped_capture = active_capture.stop()?;
-        let transcript_text = self.transcriber.transcribe(BatchTranscriptionRequest::new(
-            stopped_capture.artifact().clone(),
-        ))?;
+        let recovered_log = RecordingLog::new(stopped_capture.artifact_path()).recover()?;
+        let raw_pcm_export = recovered_log.export_raw_pcm(
+            self.capture_store
+                .raw_pcm_export_for_artifact(stopped_capture.artifact()),
+        )?;
+        let transcription_input = BatchTranscriptionInput::signed_sixteen_bit_little_endian_pcm(
+            raw_pcm_export.path().to_path_buf(),
+            raw_pcm_export.audio_format(),
+        );
+        let transcript_text =
+            self.transcriber
+                .transcribe(BatchTranscriptionRequest::new_with_input(
+                    stopped_capture.artifact().clone(),
+                    transcription_input,
+                ))?;
         let delivery_outcomes = self
             .output_target_dispatcher
             .deliver(self.configuration.output_targets(), &transcript_text);
@@ -205,6 +220,10 @@ impl StoppedCapture {
     pub fn artifact(&self) -> &signal_listener::DurableAudioArtifact {
         &self.artifact
     }
+
+    pub fn artifact_path(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(self.artifact.path().as_str())
+    }
 }
 
 impl Error {
@@ -224,7 +243,11 @@ impl Error {
                 UnimplementedReason::TranscriptionBackendUnavailable
             }
             Self::OutputTargetRejected { .. } => UnimplementedReason::OutputTargetUnavailable,
-            Self::Io(_) => UnimplementedReason::StoreUnavailable,
+            Self::Io(_)
+            | Self::InvalidAudioFormat { .. }
+            | Self::InvalidRecordingLog { .. }
+            | Self::IncompletePcmFrame { .. }
+            | Self::SystemClockBeforeUnixEpoch { .. } => UnimplementedReason::StoreUnavailable,
             _ => UnimplementedReason::NotBuiltYet,
         }
     }

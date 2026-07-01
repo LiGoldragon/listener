@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs,
     io::{Read, Write},
     os::unix::net::UnixStream,
     path::Path,
@@ -9,8 +9,9 @@ use std::{
 use listener::daemon::ListenerSocketServer;
 use listener::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, BatchTranscriber,
-    BatchTranscriptionRequest, Configuration, ListenerRuntime, OutputTargetDispatcher,
-    TranscriptDelivery, TranscriptDeliveryRequest,
+    BatchTranscriptionInput, BatchTranscriptionInputFormat, BatchTranscriptionRequest,
+    Configuration, ListenerRuntime, OutputTargetDispatcher, RecordingAudioFormat, RecordingLog,
+    RecordingLogHeader, RecordingLogWriter, TranscriptDelivery, TranscriptDeliveryRequest,
 };
 use signal_frame::{ExchangeIdentifier, ExchangeLane, LaneSequence, Reply, SessionEpoch, SubReply};
 use signal_listener::{
@@ -24,6 +25,7 @@ use tempfile::TempDir;
 struct RuntimeFixture {
     directory: TempDir,
     deliveries: Arc<Mutex<Vec<String>>>,
+    transcription_inputs: Arc<Mutex<Vec<BatchTranscriptionInput>>>,
 }
 
 impl RuntimeFixture {
@@ -31,6 +33,7 @@ impl RuntimeFixture {
         Self {
             directory: TempDir::new().expect("temp directory"),
             deliveries: Arc::new(Mutex::new(Vec::new())),
+            transcription_inputs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -38,7 +41,10 @@ impl RuntimeFixture {
         ListenerRuntime::with_dependencies(
             self.configuration(),
             Box::new(FileAudioCaptureBackend),
-            Box::new(FixedBatchTranscriber::new("transcribed text")),
+            Box::new(FixedBatchTranscriber::new(
+                "transcribed text",
+                Arc::clone(&self.transcription_inputs),
+            )),
             OutputTargetDispatcher::new(Box::new(RecordingDelivery::new(Arc::clone(
                 &self.deliveries,
             )))),
@@ -71,6 +77,13 @@ impl RuntimeFixture {
     fn delivered_texts(&self) -> Vec<String> {
         self.deliveries.lock().expect("deliveries").clone()
     }
+
+    fn transcription_inputs(&self) -> Vec<BatchTranscriptionInput> {
+        self.transcription_inputs
+            .lock()
+            .expect("transcription inputs")
+            .clone()
+    }
 }
 
 struct FileAudioCaptureBackend;
@@ -79,20 +92,31 @@ impl AudioCaptureBackend for FileAudioCaptureBackend {
     fn start(&self, request: AudioCaptureStart) -> listener::Result<Box<dyn ActiveAudioCapture>> {
         let artifact_path = request.artifact_path();
         fs::create_dir_all(artifact_path.parent().expect("artifact parent"))?;
-        let mut file = File::create(&artifact_path)?;
-        file.write_all(b"active audio chunk\n")?;
-        file.sync_all()?;
-        Ok(Box::new(FileAudioCapture::new(request.artifact().clone())))
+        let header = RecordingLogHeader::from_capture_start(
+            request.session(),
+            request.input_source(),
+            RecordingAudioFormat::signed_sixteen_bit_little_endian_mono_16khz(),
+        )?;
+        let mut writer = RecordingLogWriter::create(&artifact_path, header)?;
+        writer.append_record(ACTIVE_AUDIO_BYTES)?;
+        Ok(Box::new(FileAudioCapture::new(
+            request.artifact().clone(),
+            writer,
+        )))
     }
 }
 
+const ACTIVE_AUDIO_BYTES: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7];
+const STOPPED_AUDIO_BYTES: &[u8] = &[8, 9, 10, 11];
+
 struct FileAudioCapture {
     artifact: DurableAudioArtifact,
+    writer: RecordingLogWriter,
 }
 
 impl FileAudioCapture {
-    fn new(artifact: DurableAudioArtifact) -> Self {
-        Self { artifact }
+    fn new(artifact: DurableAudioArtifact, writer: RecordingLogWriter) -> Self {
+        Self { artifact, writer }
     }
 }
 
@@ -102,27 +126,36 @@ impl ActiveAudioCapture for FileAudioCapture {
     }
 
     fn stop(self: Box<Self>) -> listener::Result<DurableAudioArtifact> {
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(self.artifact.path().as_str())?;
-        file.write_all(b"stopped audio chunk\n")?;
-        file.sync_all()?;
-        Ok(self.artifact.clone())
+        let FileAudioCapture {
+            artifact,
+            mut writer,
+        } = *self;
+        writer.append_record(STOPPED_AUDIO_BYTES)?;
+        writer.finish()?;
+        Ok(artifact)
     }
 }
 
 struct FixedBatchTranscriber {
     text: String,
+    inputs: Arc<Mutex<Vec<BatchTranscriptionInput>>>,
 }
 
 impl FixedBatchTranscriber {
-    fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+    fn new(text: impl Into<String>, inputs: Arc<Mutex<Vec<BatchTranscriptionInput>>>) -> Self {
+        Self {
+            text: text.into(),
+            inputs,
+        }
     }
 }
 
 impl BatchTranscriber for FixedBatchTranscriber {
-    fn transcribe(&self, _request: BatchTranscriptionRequest) -> listener::Result<TranscriptText> {
+    fn transcribe(&self, request: BatchTranscriptionRequest) -> listener::Result<TranscriptText> {
+        self.inputs
+            .lock()
+            .expect("transcription inputs")
+            .push(request.input().clone());
         Ok(TranscriptText::new(self.text.clone()))
     }
 }
@@ -170,12 +203,25 @@ fn start_writes_active_capture_artifact_before_stop() {
         other => panic!("expected status reply, got {other:?}"),
     };
 
-    let active_bytes = fs::read(artifact.path().as_str()).expect("active artifact bytes");
-    assert_eq!(active_bytes, b"active audio chunk\n");
+    let active_export = RecordingLog::new(artifact.path().as_str())
+        .recover()
+        .expect("recover active recording log")
+        .export_raw_pcm(fixture.directory.path().join("active.raw.s16le"))
+        .expect("export active raw pcm");
+    let active_bytes = fs::read(active_export.path()).expect("active artifact bytes");
+    assert_eq!(active_bytes, ACTIVE_AUDIO_BYTES);
 
     runtime.handle_input(Input::stop(session));
-    let stopped_bytes = fs::read(artifact.path().as_str()).expect("stopped artifact bytes");
-    assert_eq!(stopped_bytes, b"active audio chunk\nstopped audio chunk\n");
+    let stopped_export = RecordingLog::new(artifact.path().as_str())
+        .recover()
+        .expect("recover stopped recording log")
+        .export_raw_pcm(fixture.directory.path().join("stopped.raw.s16le"))
+        .expect("export stopped raw pcm");
+    let stopped_bytes = fs::read(stopped_export.path()).expect("stopped artifact bytes");
+    let mut expected = Vec::new();
+    expected.extend_from_slice(ACTIVE_AUDIO_BYTES);
+    expected.extend_from_slice(STOPPED_AUDIO_BYTES);
+    assert_eq!(stopped_bytes, expected);
 }
 
 #[test]
@@ -199,8 +245,23 @@ fn stop_returns_artifact_transcript_and_delivery_outcome() {
             .durable_audio_artifact
             .path()
             .as_str()
-            .ends_with(".s16le")
+            .ends_with(".listenerlog")
     );
+    let transcription_inputs = fixture.transcription_inputs();
+    assert_eq!(transcription_inputs.len(), 1);
+    assert!(
+        transcription_inputs[0]
+            .path()
+            .to_string_lossy()
+            .ends_with(".raw.s16le")
+    );
+    match transcription_inputs[0].format() {
+        BatchTranscriptionInputFormat::SignedSixteenBitLittleEndianPcm { audio_format } => {
+            assert_eq!(audio_format.sample_rate(), 16_000);
+            assert_eq!(audio_format.channel_count(), 1);
+        }
+        other => panic!("expected raw PCM transcription input, got {other:?}"),
+    }
     assert_eq!(stopped.transcript_text.as_str(), "transcribed text");
     assert_eq!(
         fixture.delivered_texts(),

@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -55,6 +57,23 @@ pub enum Error {
     #[error("capture writer thread failed")]
     CaptureWriterThread,
 
+    #[error("invalid audio format: {message}")]
+    InvalidAudioFormat { message: String },
+
+    #[error("invalid recording log at {path}: {message}")]
+    InvalidRecordingLog { path: String, message: String },
+
+    #[error(
+        "incomplete PCM frame: {remaining_bytes} trailing bytes for {bytes_per_frame}-byte frames"
+    )]
+    IncompletePcmFrame {
+        remaining_bytes: usize,
+        bytes_per_frame: u16,
+    },
+
+    #[error("system clock is before the Unix epoch: {message}")]
+    SystemClockBeforeUnixEpoch { message: String },
+
     #[error("transcription backend unavailable: {message}")]
     TranscriptionBackendUnavailable { message: String },
 
@@ -72,4 +91,13 @@ pub enum Error {
 
     #[error("{surface} is scaffolded but not implemented")]
     NotImplemented { surface: &'static str },
+}
+
+impl Error {
+    pub fn invalid_recording_log(path: &Path, message: impl Into<String>) -> Self {
+        Self::InvalidRecordingLog {
+            path: path.display().to_string(),
+            message: message.into(),
+        }
+    }
 }
