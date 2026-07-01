@@ -1,0 +1,43 @@
+[package]
+name         = "listener"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.89"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/LiGoldragon/listener"
+description  = "Listener speech-to-text CLI and supervised daemon scaffold."
+publish      = false
+
+[lib]
+name = "listener"
+path = "src/lib.rs"
+
+[[bin]]
+name = "listener"
+path = "src/main.rs"
+required-features = ["nota-text"]
+
+[[bin]]
+name = "listener-daemon"
+path = "src/bin/listener_daemon.rs"
+
+[[bin]]
+name = "meta-listener"
+path = "src/bin/meta_listener.rs"
+required-features = ["nota-text"]
+
+[features]
+default = ["nota-text"]
+nota-text = ["dep:nota", "signal-listener/nota-text", "meta-signal-listener/nota-text"]
+
+[dependencies]
+meta-signal-listener = { git = "https://github.com/LiGoldragon/meta-signal-listener.git", branch = "main", default-features = false }
+nota                 = { package = "nota", git = "https://github.com/LiGoldragon/nota-next.git", branch = "main", optional = true }
+rkyv                 = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
+signal-listener      = { git = "https://github.com/LiGoldragon/signal-listener.git", branch = "main", default-features = false }
+thiserror            = "2"
+
+[lints.rust]
+unsafe_code = "forbid"
+unused      = { level = "warn", priority = -1 }
+dead_code   = "warn"
