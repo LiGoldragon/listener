@@ -28,12 +28,13 @@ required-features = ["nota-text"]
 
 [features]
 default = ["nota-text"]
-nota-text = ["dep:nota", "signal-listener/nota-text", "meta-signal-listener/nota-text"]
+nota-text = ["dep:nota", "signal-frame/nota-text", "signal-listener/nota-text", "meta-signal-listener/nota-text"]
 
 [dependencies]
 meta-signal-listener = { git = "https://github.com/LiGoldragon/meta-signal-listener.git", branch = "main", default-features = false }
 nota                 = { package = "nota", git = "https://github.com/LiGoldragon/nota-next.git", branch = "main", optional = true }
 rkyv                 = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
+signal-frame         = { git = "https://github.com/LiGoldragon/signal-frame.git", branch = "main", default-features = false }
 signal-listener      = { git = "https://github.com/LiGoldragon/signal-listener.git", branch = "main", default-features = false }
 thiserror            = "2"
 

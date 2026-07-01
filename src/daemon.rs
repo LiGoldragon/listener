@@ -84,9 +84,9 @@ impl ListenerSocketServer {
 
     pub fn handle_connection(&mut self, stream: UnixStream) -> Result<()> {
         let mut stream = ContractFrameStream::new(stream, self.codec);
-        let input = stream.receive_input()?;
-        let output = self.runtime.handle_input(input);
-        stream.send_output(&output)
+        let request = stream.receive_request()?;
+        let output = self.runtime.handle_input(request.input().clone());
+        stream.send_reply(request, output)
     }
 }
 

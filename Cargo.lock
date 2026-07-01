@@ -316,6 +316,7 @@ dependencies = [
  "meta-signal-listener",
  "nota",
  "rkyv",
+ "signal-frame",
  "signal-listener",
  "tempfile",
  "thiserror",

@@ -13,8 +13,23 @@ pub enum Error {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("signal frame: {0}")]
-    SignalFrame(#[from] signal_listener::SignalFrameError),
+    #[error("signal exchange frame: {0}")]
+    SignalExchangeFrame(#[from] signal_frame::FrameError),
+
+    #[error("unexpected contract frame: expected {expected}, got {got}")]
+    UnexpectedContractFrame { expected: &'static str, got: String },
+
+    #[error("contract frame carries {count} operations; listener accepts exactly one")]
+    UnsupportedContractBatch { count: usize },
+
+    #[error("contract reply carries {count} operation replies; listener accepts exactly one")]
+    UnsupportedContractReplyBatch { count: usize },
+
+    #[error("reply exchange mismatch: expected {expected:?}, got {actual:?}")]
+    ReplyExchangeMismatch {
+        expected: signal_frame::ExchangeIdentifier,
+        actual: signal_frame::ExchangeIdentifier,
+    },
 
     #[error("invalid command: {message}")]
     InvalidCommand { message: String },

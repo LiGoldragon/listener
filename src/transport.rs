@@ -3,7 +3,8 @@ use std::{
     os::unix::net::UnixStream,
 };
 
-use signal_listener::{Input, Output};
+use signal_frame::{ExchangeIdentifier, ExchangeLane, LaneSequence, Reply, SessionEpoch, SubReply};
+use signal_listener::{Frame, FrameBody, Input, Output};
 
 use crate::{Error, Result};
 
@@ -38,85 +39,219 @@ impl ContractFrameCodec {
         Self::new(MaximumFrameLength::new(16 * 1024 * 1024))
     }
 
-    pub fn read_input(&self, reader: &mut impl Read) -> Result<Input> {
-        let bytes = self.read_frame(reader)?;
-        let (_route, input) = Input::decode_signal_frame(&bytes)?;
-        Ok(input)
+    pub fn read_frame(&self, reader: &mut impl Read) -> Result<Frame> {
+        let bytes = self.read_length_prefixed_frame_bytes(reader)?;
+        Ok(Frame::decode_length_prefixed(&bytes)?)
     }
 
-    pub fn write_input(&self, writer: &mut impl Write, input: &Input) -> Result<()> {
-        self.write_frame(writer, input.encode_signal_frame()?)
-    }
-
-    pub fn read_output(&self, reader: &mut impl Read) -> Result<Output> {
-        let bytes = self.read_frame(reader)?;
-        let (_route, output) = Output::decode_signal_frame(&bytes)?;
-        Ok(output)
-    }
-
-    pub fn write_output(&self, writer: &mut impl Write, output: &Output) -> Result<()> {
-        self.write_frame(writer, output.encode_signal_frame()?)
-    }
-
-    fn read_frame(&self, reader: &mut impl Read) -> Result<Vec<u8>> {
-        let mut length_bytes = [0_u8; 4];
-        reader.read_exact(&mut length_bytes)?;
-        let length = u32::from_be_bytes(length_bytes) as usize;
-        if length > self.maximum_frame_length.bytes() {
-            return Err(Error::InvalidCommand {
-                message: format!(
-                    "contract frame is {length} bytes; maximum is {}",
-                    self.maximum_frame_length.bytes()
-                ),
-            });
-        }
-
-        let mut bytes = vec![0_u8; length];
-        reader.read_exact(&mut bytes)?;
-        Ok(bytes)
-    }
-
-    fn write_frame(&self, writer: &mut impl Write, bytes: Vec<u8>) -> Result<()> {
-        if bytes.len() > self.maximum_frame_length.bytes() {
-            return Err(Error::InvalidCommand {
-                message: format!(
-                    "contract frame is {} bytes; maximum is {}",
-                    bytes.len(),
-                    self.maximum_frame_length.bytes()
-                ),
-            });
-        }
-
-        writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
+    pub fn write_frame(&self, writer: &mut impl Write, frame: &Frame) -> Result<()> {
+        let bytes = frame.encode_length_prefixed()?;
+        self.require_payload_length(bytes.len().saturating_sub(4))?;
         writer.write_all(&bytes)?;
         writer.flush()?;
         Ok(())
+    }
+
+    fn read_length_prefixed_frame_bytes(&self, reader: &mut impl Read) -> Result<Vec<u8>> {
+        let mut length_prefix = [0_u8; 4];
+        reader.read_exact(&mut length_prefix)?;
+        let frame_length = u32::from_be_bytes(length_prefix) as usize;
+        self.require_payload_length(frame_length)?;
+
+        let mut frame_bytes = Vec::with_capacity(4 + frame_length);
+        frame_bytes.extend_from_slice(&length_prefix);
+        frame_bytes.resize(4 + frame_length, 0);
+        reader.read_exact(&mut frame_bytes[4..])?;
+        Ok(frame_bytes)
+    }
+
+    fn require_payload_length(&self, frame_length: usize) -> Result<()> {
+        if frame_length > self.maximum_frame_length.bytes() {
+            return Err(Error::InvalidCommand {
+                message: format!(
+                    "contract frame is {frame_length} bytes; maximum is {}",
+                    self.maximum_frame_length.bytes()
+                ),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListenerContractRequest {
+    exchange: ExchangeIdentifier,
+    input: Input,
+}
+
+impl ListenerContractRequest {
+    pub fn from_frame(frame: Frame) -> Result<Self> {
+        match frame.into_body() {
+            FrameBody::Request { exchange, request } => {
+                let (input, additional_inputs) = request.payloads.into_head_and_tail();
+                if !additional_inputs.is_empty() {
+                    return Err(Error::UnsupportedContractBatch {
+                        count: 1 + additional_inputs.len(),
+                    });
+                }
+
+                Ok(Self { exchange, input })
+            }
+            other => Err(Error::UnexpectedContractFrame {
+                expected: "request",
+                got: format!("{other:?}"),
+            }),
+        }
+    }
+
+    pub fn exchange(&self) -> ExchangeIdentifier {
+        self.exchange
+    }
+
+    pub fn input(&self) -> &Input {
+        &self.input
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListenerContractReply {
+    exchange: ExchangeIdentifier,
+    output: Output,
+}
+
+impl ListenerContractReply {
+    pub fn from_frame(frame: Frame) -> Result<Self> {
+        match frame.into_body() {
+            FrameBody::Reply { exchange, reply } => Self::from_reply(exchange, reply),
+            other => Err(Error::UnexpectedContractFrame {
+                expected: "reply",
+                got: format!("{other:?}"),
+            }),
+        }
+    }
+
+    pub fn exchange(&self) -> ExchangeIdentifier {
+        self.exchange
+    }
+
+    pub fn into_output(self) -> Output {
+        self.output
+    }
+
+    fn from_reply(exchange: ExchangeIdentifier, reply: Reply<Output>) -> Result<Self> {
+        match reply {
+            Reply::Accepted { per_operation, .. } => {
+                let (reply, additional_replies) = per_operation.into_head_and_tail();
+                if !additional_replies.is_empty() {
+                    return Err(Error::UnsupportedContractReplyBatch {
+                        count: 1 + additional_replies.len(),
+                    });
+                }
+
+                Self::from_sub_reply(exchange, reply)
+            }
+            Reply::Rejected { reason } => Err(Error::UnexpectedContractFrame {
+                expected: "accepted reply",
+                got: format!("rejected reply: {reason:?}"),
+            }),
+        }
+    }
+
+    fn from_sub_reply(exchange: ExchangeIdentifier, reply: SubReply<Output>) -> Result<Self> {
+        match reply {
+            SubReply::Ok(output) => Ok(Self { exchange, output }),
+            SubReply::Failed {
+                detail: Some(output),
+                ..
+            } => Ok(Self { exchange, output }),
+            other => Err(Error::UnexpectedContractFrame {
+                expected: "reply payload",
+                got: format!("{other:?}"),
+            }),
+        }
     }
 }
 
 pub struct ContractFrameStream {
     stream: UnixStream,
     codec: ContractFrameCodec,
+    session_epoch: SessionEpoch,
+    next_sequence: LaneSequence,
+    pending_exchange: Option<ExchangeIdentifier>,
 }
 
 impl ContractFrameStream {
     pub fn new(stream: UnixStream, codec: ContractFrameCodec) -> Self {
-        Self { stream, codec }
+        Self {
+            stream,
+            codec,
+            session_epoch: SessionEpoch::new(0),
+            next_sequence: LaneSequence::first(),
+            pending_exchange: None,
+        }
     }
 
-    pub fn send_input(&mut self, input: &Input) -> Result<()> {
-        self.codec.write_input(&mut self.stream, input)
-    }
+    pub fn send_input(&mut self, input: Input) -> Result<()> {
+        if self.pending_exchange.is_some() {
+            return Err(Error::UnexpectedContractFrame {
+                expected: "no pending request",
+                got: "pending request".to_owned(),
+            });
+        }
 
-    pub fn receive_input(&mut self) -> Result<Input> {
-        self.codec.read_input(&mut self.stream)
-    }
-
-    pub fn send_output(&mut self, output: &Output) -> Result<()> {
-        self.codec.write_output(&mut self.stream, output)
+        let exchange = self.next_exchange();
+        let frame = input.into_frame(exchange);
+        self.send_frame(&frame)?;
+        self.pending_exchange = Some(exchange);
+        Ok(())
     }
 
     pub fn receive_output(&mut self) -> Result<Output> {
-        self.codec.read_output(&mut self.stream)
+        let reply = ListenerContractReply::from_frame(self.receive_frame()?)?;
+        self.require_pending_exchange(reply.exchange())?;
+        Ok(reply.into_output())
+    }
+
+    pub fn receive_request(&mut self) -> Result<ListenerContractRequest> {
+        ListenerContractRequest::from_frame(self.receive_frame()?)
+    }
+
+    pub fn send_reply(&mut self, request: ListenerContractRequest, output: Output) -> Result<()> {
+        let frame = output.into_reply_frame(request.exchange());
+        self.send_frame(&frame)
+    }
+
+    pub fn receive_frame(&mut self) -> Result<Frame> {
+        self.codec.read_frame(&mut self.stream)
+    }
+
+    pub fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        self.codec.write_frame(&mut self.stream, frame)
+    }
+
+    fn next_exchange(&mut self) -> ExchangeIdentifier {
+        let exchange = ExchangeIdentifier::new(
+            self.session_epoch,
+            ExchangeLane::Connector,
+            self.next_sequence,
+        );
+        self.next_sequence = self.next_sequence.next();
+        exchange
+    }
+
+    fn require_pending_exchange(&mut self, actual: ExchangeIdentifier) -> Result<()> {
+        let Some(expected) = self.pending_exchange.take() else {
+            return Err(Error::UnexpectedContractFrame {
+                expected: "reply matching a pending request",
+                got: "reply without pending request".to_owned(),
+            });
+        };
+
+        if expected != actual {
+            return Err(Error::ReplyExchangeMismatch { expected, actual });
+        }
+
+        Ok(())
     }
 }

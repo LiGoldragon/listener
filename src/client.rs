@@ -28,7 +28,7 @@ impl ListenerClient {
     pub fn call(&self, input: Input) -> Result<Output> {
         let stream = UnixStream::connect(&self.socket_path)?;
         let mut stream = ContractFrameStream::new(stream, self.codec);
-        stream.send_input(&input)?;
+        stream.send_input(input)?;
         stream.receive_output()
     }
 }

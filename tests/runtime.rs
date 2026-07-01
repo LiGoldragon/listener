@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     os::unix::net::UnixStream,
     path::Path,
     sync::{Arc, Mutex},
@@ -9,12 +9,13 @@ use std::{
 use listener::daemon::ListenerSocketServer;
 use listener::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, BatchTranscriber,
-    BatchTranscriptionRequest, Configuration, ContractFrameCodec, ContractFrameStream,
-    ListenerRuntime, OutputTargetDispatcher, TranscriptDelivery, TranscriptDeliveryRequest,
+    BatchTranscriptionRequest, Configuration, ListenerRuntime, OutputTargetDispatcher,
+    TranscriptDelivery, TranscriptDeliveryRequest,
 };
+use signal_frame::{ExchangeIdentifier, ExchangeLane, LaneSequence, Reply, SessionEpoch, SubReply};
 use signal_listener::{
-    ActiveCapture, CaptureStatus, DeliveryOutcome, DurableAudioArtifact, Input, InputSource,
-    ListenerDaemonConfiguration, MetaSocketMode, MetaSocketPath, Output, OutputTarget,
+    ActiveCapture, CaptureStatus, DeliveryOutcome, DurableAudioArtifact, Frame, FrameBody, Input,
+    InputSource, ListenerDaemonConfiguration, MetaSocketMode, MetaSocketPath, Output, OutputTarget,
     OutputTargets, SocketMode, StartCapture, StatusRequest, TranscriptText, TranscriptionMode,
     WirePath, WorkingSocketMode, WorkingSocketPath,
 };
@@ -236,23 +237,68 @@ fn output_target_dispatch_returns_one_outcome_per_configured_target() {
 }
 
 #[test]
-fn socket_server_handles_status_contract_frame() {
+fn socket_server_answers_public_status_frame_with_matching_exchange() {
     let fixture = RuntimeFixture::new();
-    let (client_stream, server_stream) = UnixStream::pair().expect("socket pair");
+    let (mut client_stream, server_stream) = UnixStream::pair().expect("socket pair");
     let mut server = ListenerSocketServer::new(fixture.configuration(), fixture.runtime());
+    let exchange = ExchangeIdentifier::new(
+        SessionEpoch::new(5),
+        ExchangeLane::Connector,
+        LaneSequence::new(13),
+    );
 
-    let mut client =
-        ContractFrameStream::new(client_stream, ContractFrameCodec::listener_default());
-    client
-        .send_input(&Input::Status(StatusRequest {}))
-        .expect("send status");
+    let request = Input::Status(StatusRequest {})
+        .into_frame(exchange)
+        .encode_length_prefixed()
+        .expect("public request frame encodes");
+    client_stream
+        .write_all(&request)
+        .expect("write public request frame");
     server
         .handle_connection(server_stream)
         .expect("server reply");
-    let output = client.receive_output().expect("receive status");
+    let response = read_length_prefixed_frame_bytes(&mut client_stream);
+    let frame = Frame::decode_length_prefixed(&response).expect("public reply frame decodes");
 
-    match output {
-        Output::StatusReported(report) => assert_eq!(report.status(), &CaptureStatus::Idle),
-        other => panic!("expected status reply, got {other:?}"),
+    match frame.into_body() {
+        FrameBody::Reply {
+            exchange: reply_exchange,
+            reply,
+        } => {
+            assert_eq!(reply_exchange, exchange);
+            match reply {
+                Reply::Accepted { per_operation, .. } => {
+                    let (reply, additional_replies) = per_operation.into_head_and_tail();
+                    assert!(
+                        additional_replies.is_empty(),
+                        "expected one reply payload, got {}",
+                        1 + additional_replies.len()
+                    );
+                    match reply {
+                        SubReply::Ok(Output::StatusReported(report)) => {
+                            assert_eq!(report.status(), &CaptureStatus::Idle);
+                        }
+                        other => panic!("expected idle status reply, got {other:?}"),
+                    }
+                }
+                other => panic!("expected accepted reply, got {other:?}"),
+            }
+        }
+        other => panic!("expected public reply frame, got {other:?}"),
     }
+}
+
+fn read_length_prefixed_frame_bytes(reader: &mut impl Read) -> Vec<u8> {
+    let mut length_prefix = [0_u8; 4];
+    reader
+        .read_exact(&mut length_prefix)
+        .expect("read reply length prefix");
+    let frame_length = u32::from_be_bytes(length_prefix) as usize;
+    let mut frame_bytes = Vec::with_capacity(4 + frame_length);
+    frame_bytes.extend_from_slice(&length_prefix);
+    frame_bytes.resize(4 + frame_length, 0);
+    reader
+        .read_exact(&mut frame_bytes[4..])
+        .expect("read reply frame body");
+    frame_bytes
 }
