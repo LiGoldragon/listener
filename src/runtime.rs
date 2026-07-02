@@ -382,7 +382,8 @@ impl Error {
             Self::AudioBackendUnavailable { .. } | Self::CaptureProcessStdoutUnavailable => {
                 UnimplementedReason::AudioBackendUnavailable
             }
-            Self::TranscriptionBackendUnavailable { .. } => {
+            Self::TranscriptionBackendUnavailable { .. }
+            | Self::TranscriptionActorUnavailable { .. } => {
                 UnimplementedReason::TranscriptionBackendUnavailable
             }
             Self::OutputTargetRejected { .. } => UnimplementedReason::OutputTargetUnavailable,

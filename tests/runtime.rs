@@ -20,8 +20,9 @@ use signal_frame::{ExchangeIdentifier, ExchangeLane, LaneSequence, Reply, Sessio
 use signal_listener::{
     ActiveCapture, CaptureSession, CaptureStatus, DeliveryOutcome, DurableAudioArtifact, Frame,
     FrameBody, Input, InputSource, ListenerDaemonConfiguration, MetaSocketMode, MetaSocketPath,
-    Output, OutputTarget, OutputTargets, SocketMode, StartCapture, StatusRequest, TranscriptText,
-    TranscriptionMode, WirePath, WorkingSocketMode, WorkingSocketPath,
+    OperationKind, Output, OutputTarget, OutputTargets, SocketMode, StartCapture, StatusRequest,
+    TranscriptText, TranscriptionMode, UnimplementedReason, WirePath, WorkingSocketMode,
+    WorkingSocketPath,
 };
 use tempfile::TempDir;
 
@@ -53,14 +54,32 @@ impl RuntimeFixture {
         &self,
         capture_backend: Box<dyn AudioCaptureBackend>,
     ) -> ListenerRuntime {
-        ListenerRuntime::with_dependencies(
-            self.configuration(),
+        self.runtime_with_capture_backend_and_transcriber(
             capture_backend,
             Box::new(FixedBatchTranscriber::new(
                 "transcribed text",
                 Arc::clone(&self.transcription_inputs),
                 self.status_publisher.clone(),
             )),
+        )
+    }
+
+    fn runtime_with_transcriber(&self, transcriber: Box<dyn BatchTranscriber>) -> ListenerRuntime {
+        self.runtime_with_capture_backend_and_transcriber(
+            Box::new(FileAudioCaptureBackend),
+            transcriber,
+        )
+    }
+
+    fn runtime_with_capture_backend_and_transcriber(
+        &self,
+        capture_backend: Box<dyn AudioCaptureBackend>,
+        transcriber: Box<dyn BatchTranscriber>,
+    ) -> ListenerRuntime {
+        ListenerRuntime::with_dependencies(
+            self.configuration(),
+            capture_backend,
+            transcriber,
             OutputTargetDispatcher::new(Box::new(RecordingDelivery::new(Arc::clone(
                 &self.deliveries,
             )))),
@@ -267,6 +286,16 @@ impl BatchTranscriber for FixedBatchTranscriber {
             .expect("transcription inputs")
             .push(request.input().clone());
         Ok(TranscriptText::new(self.text.clone()))
+    }
+}
+
+struct ActorUnavailableBatchTranscriber;
+
+impl BatchTranscriber for ActorUnavailableBatchTranscriber {
+    fn transcribe(&self, _request: BatchTranscriptionRequest) -> listener::Result<TranscriptText> {
+        Err(listener::Error::TranscriptionActorUnavailable {
+            message: "test actor unavailable".to_owned(),
+        })
     }
 }
 
@@ -558,6 +587,39 @@ fn status_events_cover_recording_transcribing_copied_without_transcript_text() {
         assert!(!line.contains("transcribed text"));
         assert!(!line.contains("transcript"));
     }
+}
+
+#[test]
+fn stop_actor_unavailable_returns_transcription_backend_unavailable_reply() {
+    let fixture = RuntimeFixture::new();
+    let mut runtime = fixture.runtime_with_transcriber(Box::new(ActorUnavailableBatchTranscriber));
+
+    let session = match runtime.handle_input(Input::Start(StartCapture {})) {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected started reply, got {other:?}"),
+    };
+
+    match runtime.handle_input(Input::stop(session)) {
+        Output::RequestUnimplemented(unimplemented) => {
+            assert_eq!(
+                unimplemented.unimplemented_operation_kind.payload(),
+                &OperationKind::Stop
+            );
+            assert_eq!(
+                unimplemented.reason.payload(),
+                &UnimplementedReason::TranscriptionBackendUnavailable
+            );
+        }
+        other => panic!("expected transcription backend unavailable reply, got {other:?}"),
+    }
+
+    let events = fixture.status_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state() == listener::ListenerStatusState::Error),
+        "expected error status event after actor unavailable failure, got {events:?}"
+    );
 }
 
 #[test]
