@@ -117,9 +117,13 @@ socket server at `$XDG_RUNTIME_DIR/listener/status.sock` by default. New clients
 receive the current event immediately, then pushed events. Events contain only
 `state` and normalized microphone `level`; transcript text stays only in the
 existing typed stop reply and delivery path. Recording levels are RMS over
-`s16le` PCM with `1.0 - exp(-rms * 18.0)`, clamped to `0.0..=1.0`. Copied,
-cancelled, and error events are terminal UI events and the stream returns to
-idle after a short delay.
+`s16le` PCM with `1.0 - exp(-rms * 18.0)`, clamped to `0.0..=1.0`. The default
+`parecord` command requests low-latency delivery, and the capture writer samples
+live levels in roughly 50 ms PCM windows instead of waiting for the
+`.listenerlog` maximum record payload. Copied, cancelled, and error events are
+terminal UI events and the stream returns to idle after a short delay. Status
+clients are written nonblocking so a slow reader is dropped instead of blocking
+publication to other clients.
 
 Ordinary lifecycle conflicts stay on the public reply surface as typed
 `signal-listener` outcomes: start while recording reports the active session,

@@ -42,7 +42,9 @@ path.
 The UI-safe status stream is a newline-delimited JSON Unix socket at
 `$XDG_RUNTIME_DIR/listener/status.sock` by default. Frames are shaped as
 `{"state":"idle|recording|transcribing|cancelled|copied|error","level":0.0}`
-and never include transcript text.
+and never include transcript text. The default `parecord` capture command
+requests low-latency capture, and the writer samples live recording levels in
+roughly 50 ms PCM windows while keeping `.listenerlog` record durability intact.
 
 Environment knobs:
 

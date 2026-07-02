@@ -364,8 +364,13 @@ impl StatusStreamLoop {
         loop {
             match self.listener.accept() {
                 Ok((mut stream, _)) => {
-                    let _ = self.write_event_to_stream(&mut stream, &self.current);
-                    self.clients.push(stream);
+                    if stream.set_nonblocking(true).is_ok()
+                        && self
+                            .write_event_to_stream(&mut stream, &self.current)
+                            .is_ok()
+                    {
+                        self.clients.push(stream);
+                    }
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                 Err(_) => break,
@@ -394,8 +399,9 @@ impl StatusStreamLoop {
             Ok(line) => line,
             Err(_) => return,
         };
+        let line = StatusStreamBroadcastLine::new(line);
         self.clients
-            .retain_mut(|stream| stream.write_all(line.as_bytes()).is_ok());
+            .retain_mut(|stream| line.write_to(stream).is_ok());
     }
 
     fn publish_idle_if_due(&mut self) {
@@ -420,8 +426,34 @@ impl StatusStreamLoop {
         stream: &mut UnixStream,
         event: &ListenerStatusEvent,
     ) -> Result<()> {
-        stream.write_all(event.json_line()?.as_bytes())?;
+        StatusStreamBroadcastLine::new(event.json_line()?).write_to(stream)?;
         Ok(())
+    }
+}
+
+struct StatusStreamBroadcastLine {
+    line: String,
+}
+
+impl StatusStreamBroadcastLine {
+    fn new(line: String) -> Self {
+        Self { line }
+    }
+
+    fn write_to(&self, stream: &mut UnixStream) -> std::io::Result<()> {
+        loop {
+            match stream.write(self.line.as_bytes()) {
+                Ok(count) if count == self.line.len() => return Ok(()),
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::WouldBlock,
+                        "status client accepted a partial frame",
+                    ));
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 

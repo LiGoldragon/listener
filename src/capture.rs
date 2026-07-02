@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use signal_listener::{
@@ -14,6 +15,8 @@ use crate::{
     Configuration, Error, RecordingAudioFormat, RecordingLog, RecordingLogHeader,
     RecordingLogWriter, RecoveredRecordingLog, Result, StatusPublisher,
 };
+
+const LIVE_LEVEL_SAMPLE_DURATION: Duration = Duration::from_millis(50);
 
 pub trait AudioCaptureBackend {
     fn start(&self, request: AudioCaptureStart) -> Result<Box<dyn ActiveAudioCapture>>;
@@ -280,6 +283,8 @@ impl AudioCaptureCommand {
                 "--format=s16le".to_owned(),
                 "--rate=16000".to_owned(),
                 "--channels=1".to_owned(),
+                "--latency-msec=50".to_owned(),
+                "--process-time-msec=25".to_owned(),
             ],
         )
     }
@@ -389,7 +394,12 @@ impl<Input: Read> CaptureWriter<Input> {
         status_publisher: StatusPublisher,
     ) -> Self {
         let pending_pcm = CaptureWriterPendingPcm::new(recording_log.audio_format());
-        let read_buffer_bytes = recording_log.maximum_record_payload_bytes() as usize;
+        let read_buffer_bytes = CaptureWriterReadWindow::new(
+            recording_log.audio_format(),
+            LIVE_LEVEL_SAMPLE_DURATION,
+            recording_log.maximum_record_payload_bytes(),
+        )
+        .bytes();
         Self {
             input,
             recording_log,
@@ -423,6 +433,37 @@ impl<Input: Read + Send + 'static> CaptureWriter<Input> {
     }
 }
 
+struct CaptureWriterReadWindow {
+    audio_format: RecordingAudioFormat,
+    duration: Duration,
+    maximum_record_payload_bytes: u32,
+}
+
+impl CaptureWriterReadWindow {
+    fn new(
+        audio_format: RecordingAudioFormat,
+        duration: Duration,
+        maximum_record_payload_bytes: u32,
+    ) -> Self {
+        Self {
+            audio_format,
+            duration,
+            maximum_record_payload_bytes,
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        let sample_rate = u128::from(self.audio_format.sample_rate());
+        let window_milliseconds = self.duration.as_millis().max(1);
+        let frames = (sample_rate * window_milliseconds / 1_000).max(1);
+        let window_bytes = frames * u128::from(self.audio_format.bytes_per_frame());
+        let maximum_record_payload_bytes = u128::from(self.maximum_record_payload_bytes);
+        window_bytes
+            .min(maximum_record_payload_bytes)
+            .max(u128::from(self.audio_format.bytes_per_frame())) as usize
+    }
+}
+
 struct CaptureWriterPendingPcm {
     audio_format: RecordingAudioFormat,
     bytes: Vec<u8>,
@@ -452,13 +493,13 @@ impl CaptureWriterPendingPcm {
         let complete_bytes: Vec<u8> = self.bytes.drain(..complete_length).collect();
         for payload in complete_bytes.chunks(recording_log.maximum_record_payload_bytes() as usize)
         {
-            recording_log.append_record(payload)?;
             status_publisher.publish_recording_level(
                 crate::MicrophoneLevel::from_recording_payload(
                     payload,
                     self.audio_format.sample_format(),
                 ),
             );
+            recording_log.append_record(payload)?;
         }
         Ok(())
     }

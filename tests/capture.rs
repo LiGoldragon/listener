@@ -86,6 +86,54 @@ fn capture_writer_commits_record_before_input_end() {
     );
 }
 
+#[test]
+fn capture_writer_samples_live_level_at_fifty_millisecond_pcm_window() {
+    let fixture = CaptureWriterFixture::new();
+    let path = fixture.path();
+    let recording_log = RecordingLogWriter::create_with_durability(
+        &path,
+        fixture.header(),
+        Box::new(CommitProbe::new(Arc::clone(&fixture.committed_lengths))),
+    )
+    .expect("create recording log");
+    let (status_publisher, status_events) = listener::StatusPublisher::recorder();
+    let sample_window_bytes = 1_600;
+    let input = ReadWindowProbeInput::new(vec![
+        vec![1; sample_window_bytes],
+        vec![2; sample_window_bytes],
+    ]);
+
+    CaptureWriter::new(input, recording_log, status_publisher)
+        .write_until_capture_stops()
+        .expect("write capture stream");
+
+    let events = status_events.events();
+    let recording_levels: Vec<f32> = events
+        .iter()
+        .filter(|event| event.state() == listener::ListenerStatusState::Recording)
+        .map(|event| event.level().value())
+        .collect();
+    assert_eq!(
+        recording_levels.len(),
+        2,
+        "expected one live level event per 50 ms PCM window, got {events:?}"
+    );
+    assert!(
+        recording_levels.iter().all(|level| *level > 0.0),
+        "expected nonzero live levels, got {recording_levels:?}"
+    );
+
+    let export = RecordingLog::new(&path)
+        .recover()
+        .expect("recover log")
+        .export_raw_pcm(fixture.directory.path().join("capture.raw.s16le"))
+        .expect("export raw pcm");
+    assert_eq!(
+        fs::read(export.path()).expect("raw bytes").len(),
+        sample_window_bytes * 2
+    );
+}
+
 struct CommitProbe {
     committed_lengths: Arc<Mutex<Vec<u64>>>,
 }
@@ -142,6 +190,38 @@ impl Read for CommitAwareInput {
                 "first payload record was not committed before the next capture read"
             );
         }
+        if self.next_chunk >= self.chunks.len() {
+            return Ok(0);
+        }
+
+        let chunk = &self.chunks[self.next_chunk];
+        output[..chunk.len()].copy_from_slice(chunk);
+        self.next_chunk += 1;
+        Ok(chunk.len())
+    }
+}
+
+struct ReadWindowProbeInput {
+    chunks: Vec<Vec<u8>>,
+    next_chunk: usize,
+}
+
+impl ReadWindowProbeInput {
+    fn new(chunks: Vec<Vec<u8>>) -> Self {
+        Self {
+            chunks,
+            next_chunk: 0,
+        }
+    }
+}
+
+impl Read for ReadWindowProbeInput {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        assert_eq!(
+            output.len(),
+            1_600,
+            "capture writer should request about 50 ms of 16 kHz mono s16le PCM, not the 8192-byte durable record ceiling"
+        );
         if self.next_chunk >= self.chunks.len() {
             return Ok(0);
         }
