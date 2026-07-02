@@ -12,7 +12,7 @@ use signal_listener::{
 
 use crate::{
     Configuration, Error, RecordingAudioFormat, RecordingLog, RecordingLogHeader,
-    RecordingLogWriter, RecoveredRecordingLog, Result,
+    RecordingLogWriter, RecoveredRecordingLog, Result, StatusPublisher,
 };
 
 pub trait AudioCaptureBackend {
@@ -25,11 +25,12 @@ pub trait ActiveAudioCapture {
     fn stop(self: Box<Self>) -> Result<DurableAudioArtifact>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct AudioCaptureStart {
     session: CaptureSession,
     artifact: DurableAudioArtifact,
     input_source: InputSource,
+    status_publisher: StatusPublisher,
 }
 
 impl AudioCaptureStart {
@@ -37,11 +38,13 @@ impl AudioCaptureStart {
         session: CaptureSession,
         artifact: DurableAudioArtifact,
         input_source: InputSource,
+        status_publisher: StatusPublisher,
     ) -> Self {
         Self {
             session,
             artifact,
             input_source,
+            status_publisher,
         }
     }
 
@@ -59,6 +62,10 @@ impl AudioCaptureStart {
 
     pub fn input_source(&self) -> InputSource {
         self.input_source
+    }
+
+    pub fn status_publisher(&self) -> StatusPublisher {
+        self.status_publisher.clone()
     }
 }
 
@@ -334,7 +341,7 @@ impl AudioCaptureCommand {
             .stdout
             .take()
             .ok_or(Error::CaptureProcessStdoutUnavailable)?;
-        let writer = CaptureWriter::new(stdout, recording_log).spawn();
+        let writer = CaptureWriter::new(stdout, recording_log, request.status_publisher()).spawn();
 
         Ok(Box::new(ProcessAudioCapture {
             artifact: request.artifact().clone(),
@@ -371,17 +378,23 @@ pub struct CaptureWriter<Input> {
     input: Input,
     recording_log: RecordingLogWriter,
     pending_pcm: CaptureWriterPendingPcm,
+    status_publisher: StatusPublisher,
     read_buffer_bytes: usize,
 }
 
 impl<Input: Read> CaptureWriter<Input> {
-    pub fn new(input: Input, recording_log: RecordingLogWriter) -> Self {
+    pub fn new(
+        input: Input,
+        recording_log: RecordingLogWriter,
+        status_publisher: StatusPublisher,
+    ) -> Self {
         let pending_pcm = CaptureWriterPendingPcm::new(recording_log.audio_format());
         let read_buffer_bytes = recording_log.maximum_record_payload_bytes() as usize;
         Self {
             input,
             recording_log,
             pending_pcm,
+            status_publisher,
             read_buffer_bytes,
         }
     }
@@ -393,8 +406,11 @@ impl<Input: Read> CaptureWriter<Input> {
             if read_count == 0 {
                 break;
             }
-            self.pending_pcm
-                .push_bytes(&read_buffer[..read_count], &mut self.recording_log)?;
+            self.pending_pcm.push_bytes(
+                &read_buffer[..read_count],
+                &mut self.recording_log,
+                &self.status_publisher,
+            )?;
         }
         self.pending_pcm.finish()?;
         self.recording_log.finish()
@@ -420,7 +436,12 @@ impl CaptureWriterPendingPcm {
         }
     }
 
-    fn push_bytes(&mut self, bytes: &[u8], recording_log: &mut RecordingLogWriter) -> Result<()> {
+    fn push_bytes(
+        &mut self,
+        bytes: &[u8],
+        recording_log: &mut RecordingLogWriter,
+        status_publisher: &StatusPublisher,
+    ) -> Result<()> {
         self.bytes.extend_from_slice(bytes);
         let bytes_per_frame = usize::from(self.audio_format.bytes_per_frame());
         let complete_length = self.bytes.len() - (self.bytes.len() % bytes_per_frame);
@@ -432,6 +453,12 @@ impl CaptureWriterPendingPcm {
         for payload in complete_bytes.chunks(recording_log.maximum_record_payload_bytes() as usize)
         {
             recording_log.append_record(payload)?;
+            status_publisher.publish_recording_level(
+                crate::MicrophoneLevel::from_recording_payload(
+                    payload,
+                    self.audio_format.sample_format(),
+                ),
+            );
         }
         Ok(())
     }

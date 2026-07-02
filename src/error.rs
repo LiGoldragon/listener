@@ -83,11 +83,20 @@ pub enum Error {
     #[error("transcription backend unavailable: {message}")]
     TranscriptionBackendUnavailable { message: String },
 
+    #[error("transcription actor unavailable: {message}")]
+    TranscriptionActorUnavailable { message: String },
+
     #[error("output target rejected transcript: {message}")]
     OutputTargetRejected { message: String },
 
     #[error("daemon socket is already accepting connections at {path}")]
     DaemonAlreadyRunning { path: String },
+
+    #[error("status socket is already accepting connections at {path}")]
+    StatusSocketAlreadyRunning { path: String },
+
+    #[error("status event encode failed: {message}")]
+    StatusEventEncode { message: String },
 
     #[error("daemon socket path has no parent directory: {path}")]
     SocketParentMissing { path: String },

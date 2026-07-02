@@ -1,9 +1,10 @@
 use std::{
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use listener::daemon::ListenerSocketServer;
@@ -12,7 +13,8 @@ use listener::{
     BatchTranscriptionInput, BatchTranscriptionInputFormat, BatchTranscriptionRequest,
     Configuration, ListenerRuntime, OutputTargetDispatcher, RecordingAudioFormat,
     RecordingInputSource, RecordingLog, RecordingLogHeader, RecordingLogWriter, RecordingStartTime,
-    TranscriptDelivery, TranscriptDeliveryRequest,
+    StatusEventRecorder, StatusPublisher, StatusStreamServer, TranscriptDelivery,
+    TranscriptDeliveryRequest,
 };
 use signal_frame::{ExchangeIdentifier, ExchangeLane, LaneSequence, Reply, SessionEpoch, SubReply};
 use signal_listener::{
@@ -27,14 +29,19 @@ struct RuntimeFixture {
     directory: TempDir,
     deliveries: Arc<Mutex<Vec<String>>>,
     transcription_inputs: Arc<Mutex<Vec<BatchTranscriptionInput>>>,
+    status_publisher: StatusPublisher,
+    status_events: StatusEventRecorder,
 }
 
 impl RuntimeFixture {
     fn new() -> Self {
+        let (status_publisher, status_events) = StatusPublisher::recorder();
         Self {
             directory: TempDir::new().expect("temp directory"),
             deliveries: Arc::new(Mutex::new(Vec::new())),
             transcription_inputs: Arc::new(Mutex::new(Vec::new())),
+            status_publisher,
+            status_events,
         }
     }
 
@@ -52,10 +59,12 @@ impl RuntimeFixture {
             Box::new(FixedBatchTranscriber::new(
                 "transcribed text",
                 Arc::clone(&self.transcription_inputs),
+                self.status_publisher.clone(),
             )),
             OutputTargetDispatcher::new(Box::new(RecordingDelivery::new(Arc::clone(
                 &self.deliveries,
             )))),
+            self.status_publisher.clone(),
         )
     }
 
@@ -116,6 +125,10 @@ impl RuntimeFixture {
             .expect("transcription inputs")
             .clone()
     }
+
+    fn status_events(&self) -> Vec<listener::ListenerStatusEvent> {
+        self.status_events.events()
+    }
 }
 
 struct FileAudioCaptureBackend;
@@ -131,9 +144,16 @@ impl AudioCaptureBackend for FileAudioCaptureBackend {
         )?;
         let mut writer = RecordingLogWriter::create(&artifact_path, header)?;
         writer.append_record(ACTIVE_AUDIO_BYTES)?;
+        request.status_publisher().publish_recording_level(
+            listener::MicrophoneLevel::from_recording_payload(
+                ACTIVE_AUDIO_BYTES,
+                RecordingAudioFormat::signed_sixteen_bit_little_endian_mono_16khz().sample_format(),
+            ),
+        );
         Ok(Box::new(FileAudioCapture::new(
             request.artifact().clone(),
             writer,
+            request.status_publisher(),
         )))
     }
 }
@@ -179,11 +199,20 @@ impl AudioCaptureBackend for RacingCollisionAudioCaptureBackend {
 struct FileAudioCapture {
     artifact: DurableAudioArtifact,
     writer: RecordingLogWriter,
+    status_publisher: StatusPublisher,
 }
 
 impl FileAudioCapture {
-    fn new(artifact: DurableAudioArtifact, writer: RecordingLogWriter) -> Self {
-        Self { artifact, writer }
+    fn new(
+        artifact: DurableAudioArtifact,
+        writer: RecordingLogWriter,
+        status_publisher: StatusPublisher,
+    ) -> Self {
+        Self {
+            artifact,
+            writer,
+            status_publisher,
+        }
     }
 }
 
@@ -196,8 +225,15 @@ impl ActiveAudioCapture for FileAudioCapture {
         let FileAudioCapture {
             artifact,
             mut writer,
+            status_publisher,
         } = *self;
         writer.append_record(STOPPED_AUDIO_BYTES)?;
+        status_publisher.publish_recording_level(
+            listener::MicrophoneLevel::from_recording_payload(
+                STOPPED_AUDIO_BYTES,
+                RecordingAudioFormat::signed_sixteen_bit_little_endian_mono_16khz().sample_format(),
+            ),
+        );
         writer.finish()?;
         Ok(artifact)
     }
@@ -206,19 +242,26 @@ impl ActiveAudioCapture for FileAudioCapture {
 struct FixedBatchTranscriber {
     text: String,
     inputs: Arc<Mutex<Vec<BatchTranscriptionInput>>>,
+    status_publisher: StatusPublisher,
 }
 
 impl FixedBatchTranscriber {
-    fn new(text: impl Into<String>, inputs: Arc<Mutex<Vec<BatchTranscriptionInput>>>) -> Self {
+    fn new(
+        text: impl Into<String>,
+        inputs: Arc<Mutex<Vec<BatchTranscriptionInput>>>,
+        status_publisher: StatusPublisher,
+    ) -> Self {
         Self {
             text: text.into(),
             inputs,
+            status_publisher,
         }
     }
 }
 
 impl BatchTranscriber for FixedBatchTranscriber {
     fn transcribe(&self, request: BatchTranscriptionRequest) -> listener::Result<TranscriptText> {
+        self.status_publisher.publish_transcribing();
         self.inputs
             .lock()
             .expect("transcription inputs")
@@ -468,6 +511,75 @@ fn stop_returns_artifact_transcript_and_delivery_outcome() {
 }
 
 #[test]
+fn status_events_cover_recording_transcribing_copied_without_transcript_text() {
+    let fixture = RuntimeFixture::new();
+    let mut runtime = fixture.runtime();
+
+    let session = match runtime.handle_input(Input::Start(StartCapture {})) {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected started reply, got {other:?}"),
+    };
+    let stop_reply = runtime.handle_input(Input::stop(session));
+    match stop_reply {
+        Output::Stopped(stopped) => {
+            assert_eq!(stopped.transcript_text.as_str(), "transcribed text");
+        }
+        other => panic!("expected stopped reply, got {other:?}"),
+    }
+
+    let events = fixture.status_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state() == listener::ListenerStatusState::Recording),
+        "expected at least one recording status event, got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state() == listener::ListenerStatusState::Transcribing),
+        "expected transcribing status event, got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state() == listener::ListenerStatusState::Copied),
+        "expected copied status event, got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .filter(|event| event.state() == listener::ListenerStatusState::Recording)
+            .any(|event| event.level().value() > 0.0),
+        "expected nonzero microphone level while recording, got {events:?}"
+    );
+    for event in events {
+        let line = event.json_line().expect("status event json");
+        assert!(!line.contains("transcribed text"));
+        assert!(!line.contains("transcript"));
+    }
+}
+
+#[test]
+fn status_stream_sends_newline_json_frames() {
+    let fixture = RuntimeFixture::new();
+    let status_socket = fixture.directory.path().join("status.sock");
+    let (server, publisher) = StatusStreamServer::new(&status_socket);
+    let _server_thread = server.spawn().expect("status server starts");
+    let stream = StatusStreamClientProbe::connect(&status_socket);
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+
+    reader.read_line(&mut line).expect("read initial status");
+    assert_eq!(line, "{\"state\":\"idle\",\"level\":0.0}\n");
+
+    line.clear();
+    publisher.publish_recording_level(listener::MicrophoneLevel::new(0.5));
+    reader.read_line(&mut line).expect("read recording status");
+    assert_eq!(line, "{\"state\":\"recording\",\"level\":0.5}\n");
+}
+
+#[test]
 fn start_while_active_returns_typed_conflict_reply() {
     let fixture = RuntimeFixture::new();
     let mut runtime = fixture.runtime();
@@ -670,4 +782,33 @@ fn read_length_prefixed_frame_bytes(reader: &mut impl Read) -> Vec<u8> {
         .read_exact(&mut frame_bytes[4..])
         .expect("read reply frame body");
     frame_bytes
+}
+
+struct StatusStreamClientProbe;
+
+impl StatusStreamClientProbe {
+    fn connect(path: &Path) -> UnixStream {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match UnixStream::connect(path) {
+                Ok(stream) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .expect("set status stream read timeout");
+                    return stream;
+                }
+                Err(error) if std::time::Instant::now() < deadline => {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        ),
+                        "unexpected status socket connect error: {error}"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("status socket did not accept connection: {error}"),
+            }
+        }
+    }
 }

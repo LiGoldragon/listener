@@ -16,6 +16,7 @@ pub mod error;
 pub mod meta;
 pub mod recording_log;
 pub mod runtime;
+pub mod status;
 pub mod transcription;
 pub mod transport;
 
@@ -40,8 +41,14 @@ pub use recording_log::{
     RecordingSampleFormat, RecordingStartTime, RecoveredRecordingLog,
 };
 pub use runtime::ListenerRuntime;
+pub use status::{
+    ListenerStatusEvent, ListenerStatusState, MicrophoneLevel, StatusEventRecorder,
+    StatusPublisher, StatusStreamServer,
+};
 pub use transcription::{
     BatchTranscriber, BatchTranscriptionInput, BatchTranscriptionInputFormat,
     BatchTranscriptionRequest, ConfiguredBatchTranscriber, HonestStubTranscriber,
+    OpenAiBatchTranscriptionActor, OpenAiCredentialSource, OpenAiRestTranscriber,
+    OpenAiTranscriptionRequestConfiguration,
 };
 pub use transport::{ContractFrameCodec, ContractFrameStream, MaximumFrameLength};

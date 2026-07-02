@@ -14,15 +14,34 @@ use crate::{Error, Result};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Configuration {
     inner: ListenerDaemonConfiguration,
+    status_socket_path: PathBuf,
 }
 
 impl Configuration {
     pub fn from_environment() -> Self {
-        Self::new(ConfigurationEnvironment::from_process().listener_configuration())
+        let environment = ConfigurationEnvironment::from_process();
+        Self::new_with_status_socket_path(
+            environment.listener_configuration(),
+            environment.status_socket_path(),
+        )
     }
 
     pub fn new(inner: ListenerDaemonConfiguration) -> Self {
-        Self { inner }
+        let status_socket_path = Self::default_status_socket_path(&inner);
+        Self {
+            inner,
+            status_socket_path,
+        }
+    }
+
+    pub fn new_with_status_socket_path(
+        inner: ListenerDaemonConfiguration,
+        status_socket_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            inner,
+            status_socket_path: status_socket_path.into(),
+        }
     }
 
     pub fn inner(&self) -> &ListenerDaemonConfiguration {
@@ -47,6 +66,10 @@ impl Configuration {
 
     pub fn meta_socket_mode(&self) -> u32 {
         self.inner.meta_socket_mode.payload().as_u32()
+    }
+
+    pub fn status_socket_path(&self) -> PathBuf {
+        self.status_socket_path.clone()
     }
 
     pub fn capture_store_directory(&self) -> PathBuf {
@@ -76,12 +99,21 @@ impl Configuration {
             .map(|bytes| bytes.to_vec())
             .map_err(|_| Error::ConfigurationEncode)
     }
+
+    fn default_status_socket_path(inner: &ListenerDaemonConfiguration) -> PathBuf {
+        let working_socket_path = PathBuf::from(inner.working_socket_path.payload().as_str());
+        working_socket_path
+            .parent()
+            .map(|directory| directory.join("listener/status.sock"))
+            .unwrap_or_else(|| env::temp_dir().join("listener/status.sock"))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigurationEnvironment {
     working_socket_path: PathBuf,
     meta_socket_path: PathBuf,
+    status_socket_path: PathBuf,
     capture_store_directory: PathBuf,
 }
 
@@ -98,6 +130,9 @@ impl ConfigurationEnvironment {
             meta_socket_path: env::var_os("LISTENER_META_SOCKET")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| Self::socket_path(&runtime_directory, "listener-meta.sock")),
+            status_socket_path: env::var_os("LISTENER_STATUS_SOCKET")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| Self::runtime_status_socket_path(&runtime_directory)),
             capture_store_directory: env::var_os("LISTENER_CAPTURE_STORE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| Self::capture_store_directory_path(&state_home, &home)),
@@ -109,11 +144,23 @@ impl ConfigurationEnvironment {
         meta_socket_path: impl Into<PathBuf>,
         capture_store_directory: impl Into<PathBuf>,
     ) -> Self {
+        let working_socket_path = working_socket_path.into();
+        let meta_socket_path = meta_socket_path.into();
+        let capture_store_directory = capture_store_directory.into();
+        let status_socket_path = working_socket_path
+            .parent()
+            .map(|directory| directory.join("listener/status.sock"))
+            .unwrap_or_else(|| env::temp_dir().join("listener/status.sock"));
         Self {
-            working_socket_path: working_socket_path.into(),
-            meta_socket_path: meta_socket_path.into(),
-            capture_store_directory: capture_store_directory.into(),
+            working_socket_path,
+            meta_socket_path,
+            status_socket_path,
+            capture_store_directory,
         }
+    }
+
+    pub fn status_socket_path(&self) -> PathBuf {
+        self.status_socket_path.clone()
     }
 
     pub fn listener_configuration(&self) -> ListenerDaemonConfiguration {
@@ -136,6 +183,13 @@ impl ConfigurationEnvironment {
             .as_ref()
             .map(|directory| directory.join(file_name))
             .unwrap_or_else(|| env::temp_dir().join(file_name))
+    }
+
+    fn runtime_status_socket_path(runtime_directory: &Option<PathBuf>) -> PathBuf {
+        runtime_directory
+            .as_ref()
+            .map(|directory| directory.join("listener/status.sock"))
+            .unwrap_or_else(|| env::temp_dir().join("listener/status.sock"))
     }
 
     fn capture_store_directory_path(

@@ -4,12 +4,13 @@
 `meta-listener` CLI, and `listener-daemon` process.
 
 The first implementation slice is scoped to default input capture, continuous
-durable disk write, batch transcription on stop, and system clipboard delivery.
-The daemon listens on the configured working socket, starts capture from the
-system default input through `parecord --device=@DEFAULT_SOURCE@`, writes a
-single growing Listener recording log while recording, recovers that log on
-stop, exports a raw `s16le` PCM view for batch transcription, and dispatches the
-transcript to configured output targets.
+durable disk write, internal OpenAI batch transcription on stop, system
+clipboard delivery, and a UI-safe status stream. The daemon listens on the
+configured working socket, starts capture from the system default input through
+`parecord --device=@DEFAULT_SOURCE@`, writes a single growing Listener recording
+log while recording, recovers that log on stop, exports a raw `s16le` PCM view
+for batch transcription, and dispatches the transcript to configured output
+targets.
 
 The active capture artifact is a custom `.listenerlog` file, not a standard
 audio container. It starts with a self-describing header for version, `s16le`
@@ -27,17 +28,27 @@ Start/stop state conflicts are returned as typed public replies from
 `signal-listener`: already-active capture, no active capture, and active versus
 requested session mismatch.
 
-Transcription is a narrow backend seam. Set `LISTENER_TRANSCRIPTION_PROGRAM` to
-a batch command that accepts the recovered raw `s16le` PCM export path and
-writes transcript text to stdout. Without that variable, Listener returns an
-explicit not-configured stub transcript instead of claiming speech recognition
-happened.
+Production transcription is Listener-owned. The daemon runs a bounded internal
+OpenAI transcription actor that converts the recovered raw `s16le` PCM export
+to a WAV upload, reads the provider credential at request time with
+`gopass show -o openai/api-key`, calls OpenAI REST transcription with
+`gpt-4o-transcribe`, and returns only the transcript to the existing stop reply
+and delivery path. The development-only `LISTENER_DEVELOPMENT_TRANSCRIPTION_PROGRAM`
+seam may be used for local backend experiments; it is not the normal production
+path.
+
+The UI-safe status stream is a newline-delimited JSON Unix socket at
+`$XDG_RUNTIME_DIR/listener/status.sock` by default. Frames are shaped as
+`{"state":"idle|recording|transcribing|copied|error","level":0.0}` and never
+include transcript text.
 
 Environment knobs:
 
 - `LISTENER_SOCKET`: ordinary daemon socket path.
 - `LISTENER_META_SOCKET`: owner/meta socket path.
+- `LISTENER_STATUS_SOCKET`: UI-safe status stream socket path.
 - `LISTENER_CAPTURE_STORE`: durable capture directory.
 - `LISTENER_CAPTURE_PROGRAM`: parecord-compatible capture command.
-- `LISTENER_TRANSCRIPTION_PROGRAM`: batch transcription command.
+- `LISTENER_DEVELOPMENT_TRANSCRIPTION_PROGRAM`: development-only batch
+  transcription command.
 - `LISTENER_CLIPBOARD_PROGRAM`: clipboard command, default `wl-copy`.

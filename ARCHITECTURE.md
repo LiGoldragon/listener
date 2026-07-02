@@ -9,9 +9,11 @@ The first vertical slice is:
 
 - capture from the default system input;
 - write captured audio continuously to durable disk while capture is active;
-- transcribe the batch when capture stops;
+- transcribe the batch through Listener's internal OpenAI actor when capture
+  stops;
 - deliver the resulting text to the system clipboard as the first configured
   output target.
+- publish UI-safe capture/transcription/delivery state without transcript text.
 
 Listener runs in the NixOS desktop audio context: PipeWire, WirePlumber,
 pipewire-pulse, BlueZ, and CriomOS-home carry forward as operating context for
@@ -36,7 +38,8 @@ store directly, or bypass the daemon path.
 - `meta-listener` thin owner/meta CLI entry point.
 - `listener-daemon` runtime entry point.
 - Runtime implementation of audio capture, durable capture-log writes,
-  transcription-input export, transcription execution, and output delivery.
+  transcription-input export, internal OpenAI transcription execution, output
+  delivery, and local UI-safe status streaming.
 - Typed configuration archive helpers over
   `signal_listener::ListenerDaemonConfiguration`.
 
@@ -63,6 +66,8 @@ store directly, or bypass the daemon path.
   effects, including idle orphan recording-log discovery.
 - `src/capture.rs`, `src/transcription.rs`, and `src/delivery.rs` hold the
   explicit effect seams.
+- `src/status.rs` owns the local newline-JSON status stream and microphone
+  level projection.
 - `src/recording_log.rs` owns the one-file append-only Listener recording log,
   exclusive creation, recovery scanner, idempotent truncation, and raw PCM
   export.
@@ -94,11 +99,21 @@ the first incomplete or corrupt tail to the last valid record boundary.
 Recovery is idempotent. While idle, Listener also scans existing `.listenerlog`
 files, recovers crash-survived orphan logs, and advances new capture sessions
 past existing `capture-<session>.listenerlog` names before starting another
-recording. The configured transcription program receives a recovered raw
-`s16le` PCM export path, not the custom `.listenerlog` path. Without
-`LISTENER_TRANSCRIPTION_PROGRAM`, Listener returns an explicit not-configured
-stub transcript. Clipboard delivery uses `wl-copy` by default through the typed
-output-target dispatcher.
+recording. Listener exports a recovered raw `s16le` PCM path, sends that path
+as typed mail to the internal OpenAI transcription actor, converts it to an
+in-memory WAV upload, reads `gopass openai/api-key` at request time, and calls
+OpenAI REST transcription with `gpt-4o-transcribe`. Clipboard delivery uses
+`wl-copy` by default through the typed output-target dispatcher.
+
+The status stream is local to the runtime repo rather than a transcript-bearing
+public Signal reply. `listener-daemon` starts a state-bearing newline-JSON Unix
+socket server at `$XDG_RUNTIME_DIR/listener/status.sock` by default. New clients
+receive the current event immediately, then pushed events. Events contain only
+`state` and normalized microphone `level`; transcript text stays only in the
+existing typed stop reply and delivery path. Recording levels are RMS over
+`s16le` PCM with `1.0 - exp(-rms * 18.0)`, clamped to `0.0..=1.0`. Copied and
+error events are terminal UI events and the stream returns to idle after a
+short delay.
 
 Ordinary lifecycle conflicts stay on the public reply surface as typed
 `signal-listener` outcomes: start while recording reports the active session,

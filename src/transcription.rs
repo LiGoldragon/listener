@@ -1,10 +1,20 @@
-use std::{path::PathBuf, process::Command};
+use std::{fs, path::PathBuf, process::Command, sync::mpsc, thread, time::Duration};
 
 use signal_listener::{DurableAudioArtifact, TranscriptText};
 
-use crate::{Error, RecordingAudioFormat, Result};
+use serde::Deserialize;
 
-pub trait BatchTranscriber {
+use crate::{Error, RecordingAudioFormat, RecordingSampleFormat, Result, StatusPublisher};
+
+const OPENAI_TRANSCRIPTION_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
+const OPENAI_TRANSCRIPTION_MODEL: &str = "gpt-4o-transcribe";
+const OPENAI_TRANSCRIPTION_LANGUAGE: &str = "en";
+const OPENAI_TRANSCRIPTION_PROMPT: &str = "Transcribe spoken English as dictated text. Preserve technical names such as Codex, Claude, CriomOS, Niri, Colemak, OpenAI, gopass, Whisrs, Hyprvoice, and Listener. Do not translate.";
+const OPENAI_MAXIMUM_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
+const TRANSCRIPTION_ACTOR_QUEUE_CAPACITY: usize = 1;
+const TRANSCRIPTION_ACTOR_REPLY_TIMEOUT: Duration = Duration::from_secs(75);
+
+pub trait BatchTranscriber: Send {
     fn transcribe(&self, request: BatchTranscriptionRequest) -> Result<TranscriptText>;
 }
 
@@ -82,6 +92,413 @@ pub enum BatchTranscriptionInputFormat {
     SignedSixteenBitLittleEndianPcm { audio_format: RecordingAudioFormat },
 }
 
+pub struct OpenAiBatchTranscriptionActor {
+    sender: mpsc::SyncSender<TranscriptionActorMessage>,
+    reply_timeout: Duration,
+}
+
+impl OpenAiBatchTranscriptionActor {
+    pub fn from_environment(status_publisher: StatusPublisher) -> Self {
+        Self::new(
+            OpenAiRestTranscriber::from_environment(),
+            status_publisher,
+            TRANSCRIPTION_ACTOR_REPLY_TIMEOUT,
+        )
+    }
+
+    pub fn new(
+        transcriber: OpenAiRestTranscriber,
+        status_publisher: StatusPublisher,
+        reply_timeout: Duration,
+    ) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(TRANSCRIPTION_ACTOR_QUEUE_CAPACITY);
+        TranscriptionActorWorker::new(transcriber, status_publisher, receiver).spawn();
+        Self {
+            sender,
+            reply_timeout,
+        }
+    }
+}
+
+impl BatchTranscriber for OpenAiBatchTranscriptionActor {
+    fn transcribe(&self, request: BatchTranscriptionRequest) -> Result<TranscriptText> {
+        let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
+        self.sender
+            .send(TranscriptionActorMessage::Transcribe(
+                TranscriptionActorRequest::new(request, reply_sender),
+            ))
+            .map_err(|_| Error::TranscriptionActorUnavailable {
+                message: "transcription actor is not running".to_owned(),
+            })?;
+        reply_receiver
+            .recv_timeout(self.reply_timeout)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => Error::TranscriptionActorUnavailable {
+                    message: "OpenAI transcription actor timed out".to_owned(),
+                },
+                mpsc::RecvTimeoutError::Disconnected => Error::TranscriptionActorUnavailable {
+                    message: "OpenAI transcription actor disconnected".to_owned(),
+                },
+            })?
+    }
+}
+
+struct TranscriptionActorWorker {
+    transcriber: OpenAiRestTranscriber,
+    status_publisher: StatusPublisher,
+    receiver: mpsc::Receiver<TranscriptionActorMessage>,
+    in_flight: Option<DurableAudioArtifact>,
+}
+
+impl TranscriptionActorWorker {
+    fn new(
+        transcriber: OpenAiRestTranscriber,
+        status_publisher: StatusPublisher,
+        receiver: mpsc::Receiver<TranscriptionActorMessage>,
+    ) -> Self {
+        Self {
+            transcriber,
+            status_publisher,
+            receiver,
+            in_flight: None,
+        }
+    }
+
+    fn spawn(mut self) {
+        thread::spawn(move || self.run());
+    }
+
+    fn run(&mut self) {
+        while let Ok(message) = self.receiver.recv() {
+            match message {
+                TranscriptionActorMessage::Transcribe(request) => {
+                    self.handle_transcription(request)
+                }
+            }
+        }
+    }
+
+    fn handle_transcription(&mut self, request: TranscriptionActorRequest) {
+        self.in_flight = Some(request.request().artifact().clone());
+        self.status_publisher.publish_transcribing();
+        let result = self.transcriber.transcribe(request.request().clone());
+        if result.is_err() {
+            self.status_publisher.publish_error();
+        }
+        let _ = request.reply(result);
+        self.in_flight = None;
+    }
+}
+
+enum TranscriptionActorMessage {
+    Transcribe(TranscriptionActorRequest),
+}
+
+struct TranscriptionActorRequest {
+    request: BatchTranscriptionRequest,
+    reply_sender: mpsc::SyncSender<Result<TranscriptText>>,
+}
+
+impl TranscriptionActorRequest {
+    fn new(
+        request: BatchTranscriptionRequest,
+        reply_sender: mpsc::SyncSender<Result<TranscriptText>>,
+    ) -> Self {
+        Self {
+            request,
+            reply_sender,
+        }
+    }
+
+    fn request(&self) -> &BatchTranscriptionRequest {
+        &self.request
+    }
+
+    fn reply(
+        self,
+        result: Result<TranscriptText>,
+    ) -> std::result::Result<(), mpsc::SendError<Result<TranscriptText>>> {
+        self.reply_sender.send(result)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OpenAiRestTranscriber {
+    client: reqwest::blocking::Client,
+    credentials: OpenAiCredentialSource,
+    request_configuration: OpenAiTranscriptionRequestConfiguration,
+}
+
+impl OpenAiRestTranscriber {
+    pub fn from_environment() -> Self {
+        Self::new(
+            reqwest::blocking::Client::builder()
+                .timeout(TRANSCRIPTION_ACTOR_REPLY_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| reqwest::blocking::Client::new()),
+            OpenAiCredentialSource::gopass("openai/api-key"),
+            OpenAiTranscriptionRequestConfiguration::default(),
+        )
+    }
+
+    pub fn new(
+        client: reqwest::blocking::Client,
+        credentials: OpenAiCredentialSource,
+        request_configuration: OpenAiTranscriptionRequestConfiguration,
+    ) -> Self {
+        Self {
+            client,
+            credentials,
+            request_configuration,
+        }
+    }
+
+    pub fn transcribe(&self, request: BatchTranscriptionRequest) -> Result<TranscriptText> {
+        let upload = WavAudioUpload::from_batch_input(request.input())?;
+        if upload.bytes().len() > OPENAI_MAXIMUM_UPLOAD_BYTES {
+            return Err(Error::TranscriptionBackendUnavailable {
+                message: format!(
+                    "OpenAI upload is {} bytes, above the 25 MiB limit",
+                    upload.bytes().len()
+                ),
+            });
+        }
+        let api_key = self.credentials.resolve()?;
+        let file_part = reqwest::blocking::multipart::Part::bytes(upload.into_bytes())
+            .file_name("listener-input.wav")
+            .mime_str("audio/wav")
+            .map_err(|error| Error::TranscriptionBackendUnavailable {
+                message: format!("failed to prepare OpenAI audio upload: {error}"),
+            })?;
+        let form = reqwest::blocking::multipart::Form::new()
+            .part("file", file_part)
+            .text("model", self.request_configuration.model().to_owned())
+            .text("language", self.request_configuration.language().to_owned())
+            .text("prompt", self.request_configuration.prompt().to_owned());
+        let response = self
+            .client
+            .post(OPENAI_TRANSCRIPTION_URL)
+            .bearer_auth(api_key)
+            .multipart(form)
+            .send()
+            .map_err(|error| Error::TranscriptionBackendUnavailable {
+                message: format!("OpenAI transcription request failed: {error}"),
+            })?;
+        OpenAiTranscriptionResponseBody::from_response(response)?.into_transcript_text()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenAiCredentialSource {
+    secret_name: String,
+}
+
+impl OpenAiCredentialSource {
+    pub fn gopass(secret_name: impl Into<String>) -> Self {
+        Self {
+            secret_name: secret_name.into(),
+        }
+    }
+
+    pub fn resolve(&self) -> Result<String> {
+        let output = Command::new("gopass")
+            .args(["show", "-o", self.secret_name.as_str()])
+            .output()
+            .map_err(|error| Error::TranscriptionBackendUnavailable {
+                message: format!("failed to start gopass for OpenAI credential: {error}"),
+            })?;
+        if !output.status.success() {
+            return Err(Error::TranscriptionBackendUnavailable {
+                message: format!("gopass returned {} for OpenAI credential", output.status),
+            });
+        }
+        let key = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if key.is_empty() {
+            Err(Error::TranscriptionBackendUnavailable {
+                message: "gopass returned an empty OpenAI credential".to_owned(),
+            })
+        } else {
+            Ok(key)
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenAiTranscriptionRequestConfiguration {
+    model: String,
+    language: String,
+    prompt: String,
+}
+
+impl OpenAiTranscriptionRequestConfiguration {
+    pub fn new(
+        model: impl Into<String>,
+        language: impl Into<String>,
+        prompt: impl Into<String>,
+    ) -> Self {
+        Self {
+            model: model.into(),
+            language: language.into(),
+            prompt: prompt.into(),
+        }
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn language(&self) -> &str {
+        &self.language
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+}
+
+impl Default for OpenAiTranscriptionRequestConfiguration {
+    fn default() -> Self {
+        Self::new(
+            OPENAI_TRANSCRIPTION_MODEL,
+            OPENAI_TRANSCRIPTION_LANGUAGE,
+            OPENAI_TRANSCRIPTION_PROMPT,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+struct OpenAiTranscriptionResponse {
+    text: String,
+}
+
+struct OpenAiTranscriptionResponseBody {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl OpenAiTranscriptionResponseBody {
+    fn from_response(response: reqwest::blocking::Response) -> Result<Self> {
+        let status = response.status();
+        let body = response
+            .text()
+            .map_err(|error| Error::TranscriptionBackendUnavailable {
+                message: format!("failed to read OpenAI transcription response: {error}"),
+            })?;
+        Ok(Self { status, body })
+    }
+
+    fn into_transcript_text(self) -> Result<TranscriptText> {
+        if !self.status.is_success() {
+            return Err(Error::TranscriptionBackendUnavailable {
+                message: format!(
+                    "OpenAI transcription returned HTTP {}",
+                    self.status.as_u16()
+                ),
+            });
+        }
+        let parsed: OpenAiTranscriptionResponse =
+            serde_json::from_str(&self.body).map_err(|error| {
+                Error::TranscriptionBackendUnavailable {
+                    message: format!("failed to decode OpenAI transcription response: {error}"),
+                }
+            })?;
+        let transcript = parsed.text.trim().to_owned();
+        if transcript.is_empty() {
+            Err(Error::TranscriptionBackendUnavailable {
+                message: "OpenAI transcription response did not contain text".to_owned(),
+            })
+        } else {
+            Ok(TranscriptText::new(transcript))
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WavAudioUpload {
+    bytes: Vec<u8>,
+}
+
+impl WavAudioUpload {
+    fn from_batch_input(input: &BatchTranscriptionInput) -> Result<Self> {
+        match input.format() {
+            BatchTranscriptionInputFormat::SignedSixteenBitLittleEndianPcm { audio_format } => {
+                Self::from_raw_pcm(input.path(), *audio_format)
+            }
+            BatchTranscriptionInputFormat::ListenerRecordingLog => {
+                Err(Error::TranscriptionBackendUnavailable {
+                    message: "OpenAI transcription requires exported raw PCM input".to_owned(),
+                })
+            }
+        }
+    }
+
+    fn from_raw_pcm(path: &PathBuf, audio_format: RecordingAudioFormat) -> Result<Self> {
+        if audio_format.sample_format() != RecordingSampleFormat::SignedSixteenBitLittleEndian {
+            return Err(Error::TranscriptionBackendUnavailable {
+                message: "OpenAI transcription only supports Listener s16le PCM exports".to_owned(),
+            });
+        }
+        let pcm = fs::read(path)?;
+        if pcm.is_empty() {
+            return Err(Error::TranscriptionBackendUnavailable {
+                message: "OpenAI transcription input is empty".to_owned(),
+            });
+        }
+        if !pcm
+            .len()
+            .is_multiple_of(usize::from(audio_format.bytes_per_frame()))
+        {
+            return Err(Error::IncompletePcmFrame {
+                remaining_bytes: pcm.len() % usize::from(audio_format.bytes_per_frame()),
+                bytes_per_frame: audio_format.bytes_per_frame(),
+            });
+        }
+        Self::new(pcm, audio_format)
+    }
+
+    fn new(pcm: Vec<u8>, audio_format: RecordingAudioFormat) -> Result<Self> {
+        let data_length =
+            u32::try_from(pcm.len()).map_err(|_| Error::TranscriptionBackendUnavailable {
+                message: "OpenAI transcription input is too large for WAV".to_owned(),
+            })?;
+        let chunk_length =
+            data_length
+                .checked_add(36)
+                .ok_or_else(|| Error::TranscriptionBackendUnavailable {
+                    message: "OpenAI transcription input is too large for WAV".to_owned(),
+                })?;
+        let byte_rate = audio_format
+            .sample_rate()
+            .checked_mul(u32::from(audio_format.bytes_per_frame()))
+            .ok_or_else(|| Error::TranscriptionBackendUnavailable {
+                message: "OpenAI transcription WAV byte rate overflowed".to_owned(),
+            })?;
+        let mut bytes = Vec::with_capacity(44 + pcm.len());
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&chunk_length.to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&audio_format.channel_count().to_le_bytes());
+        bytes.extend_from_slice(&audio_format.sample_rate().to_le_bytes());
+        bytes.extend_from_slice(&byte_rate.to_le_bytes());
+        bytes.extend_from_slice(&audio_format.bytes_per_frame().to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_length.to_le_bytes());
+        bytes.extend_from_slice(&pcm);
+        Ok(Self { bytes })
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfiguredBatchTranscriber {
     command: Option<BatchTranscriptionCommand>,
@@ -91,7 +508,7 @@ pub struct ConfiguredBatchTranscriber {
 impl ConfiguredBatchTranscriber {
     pub fn from_environment() -> Self {
         Self {
-            command: std::env::var("LISTENER_TRANSCRIPTION_PROGRAM")
+            command: std::env::var("LISTENER_DEVELOPMENT_TRANSCRIPTION_PROGRAM")
                 .ok()
                 .map(BatchTranscriptionCommand::new),
             stub: HonestStubTranscriber::from_environment(),

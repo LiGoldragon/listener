@@ -1,19 +1,19 @@
 use signal_listener::{
     ActiveCapture, ActiveCaptureSession, CaptureAlreadyActive, CaptureSession,
-    CaptureSessionMismatch, CaptureStarted, CaptureStatus, CaptureStopped, Input, NoActiveCapture,
-    OperationKind, Output, Reason, RequestUnimplemented, RequestedCaptureSession, StartCapture,
-    StartedSession, StatusRequest, StopCapture, StoppedSession, UnimplementedOperationKind,
-    UnimplementedReason,
+    CaptureSessionMismatch, CaptureStarted, CaptureStatus, CaptureStopped, DeliveryOutcome,
+    DeliveryOutcomes, Input, NoActiveCapture, OperationKind, Output, Reason, RequestUnimplemented,
+    RequestedCaptureSession, StartCapture, StartedSession, StatusRequest, StopCapture,
+    StoppedSession, UnimplementedOperationKind, UnimplementedReason,
 };
 
 use crate::{
-    ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureStore, Configuration,
-    ConfiguredBatchTranscriber, Error, OutputTargetDispatcher, RecordingLog,
+    ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureStore, Configuration, Error,
+    OpenAiBatchTranscriptionActor, OutputTargetDispatcher, RecordingLog,
     RecoveredCaptureRecordings, Result,
 };
 use crate::{
     BatchTranscriber, BatchTranscriptionInput, BatchTranscriptionRequest,
-    ProcessAudioCaptureBackend,
+    ProcessAudioCaptureBackend, StatusPublisher,
 };
 
 pub struct ListenerRuntime {
@@ -22,6 +22,7 @@ pub struct ListenerRuntime {
     capture_backend: Box<dyn AudioCaptureBackend>,
     transcriber: Box<dyn BatchTranscriber>,
     output_target_dispatcher: OutputTargetDispatcher,
+    status_publisher: StatusPublisher,
     session_sequence: CaptureSessionSequence,
     active_capture: Option<RuntimeActiveCapture>,
     orphaned_recordings: RecoveredCaptureRecordings,
@@ -29,11 +30,21 @@ pub struct ListenerRuntime {
 
 impl ListenerRuntime {
     pub fn from_configuration(configuration: Configuration) -> Self {
+        Self::from_configuration_with_status(configuration, StatusPublisher::silent())
+    }
+
+    pub fn from_configuration_with_status(
+        configuration: Configuration,
+        status_publisher: StatusPublisher,
+    ) -> Self {
         Self::with_dependencies(
             configuration,
             Box::new(ProcessAudioCaptureBackend::from_environment()),
-            Box::new(ConfiguredBatchTranscriber::from_environment()),
+            Box::new(OpenAiBatchTranscriptionActor::from_environment(
+                status_publisher.clone(),
+            )),
             OutputTargetDispatcher::from_environment(),
+            status_publisher,
         )
     }
 
@@ -42,6 +53,7 @@ impl ListenerRuntime {
         capture_backend: Box<dyn AudioCaptureBackend>,
         transcriber: Box<dyn BatchTranscriber>,
         output_target_dispatcher: OutputTargetDispatcher,
+        status_publisher: StatusPublisher,
     ) -> Self {
         let capture_store = CaptureStore::from_configuration(&configuration);
         Self {
@@ -50,6 +62,7 @@ impl ListenerRuntime {
             capture_backend,
             transcriber,
             output_target_dispatcher,
+            status_publisher,
             session_sequence: CaptureSessionSequence::new(1),
             active_capture: None,
             orphaned_recordings: RecoveredCaptureRecordings::empty(),
@@ -93,25 +106,51 @@ impl ListenerRuntime {
             });
         }
 
-        let stopped_capture = active_capture.stop()?;
-        let recovered_log = RecordingLog::new(stopped_capture.artifact_path()).recover()?;
-        let raw_pcm_export = recovered_log.export_raw_pcm(
+        let stopped_capture = match active_capture.stop() {
+            Ok(stopped_capture) => stopped_capture,
+            Err(error) => {
+                self.status_publisher.publish_error();
+                return Err(error);
+            }
+        };
+        let recovered_log = match RecordingLog::new(stopped_capture.artifact_path()).recover() {
+            Ok(recovered_log) => recovered_log,
+            Err(error) => {
+                self.status_publisher.publish_error();
+                return Err(error);
+            }
+        };
+        let raw_pcm_export = match recovered_log.export_raw_pcm(
             self.capture_store
                 .raw_pcm_export_for_artifact(stopped_capture.artifact()),
-        )?;
+        ) {
+            Ok(raw_pcm_export) => raw_pcm_export,
+            Err(error) => {
+                self.status_publisher.publish_error();
+                return Err(error);
+            }
+        };
         let transcription_input = BatchTranscriptionInput::signed_sixteen_bit_little_endian_pcm(
             raw_pcm_export.path().to_path_buf(),
             raw_pcm_export.audio_format(),
         );
         let transcript_text =
-            self.transcriber
+            match self
+                .transcriber
                 .transcribe(BatchTranscriptionRequest::new_with_input(
                     stopped_capture.artifact().clone(),
                     transcription_input,
-                ))?;
+                )) {
+                Ok(transcript_text) => transcript_text,
+                Err(error) => {
+                    self.status_publisher.publish_error();
+                    return Err(error);
+                }
+            };
         let delivery_outcomes = self
             .output_target_dispatcher
             .deliver(self.configuration.output_targets(), &transcript_text);
+        RuntimeDeliveryStatus::from_outcomes(&delivery_outcomes).publish(&self.status_publisher);
 
         Ok(Output::Stopped(CaptureStopped {
             stopped_session: StoppedSession::new(stopped_capture.session().clone()),
@@ -154,6 +193,7 @@ impl ListenerRuntime {
                 session.clone(),
                 artifact.clone(),
                 self.configuration.input_source(),
+                self.status_publisher.clone(),
             )) {
                 Ok(capture) => {
                     self.active_capture = Some(RuntimeActiveCapture::new(
@@ -161,6 +201,8 @@ impl ListenerRuntime {
                         artifact,
                         capture,
                     ));
+                    self.status_publisher
+                        .publish_recording_level(crate::MicrophoneLevel::silent());
                     return Ok(Output::Started(CaptureStarted::new(StartedSession::new(
                         session,
                     ))));
@@ -172,8 +214,43 @@ impl ListenerRuntime {
                     self.session_sequence
                         .advance_to_at_least(next_session_value);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    self.status_publisher.publish_error();
+                    return Err(error);
+                }
             }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeDeliveryStatus {
+    Delivered,
+    Failed,
+    NoTargets,
+}
+
+impl RuntimeDeliveryStatus {
+    fn from_outcomes(outcomes: &DeliveryOutcomes) -> Self {
+        let mut delivered_count = 0_usize;
+        for outcome in outcomes.as_slice() {
+            match outcome {
+                DeliveryOutcome::Delivered(_) => delivered_count += 1,
+                DeliveryOutcome::Failed(_) => return Self::Failed,
+            }
+        }
+        if delivered_count == 0 {
+            Self::NoTargets
+        } else {
+            Self::Delivered
+        }
+    }
+
+    fn publish(&self, status_publisher: &StatusPublisher) {
+        match self {
+            Self::Delivered => status_publisher.publish_copied(),
+            Self::Failed => status_publisher.publish_error(),
+            Self::NoTargets => status_publisher.publish_idle(),
         }
     }
 }

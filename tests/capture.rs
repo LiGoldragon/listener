@@ -61,7 +61,7 @@ fn capture_writer_commits_record_before_input_end() {
         baseline_commit_count,
     );
 
-    CaptureWriter::new(input, recording_log)
+    CaptureWriter::new(input, recording_log, listener::StatusPublisher::silent())
         .write_until_capture_stops()
         .expect("write capture stream");
 

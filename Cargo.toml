@@ -1,6 +1,6 @@
 [package]
 name         = "listener"
-version      = "0.3.0"
+version      = "0.4.0"
 edition      = "2024"
 rust-version = "1.89"
 license      = "MIT OR Apache-2.0"
@@ -34,7 +34,10 @@ nota-text = ["dep:nota", "signal-frame/nota-text", "signal-listener/nota-text", 
 crc32fast            = "1"
 meta-signal-listener = { git = "https://github.com/LiGoldragon/meta-signal-listener.git", branch = "main", default-features = false }
 nota                 = { package = "nota", git = "https://github.com/LiGoldragon/nota-next.git", branch = "main", optional = true }
+reqwest              = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 rkyv                 = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
+serde                = { version = "1", features = ["derive"] }
+serde_json           = "1"
 signal-frame         = { git = "https://github.com/LiGoldragon/signal-frame.git", branch = "main", default-features = false }
 signal-listener      = { git = "https://github.com/LiGoldragon/signal-listener.git", branch = "main", default-features = false }
 thiserror            = "2"

@@ -11,6 +11,7 @@ use std::{
 
 use crate::{
     Configuration, ContractFrameCodec, ContractFrameStream, Error, ListenerRuntime, Result,
+    StatusStreamServer,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,7 +36,13 @@ impl ListenerDaemon {
 
     pub fn run(&self) -> Result<()> {
         let configuration = Configuration::from_environment();
-        let runtime = ListenerRuntime::from_configuration(configuration.clone());
+        let (status_server, status_publisher) =
+            StatusStreamServer::from_configuration(&configuration);
+        let _status_thread = status_server.spawn()?;
+        let runtime = ListenerRuntime::from_configuration_with_status(
+            configuration.clone(),
+            status_publisher,
+        );
         ListenerSocketServer::new(configuration, runtime).serve()
     }
 
