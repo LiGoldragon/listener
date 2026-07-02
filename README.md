@@ -30,6 +30,17 @@ Start/stop/cancel state conflicts are returned as typed public replies from
 `signal-listener`: already-active capture, no active capture, and active versus
 requested session mismatch.
 
+When a capture stops with a successful transcript, Listener appends the
+transcript to a private, append-only history file at
+`$XDG_DATA_HOME/listener/history.jsonl` (typically
+`~/.local/share/listener/history.jsonl`), created with owner-only directory and
+file permissions. Each JSON line records the Unix-millisecond timestamp, the
+capture session, and the transcript text. A cancelled capture writes no history
+entry. The `listener-recall` client reads that history newest first, shows a
+`fuzzel --dmenu` picker over one-line previews, and copies the full chosen
+transcript back to the system clipboard. Recall reads the history file directly
+and does not require the daemon.
+
 Production transcription is Listener-owned. The daemon runs a bounded internal
 OpenAI transcription actor that converts the recovered raw `s16le` PCM export
 to a WAV upload, reads the provider credential at request time with
@@ -56,3 +67,6 @@ Environment knobs:
 - `LISTENER_DEVELOPMENT_TRANSCRIPTION_PROGRAM`: development-only batch
   transcription command.
 - `LISTENER_CLIPBOARD_PROGRAM`: clipboard command, default `wl-copy`.
+- `LISTENER_HISTORY_STORE`: transcript history file, default
+  `$XDG_DATA_HOME/listener/history.jsonl`.
+- `LISTENER_RECALL_SELECTOR`: recall picker command, default `fuzzel`.

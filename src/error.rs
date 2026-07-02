@@ -89,6 +89,15 @@ pub enum Error {
     #[error("output target rejected transcript: {message}")]
     OutputTargetRejected { message: String },
 
+    #[error("transcript history entry encode failed: {message}")]
+    HistoryEntryEncode { message: String },
+
+    #[error("transcript history entry decode failed: {message}")]
+    HistoryEntryDecode { message: String },
+
+    #[error("recall selector `{program}` unavailable: {message}")]
+    RecallSelectorUnavailable { program: String, message: String },
+
     #[error("daemon socket is already accepting connections at {path}")]
     DaemonAlreadyRunning { path: String },
 

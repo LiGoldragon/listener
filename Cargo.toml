@@ -1,6 +1,6 @@
 [package]
 name         = "listener"
-version      = "0.5.1"
+version      = "0.6.0"
 edition      = "2024"
 rust-version = "1.89"
 license      = "MIT OR Apache-2.0"
@@ -20,6 +20,10 @@ required-features = ["nota-text"]
 [[bin]]
 name = "listener-daemon"
 path = "src/bin/listener_daemon.rs"
+
+[[bin]]
+name = "listener-recall"
+path = "src/bin/listener_recall.rs"
 
 [[bin]]
 name = "meta-listener"

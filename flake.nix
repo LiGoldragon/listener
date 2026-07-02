@@ -80,6 +80,20 @@
               cargoTestExtraArgs = "--test configuration";
             }
           );
+          test-history = context.craneLib.cargoTest (
+            context.commonArgs
+            // {
+              inherit (context) cargoArtifacts;
+              cargoTestExtraArgs = "--test history";
+            }
+          );
+          test-recall = context.craneLib.cargoTest (
+            context.commonArgs
+            // {
+              inherit (context) cargoArtifacts;
+              cargoTestExtraArgs = "--test recall";
+            }
+          );
           doc = context.craneLib.cargoDoc (
             context.commonArgs
             // {
@@ -111,6 +125,10 @@
           daemon = {
             type = "app";
             program = "${package}/bin/listener-daemon";
+          };
+          recall = {
+            type = "app";
+            program = "${package}/bin/listener-recall";
           };
           meta = {
             type = "app";

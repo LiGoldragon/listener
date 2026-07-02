@@ -15,6 +15,8 @@ The first vertical slice is:
   transcription and delivery;
 - deliver the resulting text to the system clipboard as the first configured
   output target.
+- append each successful transcript to a private local history store and recall
+  a past transcript back to the clipboard through a fuzzel picker.
 - publish UI-safe capture/transcription/delivery state without transcript text.
 
 Listener runs in the NixOS desktop audio context: PipeWire, WirePlumber,
@@ -39,9 +41,11 @@ store directly, or bypass the daemon path.
 - `listener` thin CLI entry point.
 - `meta-listener` thin owner/meta CLI entry point.
 - `listener-daemon` runtime entry point.
+- `listener-recall` thin recall client entry point.
 - Runtime implementation of audio capture, durable capture-log writes,
   transcription-input export, internal OpenAI transcription execution, output
-  delivery, and local UI-safe status streaming.
+  delivery, local UI-safe status streaming, and the private transcript history
+  store.
 - Typed configuration archive helpers over
   `signal_listener::ListenerDaemonConfiguration`.
 
@@ -70,6 +74,11 @@ store directly, or bypass the daemon path.
   explicit effect seams.
 - `src/status.rs` owns the local newline-JSON status stream and microphone
   level projection.
+- `src/history.rs` owns the typed append-only transcript history store and its
+  JSONL projection under the XDG data directory.
+- `src/recall.rs` owns the transcript recall flow: read history newest first,
+  drive a fuzzel dmenu picker, and copy the chosen transcript to the clipboard.
+- `src/bin/listener_recall.rs` is the thin `listener-recall` client entry point.
 - `src/recording_log.rs` owns the one-file append-only Listener recording log,
   exclusive creation, recovery scanner, idempotent truncation, and raw PCM
   export.
@@ -81,7 +90,12 @@ store directly, or bypass the daemon path.
   record before capture stop through the writer sync boundary.
 - `tests/runtime.rs` proves active durable artifact writes, stop-time recovery
   export, stop reply shape, cancel retention, no-transcription/no-delivery
-  cancel behavior, and output-target dispatch.
+  cancel behavior, output-target dispatch, transcript-history append on stop,
+  and history untouched on cancel.
+- `tests/history.rs` proves append/read-back ordering, limit truncation,
+  multiline round trip, owner-only permissions, and empty-store reads.
+- `tests/recall.rs` proves the read-select-copy recall flow end to end, empty
+  history, and cancelled selection through stub selector and clipboard programs.
 
 ## Status
 
@@ -110,6 +124,20 @@ typed mail to the internal OpenAI transcription actor, converts it to an
 in-memory WAV upload, reads `gopass openai/api-key` at request time, and calls
 OpenAI REST transcription with `gpt-4o-transcribe`. Clipboard delivery uses
 `wl-copy` by default through the typed output-target dispatcher.
+
+On a successful stop, before delivery, the runtime appends the transcript to a
+private append-only history store at `$XDG_DATA_HOME/listener/history.jsonl`
+(overridable with `LISTENER_HISTORY_STORE`), created with owner-only directory
+and file permissions. The typed `TranscriptHistoryEntry` carries the record and
+its JSON line is the human/interchange projection: Unix-millisecond timestamp,
+capture session, and transcript text. History is a best-effort convenience
+projection, so a history-write failure never aborts the stop or drops the
+already-produced transcript. A cancelled capture skips this step and writes no
+history entry. `listener-recall` reads the history newest first, presents a
+`fuzzel --dmenu` picker over one-line previews (selector overridable with
+`LISTENER_RECALL_SELECTOR`), and copies the full chosen transcript to the
+clipboard through the same clipboard command; it reads the history file directly
+and does not open the daemon path.
 
 The status stream is local to the runtime repo rather than a transcript-bearing
 public Signal reply. `listener-daemon` starts a state-bearing newline-JSON Unix

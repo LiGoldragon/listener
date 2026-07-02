@@ -11,10 +11,10 @@ use listener::daemon::ListenerSocketServer;
 use listener::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, BatchTranscriber,
     BatchTranscriptionInput, BatchTranscriptionInputFormat, BatchTranscriptionRequest,
-    Configuration, ListenerRuntime, OutputTargetDispatcher, RecordingAudioFormat,
+    Configuration, HistoryLimit, ListenerRuntime, OutputTargetDispatcher, RecordingAudioFormat,
     RecordingInputSource, RecordingLog, RecordingLogHeader, RecordingLogWriter, RecordingStartTime,
     StatusEventRecorder, StatusPublisher, StatusStreamServer, TranscriptDelivery,
-    TranscriptDeliveryRequest,
+    TranscriptDeliveryRequest, TranscriptHistoryStore,
 };
 use signal_frame::{ExchangeIdentifier, ExchangeLane, LaneSequence, Reply, SessionEpoch, SubReply};
 use signal_listener::{
@@ -83,8 +83,26 @@ impl RuntimeFixture {
             OutputTargetDispatcher::new(Box::new(RecordingDelivery::new(Arc::clone(
                 &self.deliveries,
             )))),
+            self.history_store(),
             self.status_publisher.clone(),
         )
+    }
+
+    fn history_path(&self) -> PathBuf {
+        self.directory.path().join("history.jsonl")
+    }
+
+    fn history_store(&self) -> TranscriptHistoryStore {
+        TranscriptHistoryStore::new(self.history_path())
+    }
+
+    fn recorded_history(&self) -> Vec<String> {
+        self.history_store()
+            .read_recent(HistoryLimit::new(64))
+            .expect("read transcript history")
+            .iter()
+            .map(|entry| entry.transcript_text().as_str().to_owned())
+            .collect()
     }
 
     fn configuration(&self) -> Configuration {
@@ -530,6 +548,11 @@ fn stop_returns_artifact_transcript_and_delivery_outcome() {
         fixture.delivered_texts(),
         vec!["transcribed text".to_owned()]
     );
+    assert_eq!(
+        fixture.recorded_history(),
+        vec!["transcribed text".to_owned()],
+        "a successful stop must append the transcript to history"
+    );
     assert_eq!(stopped.delivery_outcomes.as_slice().len(), 1);
     match &stopped.delivery_outcomes.as_slice()[0] {
         DeliveryOutcome::Delivered(delivered) => {
@@ -590,6 +613,14 @@ fn cancel_stops_capture_retains_artifact_and_skips_transcription_and_delivery() 
     assert!(
         fixture.delivered_texts().is_empty(),
         "cancel must not deliver transcript text"
+    );
+    assert!(
+        fixture.recorded_history().is_empty(),
+        "cancel must not append a transcript history entry"
+    );
+    assert!(
+        !fixture.history_path().exists(),
+        "cancel must not create the transcript history store"
     );
     match runtime.handle_input(Input::Status(StatusRequest {})) {
         Output::StatusReported(report) => assert_eq!(report.status(), &CaptureStatus::Idle),

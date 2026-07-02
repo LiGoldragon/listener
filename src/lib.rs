@@ -12,8 +12,10 @@ pub mod configuration;
 pub mod daemon;
 pub mod delivery;
 pub mod error;
+pub mod history;
 #[cfg(feature = "nota-text")]
 pub mod meta;
+pub mod recall;
 pub mod recording_log;
 pub mod runtime;
 pub mod status;
@@ -30,11 +32,14 @@ pub use command::CommandLine;
 pub use configuration::{Configuration, ConfigurationEnvironment};
 pub use daemon::ListenerDaemon;
 pub use delivery::{
-    ClipboardDelivery, OutputTargetDispatcher, TranscriptDelivery, TranscriptDeliveryRequest,
+    ClipboardCommand, ClipboardDelivery, OutputTargetDispatcher, TranscriptDelivery,
+    TranscriptDeliveryRequest,
 };
 pub use error::{Error, Result};
+pub use history::{HistoryLimit, HistoryTimestamp, TranscriptHistoryEntry, TranscriptHistoryStore};
 #[cfg(feature = "nota-text")]
 pub use meta::MetaCommandLine;
+pub use recall::{RecallOutcome, RecallSelector, TranscriptRecall};
 pub use recording_log::{
     RawPcmExport, RecordingAudioFormat, RecordingInputSource, RecordingLog, RecordingLogDurability,
     RecordingLogDurabilityPolicy, RecordingLogHeader, RecordingLogRecordCommit, RecordingLogWriter,

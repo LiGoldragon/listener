@@ -3,13 +3,14 @@ use signal_listener::{
     CaptureCancelled, CaptureSession, CaptureSessionMismatch, CaptureStarted, CaptureStatus,
     CaptureStopped, DeliveryOutcome, DeliveryOutcomes, Input, NoActiveCapture, OperationKind,
     Output, Reason, RequestUnimplemented, RequestedCaptureSession, StartCapture, StartedSession,
-    StatusRequest, StopCapture, StoppedSession, UnimplementedOperationKind, UnimplementedReason,
+    StatusRequest, StopCapture, StoppedSession, TranscriptText, UnimplementedOperationKind,
+    UnimplementedReason,
 };
 
 use crate::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureStore, Configuration, Error,
     OpenAiBatchTranscriptionActor, OutputTargetDispatcher, RecordingLog,
-    RecoveredCaptureRecordings, Result,
+    RecoveredCaptureRecordings, Result, TranscriptHistoryEntry, TranscriptHistoryStore,
 };
 use crate::{
     BatchTranscriber, BatchTranscriptionInput, BatchTranscriptionRequest,
@@ -22,6 +23,7 @@ pub struct ListenerRuntime {
     capture_backend: Box<dyn AudioCaptureBackend>,
     transcriber: Box<dyn BatchTranscriber>,
     output_target_dispatcher: OutputTargetDispatcher,
+    history_store: TranscriptHistoryStore,
     status_publisher: StatusPublisher,
     session_sequence: CaptureSessionSequence,
     active_capture: Option<RuntimeActiveCapture>,
@@ -44,6 +46,7 @@ impl ListenerRuntime {
                 status_publisher.clone(),
             )),
             OutputTargetDispatcher::from_environment(),
+            TranscriptHistoryStore::from_environment(),
             status_publisher,
         )
     }
@@ -53,6 +56,7 @@ impl ListenerRuntime {
         capture_backend: Box<dyn AudioCaptureBackend>,
         transcriber: Box<dyn BatchTranscriber>,
         output_target_dispatcher: OutputTargetDispatcher,
+        history_store: TranscriptHistoryStore,
         status_publisher: StatusPublisher,
     ) -> Self {
         let capture_store = CaptureStore::from_configuration(&configuration);
@@ -62,6 +66,7 @@ impl ListenerRuntime {
             capture_backend,
             transcriber,
             output_target_dispatcher,
+            history_store,
             status_publisher,
             session_sequence: CaptureSessionSequence::new(1),
             active_capture: None,
@@ -136,6 +141,7 @@ impl ListenerRuntime {
                     return Err(error);
                 }
             };
+        self.record_transcript_history(stopped_capture.session(), &transcript_text);
         let delivery_outcomes = self
             .output_target_dispatcher
             .deliver(self.configuration.output_targets(), &transcript_text);
@@ -165,6 +171,22 @@ impl ListenerRuntime {
             cancelled_session: CancelledSession::new(stopped_capture.session().clone()),
             durable_audio_artifact: stopped_capture.artifact().clone(),
         }))
+    }
+
+    /// Append the finished transcript to the local history store. This is a
+    /// best-effort convenience projection: the transcript is already in the stop
+    /// reply and about to be delivered, so a history-write failure must not abort
+    /// the stop or lose the transcript. A cancelled capture never reaches here.
+    fn record_transcript_history(
+        &self,
+        session: &CaptureSession,
+        transcript_text: &TranscriptText,
+    ) {
+        if let Ok(entry) =
+            TranscriptHistoryEntry::recorded_now(session.clone(), transcript_text.clone())
+        {
+            let _ = self.history_store.append(&entry);
+        }
     }
 
     pub fn status(&mut self, _request: StatusRequest) -> Result<Output> {
@@ -435,6 +457,8 @@ impl Error {
             | Self::RecordingLogAlreadyExists { .. }
             | Self::CaptureSessionSequenceExhausted { .. }
             | Self::IncompletePcmFrame { .. }
+            | Self::HistoryEntryEncode { .. }
+            | Self::HistoryEntryDecode { .. }
             | Self::SystemClockBeforeUnixEpoch { .. } => UnimplementedReason::StoreUnavailable,
             _ => UnimplementedReason::NotBuiltYet,
         }
