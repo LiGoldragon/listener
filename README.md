@@ -5,12 +5,14 @@
 
 The first implementation slice is scoped to default input capture, continuous
 durable disk write, internal OpenAI batch transcription on stop, system
-clipboard delivery, and a UI-safe status stream. The daemon listens on the
-configured working socket, starts capture from the system default input through
-`parecord --device=@DEFAULT_SOURCE@`, writes a single growing Listener recording
-log while recording, recovers that log on stop, exports a raw `s16le` PCM view
-for batch transcription, and dispatches the transcript to configured output
-targets.
+clipboard delivery, typed cancellation, and a UI-safe status stream. The daemon
+listens on the configured working socket, starts capture from the system default
+input through `parecord --device=@DEFAULT_SOURCE@`, writes a single growing
+Listener recording log while recording, recovers that log on stop, exports a raw
+`s16le` PCM view for batch transcription, and dispatches the transcript to
+configured output targets. Cancel stops the active capture and retains the
+`.listenerlog` artifact without exporting audio for transcription, calling
+OpenAI, or delivering text.
 
 The active capture artifact is a custom `.listenerlog` file, not a standard
 audio container. It starts with a self-describing header for version, `s16le`
@@ -24,7 +26,7 @@ The writer creates `.listenerlog` files exclusively. On daemon restart, Listener
 scans existing capture logs, recovers idle orphan logs, and allocates the next
 active artifact after the existing `capture-<session>.listenerlog` names.
 
-Start/stop state conflicts are returned as typed public replies from
+Start/stop/cancel state conflicts are returned as typed public replies from
 `signal-listener`: already-active capture, no active capture, and active versus
 requested session mismatch.
 
@@ -39,8 +41,8 @@ path.
 
 The UI-safe status stream is a newline-delimited JSON Unix socket at
 `$XDG_RUNTIME_DIR/listener/status.sock` by default. Frames are shaped as
-`{"state":"idle|recording|transcribing|copied|error","level":0.0}` and never
-include transcript text.
+`{"state":"idle|recording|transcribing|cancelled|copied|error","level":0.0}`
+and never include transcript text.
 
 Environment knobs:
 

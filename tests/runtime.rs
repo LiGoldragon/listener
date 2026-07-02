@@ -540,6 +540,97 @@ fn stop_returns_artifact_transcript_and_delivery_outcome() {
 }
 
 #[test]
+fn cancel_stops_capture_retains_artifact_and_skips_transcription_and_delivery() {
+    let fixture = RuntimeFixture::new();
+    let mut runtime = fixture.runtime();
+
+    let session = match runtime.handle_input(Input::Start(StartCapture {})) {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected started reply, got {other:?}"),
+    };
+    let artifact = match runtime.handle_input(Input::Status(StatusRequest {})) {
+        Output::StatusReported(report) => match report.status() {
+            CaptureStatus::Capturing(ActiveCapture {
+                durable_audio_artifact,
+                ..
+            }) => durable_audio_artifact.clone(),
+            other => panic!("expected active capture status, got {other:?}"),
+        },
+        other => panic!("expected status reply, got {other:?}"),
+    };
+
+    match runtime.handle_input(Input::cancel(session.clone())) {
+        Output::Cancelled(cancelled) => {
+            assert_eq!(cancelled.cancelled_session.payload(), &session);
+            assert_eq!(&cancelled.durable_audio_artifact, &artifact);
+        }
+        other => panic!("expected cancelled reply, got {other:?}"),
+    }
+
+    let mut stop_export_path = PathBuf::from(artifact.path().as_str());
+    stop_export_path.set_extension("raw.s16le");
+    assert!(
+        !stop_export_path.exists(),
+        "cancel must not create the normal stop-time transcription export"
+    );
+    let retained_export = RecordingLog::new(artifact.path().as_str())
+        .recover()
+        .expect("recover retained cancelled recording log")
+        .export_raw_pcm(fixture.directory.path().join("cancelled.raw.s16le"))
+        .expect("export cancelled raw pcm");
+    let retained_bytes = fs::read(retained_export.path()).expect("cancelled raw bytes");
+    let mut expected = Vec::new();
+    expected.extend_from_slice(ACTIVE_AUDIO_BYTES);
+    expected.extend_from_slice(STOPPED_AUDIO_BYTES);
+    assert_eq!(retained_bytes, expected);
+    assert!(
+        fixture.transcription_inputs().is_empty(),
+        "cancel must not send transcription input"
+    );
+    assert!(
+        fixture.delivered_texts().is_empty(),
+        "cancel must not deliver transcript text"
+    );
+    match runtime.handle_input(Input::Status(StatusRequest {})) {
+        Output::StatusReported(report) => assert_eq!(report.status(), &CaptureStatus::Idle),
+        other => panic!("expected idle status reply after cancel, got {other:?}"),
+    }
+
+    let events = fixture.status_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state() == listener::ListenerStatusState::Cancelled),
+        "expected cancelled status event, got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .filter(|event| event.state() == listener::ListenerStatusState::Cancelled)
+            .all(|event| event.json_line().expect("cancelled status json")
+                == "{\"state\":\"cancelled\",\"level\":0.0}\n"),
+        "expected UI-safe cancelled status JSON, got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.state() == listener::ListenerStatusState::Transcribing),
+        "cancel must not publish transcribing status, got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.state() == listener::ListenerStatusState::Copied),
+        "cancel must not publish copied status, got {events:?}"
+    );
+    for event in events {
+        let line = event.json_line().expect("status event json");
+        assert!(!line.contains("transcribed text"));
+        assert!(!line.contains("transcript"));
+    }
+}
+
+#[test]
 fn status_events_cover_recording_transcribing_copied_without_transcript_text() {
     let fixture = RuntimeFixture::new();
     let mut runtime = fixture.runtime();
@@ -701,6 +792,53 @@ fn stop_with_wrong_session_returns_typed_conflict_reply_and_preserves_active_cap
                 ..
             }) => assert_eq!(active_capture_session.payload(), &session),
             other => panic!("expected active capture after wrong stop, got {other:?}"),
+        },
+        other => panic!("expected status reply, got {other:?}"),
+    }
+
+    runtime.handle_input(Input::stop(session));
+}
+
+#[test]
+fn cancel_while_idle_returns_typed_conflict_reply() {
+    let fixture = RuntimeFixture::new();
+    let mut runtime = fixture.runtime();
+
+    match runtime.handle_input(Input::cancel(CaptureSession::new(1))) {
+        Output::NoActiveCapture(_) => {}
+        other => panic!("expected no-active-capture conflict, got {other:?}"),
+    }
+}
+
+#[test]
+fn cancel_with_wrong_session_returns_typed_conflict_reply_and_preserves_active_capture() {
+    let fixture = RuntimeFixture::new();
+    let mut runtime = fixture.runtime();
+
+    let session = match runtime.handle_input(Input::Start(StartCapture {})) {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected started reply, got {other:?}"),
+    };
+    let requested_session = CaptureSession::new(session.value() + 1);
+
+    match runtime.handle_input(Input::cancel(requested_session.clone())) {
+        Output::CaptureSessionMismatch(conflict) => {
+            assert_eq!(conflict.active_capture_session.payload(), &session);
+            assert_eq!(
+                conflict.requested_capture_session.payload(),
+                &requested_session
+            );
+        }
+        other => panic!("expected session-mismatch conflict, got {other:?}"),
+    }
+
+    match runtime.handle_input(Input::Status(StatusRequest {})) {
+        Output::StatusReported(report) => match report.status() {
+            CaptureStatus::Capturing(ActiveCapture {
+                active_capture_session,
+                ..
+            }) => assert_eq!(active_capture_session.payload(), &session),
+            other => panic!("expected active capture after wrong cancel, got {other:?}"),
         },
         other => panic!("expected status reply, got {other:?}"),
     }

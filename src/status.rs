@@ -21,6 +21,7 @@ pub enum ListenerStatusState {
     Idle,
     Recording,
     Transcribing,
+    Cancelled,
     Copied,
     Error,
 }
@@ -31,13 +32,14 @@ impl ListenerStatusState {
             Self::Idle => "idle",
             Self::Recording => "recording",
             Self::Transcribing => "transcribing",
+            Self::Cancelled => "cancelled",
             Self::Copied => "copied",
             Self::Error => "error",
         }
     }
 
     fn returns_to_idle(&self) -> bool {
-        matches!(self, Self::Copied | Self::Error)
+        matches!(self, Self::Cancelled | Self::Copied | Self::Error)
     }
 }
 
@@ -100,6 +102,10 @@ impl ListenerStatusEvent {
 
     pub fn transcribing() -> Self {
         Self::new(ListenerStatusState::Transcribing, MicrophoneLevel::silent())
+    }
+
+    pub fn cancelled() -> Self {
+        Self::new(ListenerStatusState::Cancelled, MicrophoneLevel::silent())
     }
 
     pub fn copied() -> Self {
@@ -198,6 +204,10 @@ impl StatusPublisher {
 
     pub fn publish_transcribing(&self) {
         self.publish(ListenerStatusEvent::transcribing());
+    }
+
+    pub fn publish_cancelled(&self) {
+        self.publish(ListenerStatusEvent::cancelled());
     }
 
     pub fn publish_copied(&self) {

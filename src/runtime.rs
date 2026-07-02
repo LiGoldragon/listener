@@ -1,9 +1,9 @@
 use signal_listener::{
-    ActiveCapture, ActiveCaptureSession, CaptureAlreadyActive, CaptureSession,
-    CaptureSessionMismatch, CaptureStarted, CaptureStatus, CaptureStopped, DeliveryOutcome,
-    DeliveryOutcomes, Input, NoActiveCapture, OperationKind, Output, Reason, RequestUnimplemented,
-    RequestedCaptureSession, StartCapture, StartedSession, StatusRequest, StopCapture,
-    StoppedSession, UnimplementedOperationKind, UnimplementedReason,
+    ActiveCapture, ActiveCaptureSession, CancelCapture, CancelledSession, CaptureAlreadyActive,
+    CaptureCancelled, CaptureSession, CaptureSessionMismatch, CaptureStarted, CaptureStatus,
+    CaptureStopped, DeliveryOutcome, DeliveryOutcomes, Input, NoActiveCapture, OperationKind,
+    Output, Reason, RequestUnimplemented, RequestedCaptureSession, StartCapture, StartedSession,
+    StatusRequest, StopCapture, StoppedSession, UnimplementedOperationKind, UnimplementedReason,
 };
 
 use crate::{
@@ -73,6 +73,7 @@ impl ListenerRuntime {
         match input {
             Input::Start(start) => self.start(start).unwrap_or_else(Error::into_start_reply),
             Input::Stop(stop) => self.stop(stop).unwrap_or_else(Error::into_stop_reply),
+            Input::Cancel(cancel) => self.cancel(cancel).unwrap_or_else(Error::into_cancel_reply),
             Input::Status(status) => self
                 .status(status)
                 .unwrap_or_else(|error| error.into_unimplemented_reply(OperationKind::Status)),
@@ -92,19 +93,7 @@ impl ListenerRuntime {
     }
 
     pub fn stop(&mut self, request: StopCapture) -> Result<Output> {
-        let requested_session = request.into_payload();
-        let Some(active_capture) = self.active_capture.take() else {
-            return Err(Error::NoActiveCapture);
-        };
-
-        if active_capture.session() != &requested_session {
-            let active_session = active_capture.session().value();
-            self.active_capture = Some(active_capture);
-            return Err(Error::CaptureSessionMismatch {
-                active: active_session,
-                requested: requested_session.value(),
-            });
-        }
+        let active_capture = self.take_active_capture(request.into_payload())?;
 
         let stopped_capture = match active_capture.stop() {
             Ok(stopped_capture) => stopped_capture,
@@ -160,6 +149,24 @@ impl ListenerRuntime {
         }))
     }
 
+    pub fn cancel(&mut self, request: CancelCapture) -> Result<Output> {
+        let active_capture = self.take_active_capture(request.into_payload())?;
+
+        let stopped_capture = match active_capture.stop() {
+            Ok(stopped_capture) => stopped_capture,
+            Err(error) => {
+                self.status_publisher.publish_error();
+                return Err(error);
+            }
+        };
+        self.status_publisher.publish_cancelled();
+
+        Ok(Output::Cancelled(CaptureCancelled {
+            cancelled_session: CancelledSession::new(stopped_capture.session().clone()),
+            durable_audio_artifact: stopped_capture.artifact().clone(),
+        }))
+    }
+
     pub fn status(&mut self, _request: StatusRequest) -> Result<Output> {
         if self.active_capture.is_none() {
             self.recover_orphaned_recordings()?;
@@ -175,6 +182,26 @@ impl ListenerRuntime {
 
     pub fn orphaned_recordings(&self) -> &RecoveredCaptureRecordings {
         &self.orphaned_recordings
+    }
+
+    fn take_active_capture(
+        &mut self,
+        requested_session: CaptureSession,
+    ) -> Result<RuntimeActiveCapture> {
+        let Some(active_capture) = self.active_capture.take() else {
+            return Err(Error::NoActiveCapture);
+        };
+
+        if active_capture.session() != &requested_session {
+            let active_session = active_capture.session().value();
+            self.active_capture = Some(active_capture);
+            return Err(Error::CaptureSessionMismatch {
+                active: active_session,
+                requested: requested_session.value(),
+            });
+        }
+
+        Ok(active_capture)
     }
 
     fn recover_orphaned_recordings(&mut self) -> Result<()> {
@@ -367,6 +394,21 @@ impl Error {
                 })
             }
             error => error.into_unimplemented_reply(OperationKind::Stop),
+        }
+    }
+
+    pub fn into_cancel_reply(self) -> Output {
+        match self {
+            Self::NoActiveCapture => Output::NoActiveCapture(NoActiveCapture {}),
+            Self::CaptureSessionMismatch { active, requested } => {
+                Output::CaptureSessionMismatch(CaptureSessionMismatch {
+                    active_capture_session: ActiveCaptureSession::new(CaptureSession::new(active)),
+                    requested_capture_session: RequestedCaptureSession::new(CaptureSession::new(
+                        requested,
+                    )),
+                })
+            }
+            error => error.into_unimplemented_reply(OperationKind::Cancel),
         }
     }
 

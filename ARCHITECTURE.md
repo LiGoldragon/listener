@@ -11,6 +11,8 @@ The first vertical slice is:
 - write captured audio continuously to durable disk while capture is active;
 - transcribe the batch through Listener's internal OpenAI actor when capture
   stops;
+- cancel an active capture while retaining the durable artifact and skipping
+  transcription and delivery;
 - deliver the resulting text to the system clipboard as the first configured
   output target.
 - publish UI-safe capture/transcription/delivery state without transcript text.
@@ -78,7 +80,8 @@ store directly, or bypass the daemon path.
 - `tests/capture.rs` proves the production capture writer commits a payload
   record before capture stop through the writer sync boundary.
 - `tests/runtime.rs` proves active durable artifact writes, stop-time recovery
-  export, stop reply shape, and output-target dispatch.
+  export, stop reply shape, cancel retention, no-transcription/no-delivery
+  cancel behavior, and output-target dispatch.
 
 ## Status
 
@@ -99,8 +102,11 @@ the first incomplete or corrupt tail to the last valid record boundary.
 Recovery is idempotent. While idle, Listener also scans existing `.listenerlog`
 files, recovers crash-survived orphan logs, and advances new capture sessions
 past existing `capture-<session>.listenerlog` names before starting another
-recording. Listener exports a recovered raw `s16le` PCM path, sends that path
-as typed mail to the internal OpenAI transcription actor, converts it to an
+recording. Cancel stops the active capture using the same capture shutdown path
+and returns the retained `.listenerlog` artifact without recovering/exporting
+audio for transcription, sending OpenAI actor mail, or invoking output delivery.
+Listener exports a recovered raw `s16le` PCM path on stop, sends that path as
+typed mail to the internal OpenAI transcription actor, converts it to an
 in-memory WAV upload, reads `gopass openai/api-key` at request time, and calls
 OpenAI REST transcription with `gpt-4o-transcribe`. Clipboard delivery uses
 `wl-copy` by default through the typed output-target dispatcher.
@@ -111,12 +117,12 @@ socket server at `$XDG_RUNTIME_DIR/listener/status.sock` by default. New clients
 receive the current event immediately, then pushed events. Events contain only
 `state` and normalized microphone `level`; transcript text stays only in the
 existing typed stop reply and delivery path. Recording levels are RMS over
-`s16le` PCM with `1.0 - exp(-rms * 18.0)`, clamped to `0.0..=1.0`. Copied and
-error events are terminal UI events and the stream returns to idle after a
-short delay.
+`s16le` PCM with `1.0 - exp(-rms * 18.0)`, clamped to `0.0..=1.0`. Copied,
+cancelled, and error events are terminal UI events and the stream returns to
+idle after a short delay.
 
 Ordinary lifecycle conflicts stay on the public reply surface as typed
 `signal-listener` outcomes: start while recording reports the active session,
-stop while idle reports no active capture, and stop with a different session
-reports both active and requested sessions. These are not lowered to
-`RequestUnimplemented`.
+stop or cancel while idle reports no active capture, and stop or cancel with a
+different session reports both active and requested sessions. These are not
+lowered to `RequestUnimplemented`.
