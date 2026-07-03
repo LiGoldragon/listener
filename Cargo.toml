@@ -36,14 +36,14 @@ nota-text = ["dep:nota", "signal-frame/nota-text", "signal-listener/nota-text", 
 
 [dependencies]
 crc32fast            = "1"
-meta-signal-listener = { git = "https://github.com/LiGoldragon/meta-signal-listener.git", branch = "main", default-features = false }
+meta-signal-listener = { git = "https://github.com/LiGoldragon/meta-signal-listener.git", branch = "drop-next", default-features = false }
 nota                 = { package = "nota", git = "https://github.com/LiGoldragon/nota.git", branch = "main", optional = true }
 reqwest              = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 rkyv                 = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
 serde                = { version = "1", features = ["derive"] }
 serde_json           = "1"
-signal-frame         = { git = "https://github.com/LiGoldragon/signal-frame.git", branch = "main", default-features = false }
-signal-listener      = { git = "https://github.com/LiGoldragon/signal-listener.git", branch = "main", default-features = false }
+signal-frame         = { git = "https://github.com/LiGoldragon/signal-frame.git", branch = "drop-next", default-features = false }
+signal-listener      = { git = "https://github.com/LiGoldragon/signal-listener.git", branch = "drop-next", default-features = false }
 thiserror            = "2"
 
 [dev-dependencies]
