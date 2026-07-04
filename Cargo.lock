@@ -640,7 +640,7 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 [[package]]
 name = "meta-signal-listener"
 version = "0.2.0"
-source = "git+https://github.com/LiGoldragon/meta-signal-listener.git?branch=drop-next#61abce8c964ce94746e578d1e6c19c6f634a304d"
+source = "git+https://github.com/LiGoldragon/meta-signal-listener.git?branch=drop-next#f7d0cbab939f0f28daad638211730d632982684b"
 dependencies = [
  "nota",
  "rkyv",
@@ -1099,7 +1099,7 @@ dependencies = [
 [[package]]
 name = "schema-rust"
 version = "0.5.3"
-source = "git+https://github.com/LiGoldragon/schema-rust.git?branch=drop-next#af814e757cd84fb0b3b8cce9c0623f69b6d99b5c"
+source = "git+https://github.com/LiGoldragon/schema-rust.git?branch=drop-next#67b91f5a6a70eced5854f27c7af8b39ace7e2d88"
 dependencies = [
  "nota",
  "prettyplease",
@@ -1197,7 +1197,7 @@ dependencies = [
 [[package]]
 name = "signal-listener"
 version = "0.4.0"
-source = "git+https://github.com/LiGoldragon/signal-listener.git?branch=drop-next#01a7872e7eb6818a4dc2cad6ca624282919b1b3a"
+source = "git+https://github.com/LiGoldragon/signal-listener.git?branch=drop-next#975abf826651580cf29be0ad4f26a32d5a32eb70"
 dependencies = [
  "nota",
  "rkyv",
