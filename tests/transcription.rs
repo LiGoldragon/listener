@@ -251,6 +251,11 @@ impl OpenAiCaptureServer {
 
 struct RecordedHttpRequest;
 
+enum HttpRequestBodyFraming {
+    ContentLength(usize),
+    Chunked,
+}
+
 impl RecordedHttpRequest {
     fn read_from(stream: &mut TcpStream) -> String {
         stream
@@ -259,30 +264,114 @@ impl RecordedHttpRequest {
         let mut bytes = Vec::new();
         let mut buffer = [0_u8; 4096];
         let header_end = loop {
-            let count = stream.read(&mut buffer).expect("read OpenAI request");
-            assert!(count > 0, "OpenAI client closed before headers arrived");
-            bytes.extend_from_slice(&buffer[..count]);
+            Self::read_more(stream, &mut bytes, &mut buffer, "headers arrived");
             if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
                 break index + 4;
             }
         };
         let headers = String::from_utf8_lossy(&bytes[..header_end]);
-        let content_length = Self::content_length(&headers);
-        while bytes.len() - header_end < content_length {
-            let count = stream.read(&mut buffer).expect("read OpenAI body");
-            assert!(count > 0, "OpenAI client closed before body completed");
-            bytes.extend_from_slice(&buffer[..count]);
+        match Self::body_framing(&headers) {
+            HttpRequestBodyFraming::ContentLength(content_length) => {
+                Self::read_content_length_body(
+                    stream,
+                    &mut bytes,
+                    &mut buffer,
+                    header_end,
+                    content_length,
+                );
+            }
+            HttpRequestBodyFraming::Chunked => {
+                Self::read_chunked_body(stream, &mut bytes, &mut buffer, header_end);
+            }
         }
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    fn content_length(headers: &str) -> usize {
-        headers
-            .lines()
-            .find_map(|line| line.strip_prefix("Content-Length: "))
-            .expect("OpenAI request content length")
-            .parse()
-            .expect("parse OpenAI request content length")
+    fn read_content_length_body(
+        stream: &mut TcpStream,
+        bytes: &mut Vec<u8>,
+        buffer: &mut [u8],
+        header_end: usize,
+        content_length: usize,
+    ) {
+        while bytes.len() - header_end < content_length {
+            Self::read_more(stream, bytes, buffer, "body completed");
+        }
+    }
+
+    fn read_chunked_body(
+        stream: &mut TcpStream,
+        bytes: &mut Vec<u8>,
+        buffer: &mut [u8],
+        header_end: usize,
+    ) {
+        let mut chunk_start = header_end;
+        loop {
+            let chunk_size_line_end = loop {
+                if let Some(index) = bytes[chunk_start..]
+                    .windows(2)
+                    .position(|window| window == b"\r\n")
+                {
+                    break chunk_start + index;
+                }
+                Self::read_more(stream, bytes, buffer, "chunk size arrived");
+            };
+            let chunk_size_line = std::str::from_utf8(&bytes[chunk_start..chunk_size_line_end])
+                .expect("OpenAI chunk size is UTF-8");
+            let chunk_size_hex = chunk_size_line
+                .split(';')
+                .next()
+                .expect("OpenAI chunk size line")
+                .trim();
+            let chunk_size =
+                usize::from_str_radix(chunk_size_hex, 16).expect("parse OpenAI chunk size");
+            let chunk_payload_start = chunk_size_line_end + 2;
+            let chunk_end = chunk_payload_start + chunk_size + 2;
+            while bytes.len() < chunk_end {
+                Self::read_more(stream, bytes, buffer, "chunk body completed");
+            }
+            assert_eq!(
+                &bytes[chunk_payload_start + chunk_size..chunk_end],
+                b"\r\n",
+                "OpenAI chunk must end with CRLF"
+            );
+            chunk_start = chunk_end;
+            if chunk_size == 0 {
+                break;
+            }
+        }
+    }
+
+    fn read_more(
+        stream: &mut TcpStream,
+        bytes: &mut Vec<u8>,
+        buffer: &mut [u8],
+        expectation: &str,
+    ) {
+        let count = stream.read(buffer).expect("read OpenAI request");
+        assert!(count > 0, "OpenAI client closed before {expectation}");
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+
+    fn body_framing(headers: &str) -> HttpRequestBodyFraming {
+        for line in headers.lines() {
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    return HttpRequestBodyFraming::ContentLength(
+                        value
+                            .trim()
+                            .parse()
+                            .expect("parse OpenAI request content length"),
+                    );
+                }
+                if name.eq_ignore_ascii_case("transfer-encoding")
+                    && value.trim().eq_ignore_ascii_case("chunked")
+                {
+                    return HttpRequestBodyFraming::Chunked;
+                }
+            }
+        }
+        panic!("OpenAI request body framing");
     }
 
     fn write_success_response(stream: &mut TcpStream) {

@@ -16,7 +16,10 @@
       crane,
     }:
     let
-      systems = [ "x86_64-linux" "aarch64-linux" ];
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
       forSystems = function: nixpkgs.lib.genAttrs systems (system: function system);
 
       contextFor =
@@ -32,11 +35,20 @@
             "rust-analyzer"
           ];
           craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
-          src = pkgs.lib.cleanSourceWith {
-            src = ./.;
-            filter = path: type: type == "directory" || craneLib.filterCargoSources path type;
-            name = "source";
-          };
+          src =
+            let
+              transcriptionFixtureSource =
+                path: type: type == "regular" && pkgs.lib.hasPrefix "${toString ./tests/fixtures}/" path;
+            in
+            pkgs.lib.cleanSourceWith {
+              src = ./.;
+              filter =
+                path: type:
+                type == "directory"
+                || transcriptionFixtureSource path type
+                || craneLib.filterCargoSources path type;
+              name = "source";
+            };
           commonArgs = {
             inherit src;
             strictDeps = true;
@@ -44,7 +56,14 @@
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
         in
         {
-          inherit pkgs toolchain craneLib src commonArgs cargoArtifacts;
+          inherit
+            pkgs
+            toolchain
+            craneLib
+            src
+            commonArgs
+            cargoArtifacts
+            ;
         };
     in
     {
