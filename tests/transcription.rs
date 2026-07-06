@@ -58,6 +58,44 @@ fn transcription_customization_round_trips_through_rkyv_archive() {
 }
 
 #[test]
+fn transcription_customization_archive_rejects_magic_mismatch() {
+    let mut bytes = TranscriptionFixture::customization()
+        .to_rkyv_bytes()
+        .expect("encode customization");
+    bytes[0] ^= 0xff;
+
+    let error = TranscriptionCustomization::from_rkyv_bytes(&bytes)
+        .expect_err("magic mismatch should reject archive");
+
+    assert!(
+        matches!(error, Error::TranscriptionCustomizationArchiveMagic),
+        "expected customization archive magic error, got {error:?}"
+    );
+}
+
+#[test]
+fn transcription_customization_archive_rejects_unsupported_version() {
+    let mut bytes = TranscriptionFixture::customization()
+        .to_rkyv_bytes()
+        .expect("encode customization");
+    bytes[8..12].copy_from_slice(&2_u32.to_le_bytes());
+
+    let error = TranscriptionCustomization::from_rkyv_bytes(&bytes)
+        .expect_err("unsupported version should reject archive");
+
+    assert!(
+        matches!(
+            error,
+            Error::TranscriptionCustomizationArchiveVersion {
+                version: 2,
+                expected: 1
+            }
+        ),
+        "expected customization archive version error, got {error:?}"
+    );
+}
+
+#[test]
 fn transcription_prompt_uses_configured_terms_without_removed_terms() {
     let customization = TranscriptionFixture::customization();
     let prompt = customization.prompt();
@@ -108,8 +146,24 @@ fn configured_customization_archive_decode_failure_is_visible() {
         .expect_err("invalid customization archive should fail");
 
     assert!(
-        matches!(error, Error::TranscriptionCustomizationDecode),
-        "expected customization decode error, got {error:?}"
+        matches!(error, Error::TranscriptionCustomizationArchiveMagic),
+        "expected customization archive magic error, got {error:?}"
+    );
+}
+
+#[test]
+fn openai_transcriber_customization_archive_failure_is_returned_without_panic() {
+    let directory = TempDir::new().expect("create customization tempdir");
+    let archive_path = directory.path().join("transcription-customization.rkyv");
+    fs::write(&archive_path, b"not a transcription customization archive")
+        .expect("write invalid customization archive");
+
+    let error = OpenAiRestTranscriber::from_customization_archive_path(archive_path)
+        .expect_err("invalid customization archive should return an error");
+
+    assert!(
+        matches!(error, Error::TranscriptionCustomizationArchiveMagic),
+        "expected customization archive magic error, got {error:?}"
     );
 }
 

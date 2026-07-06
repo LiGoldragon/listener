@@ -31,24 +31,24 @@ pub struct ListenerRuntime {
 }
 
 impl ListenerRuntime {
-    pub fn from_configuration(configuration: Configuration) -> Self {
+    pub fn from_configuration(configuration: Configuration) -> Result<Self> {
         Self::from_configuration_with_status(configuration, StatusPublisher::silent())
     }
 
     pub fn from_configuration_with_status(
         configuration: Configuration,
         status_publisher: StatusPublisher,
-    ) -> Self {
-        Self::with_dependencies(
+    ) -> Result<Self> {
+        Ok(Self::with_dependencies(
             configuration,
             Box::new(ProcessAudioCaptureBackend::from_environment()),
             Box::new(OpenAiBatchTranscriptionActor::from_environment(
                 status_publisher.clone(),
-            )),
+            )?),
             OutputTargetDispatcher::from_environment(),
             TranscriptHistoryStore::from_environment(),
             status_publisher,
-        )
+        ))
     }
 
     pub fn with_dependencies(

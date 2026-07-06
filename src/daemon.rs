@@ -42,7 +42,7 @@ impl ListenerDaemon {
         let runtime = ListenerRuntime::from_configuration_with_status(
             configuration.clone(),
             status_publisher,
-        );
+        )?;
         ListenerSocketServer::new(configuration, runtime).serve()
     }
 

@@ -18,6 +18,17 @@ pub enum Error {
     #[error("transcription customization archive decode failed")]
     TranscriptionCustomizationDecode,
 
+    #[error("transcription customization archive header is incomplete")]
+    TranscriptionCustomizationArchiveHeader,
+
+    #[error("transcription customization archive magic mismatch")]
+    TranscriptionCustomizationArchiveMagic,
+
+    #[error(
+        "unsupported transcription customization archive version {version}; expected {expected}"
+    )]
+    TranscriptionCustomizationArchiveVersion { version: u32, expected: u32 },
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 

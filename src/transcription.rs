@@ -22,6 +22,8 @@ pub const TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_ENVIRONMENT_VARIABLE: &str =
 const OPENAI_MAXIMUM_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 const TRANSCRIPTION_ACTOR_QUEUE_CAPACITY: usize = 1;
 const TRANSCRIPTION_ACTOR_REPLY_TIMEOUT: Duration = Duration::from_secs(75);
+const TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_MAGIC: [u8; 8] = *b"LSTNVOC\0";
+const TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_VERSION: u32 = 1;
 
 pub trait BatchTranscriber: Send {
     fn transcribe(&self, request: BatchTranscriptionRequest) -> Result<TranscriptText>;
@@ -116,14 +118,12 @@ impl TranscriptionCustomization {
     }
 
     pub fn from_rkyv_bytes(bytes: &[u8]) -> Result<Self> {
-        rkyv::from_bytes::<Self, rkyv::rancor::Error>(bytes)
-            .map_err(|_| Error::TranscriptionCustomizationDecode)
+        TranscriptionCustomizationArchive::from_bytes(bytes)?.into_customization()
     }
 
     pub fn to_rkyv_bytes(&self) -> Result<Vec<u8>> {
-        rkyv::to_bytes::<rkyv::rancor::Error>(self)
-            .map(|bytes| bytes.to_vec())
-            .map_err(|_| Error::TranscriptionCustomizationEncode)
+        TranscriptionCustomizationArchive::from_customization(self)
+            .map(|archive| archive.into_bytes())
     }
 
     pub fn from_archive_path(path: impl AsRef<Path>) -> Result<Self> {
@@ -133,6 +133,91 @@ impl TranscriptionCustomization {
 
     pub fn prompt(&self) -> TranscriptionPrompt {
         TranscriptionPrompt::with_customization(self)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TranscriptionCustomizationArchiveFormat {
+    magic: [u8; 8],
+    version: u32,
+}
+
+impl TranscriptionCustomizationArchiveFormat {
+    fn current() -> Self {
+        Self {
+            magic: TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_MAGIC,
+            version: TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_VERSION,
+        }
+    }
+
+    fn header_length(&self) -> usize {
+        self.magic.len() + std::mem::size_of::<u32>()
+    }
+
+    fn validate(&self) -> Result<()> {
+        let current = Self::current();
+        if self.magic != current.magic {
+            return Err(Error::TranscriptionCustomizationArchiveMagic);
+        }
+        if self.version != current.version {
+            return Err(Error::TranscriptionCustomizationArchiveVersion {
+                version: self.version,
+                expected: current.version,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TranscriptionCustomizationArchive {
+    format: TranscriptionCustomizationArchiveFormat,
+    payload: Vec<u8>,
+}
+
+impl TranscriptionCustomizationArchive {
+    fn from_customization(customization: &TranscriptionCustomization) -> Result<Self> {
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(customization)
+            .map(|bytes| bytes.to_vec())
+            .map_err(|_| Error::TranscriptionCustomizationEncode)?;
+        Ok(Self {
+            format: TranscriptionCustomizationArchiveFormat::current(),
+            payload,
+        })
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let current = TranscriptionCustomizationArchiveFormat::current();
+        if bytes.len() < current.header_length() {
+            return Err(Error::TranscriptionCustomizationArchiveHeader);
+        }
+        let mut magic = [0_u8; 8];
+        magic.copy_from_slice(&bytes[..current.magic.len()]);
+        let version_start = current.magic.len();
+        let version_end = version_start + std::mem::size_of::<u32>();
+        let version = u32::from_le_bytes(
+            bytes[version_start..version_end]
+                .try_into()
+                .map_err(|_| Error::TranscriptionCustomizationArchiveHeader)?,
+        );
+        Ok(Self {
+            format: TranscriptionCustomizationArchiveFormat { magic, version },
+            payload: bytes[version_end..].to_vec(),
+        })
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.format.header_length() + self.payload.len());
+        bytes.extend_from_slice(&self.format.magic);
+        bytes.extend_from_slice(&self.format.version.to_le_bytes());
+        bytes.extend_from_slice(&self.payload);
+        bytes
+    }
+
+    fn into_customization(self) -> Result<TranscriptionCustomization> {
+        self.format.validate()?;
+        rkyv::from_bytes::<TranscriptionCustomization, rkyv::rancor::Error>(&self.payload)
+            .map_err(|_| Error::TranscriptionCustomizationDecode)
     }
 }
 
@@ -231,12 +316,12 @@ pub struct OpenAiBatchTranscriptionActor {
 }
 
 impl OpenAiBatchTranscriptionActor {
-    pub fn from_environment(status_publisher: StatusPublisher) -> Self {
-        Self::new(
-            OpenAiRestTranscriber::from_environment(),
+    pub fn from_environment(status_publisher: StatusPublisher) -> Result<Self> {
+        Ok(Self::new(
+            OpenAiRestTranscriber::from_environment()?,
             status_publisher,
             TRANSCRIPTION_ACTOR_REPLY_TIMEOUT,
-        )
+        ))
     }
 
     pub fn new(
@@ -363,17 +448,26 @@ pub struct OpenAiRestTranscriber {
 }
 
 impl OpenAiRestTranscriber {
-    pub fn from_environment() -> Self {
-        Self::new(
+    pub fn from_environment() -> Result<Self> {
+        Ok(Self::new(
             reqwest::blocking::Client::builder()
                 .timeout(TRANSCRIPTION_ACTOR_REPLY_TIMEOUT)
                 .build()
                 .unwrap_or_else(|_| reqwest::blocking::Client::new()),
             OpenAiCredentialSource::gopass("openai/api-key"),
-            OpenAiTranscriptionRequestConfiguration::from_environment().unwrap_or_else(|error| {
-                panic!("failed to load Listener transcription customization: {error}")
-            }),
-        )
+            OpenAiTranscriptionRequestConfiguration::from_environment()?,
+        ))
+    }
+
+    pub fn from_customization_archive_path(path: impl Into<PathBuf>) -> Result<Self> {
+        Ok(Self::new(
+            reqwest::blocking::Client::builder()
+                .timeout(TRANSCRIPTION_ACTOR_REPLY_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| reqwest::blocking::Client::new()),
+            OpenAiCredentialSource::gopass("openai/api-key"),
+            OpenAiTranscriptionRequestConfiguration::from_customization_archive_path(path)?,
+        ))
     }
 
     pub fn new(
