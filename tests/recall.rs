@@ -57,6 +57,19 @@ impl RecallFixture {
         RecallSelector::new(script.to_string_lossy().into_owned(), Vec::new())
     }
 
+    fn selector_recording_rows(&self) -> (RecallSelector, PathBuf) {
+        let output = self.path("selector-rows.txt");
+        let script = self.path("selector-recording.sh");
+        write_executable(
+            &script,
+            &format!("#!/bin/sh\ncat > '{}'\nexit 0\n", output.display()),
+        );
+        (
+            RecallSelector::new(script.to_string_lossy().into_owned(), Vec::new()),
+            output,
+        )
+    }
+
     /// A clipboard stub that records the copied text to a file for inspection.
     fn recording_clipboard(&self) -> (ClipboardCommand, PathBuf) {
         let output = self.path("clipboard.txt");
@@ -104,20 +117,13 @@ fn recall_copies_the_selected_transcript_to_the_clipboard() {
 }
 
 #[test]
-fn recall_over_empty_history_reports_empty_and_never_invokes_the_selector() {
+fn recall_over_empty_history_shows_an_empty_picker_and_leaves_the_clipboard_untouched() {
     let fixture = RecallFixture::new();
     let (clipboard, clipboard_output) = fixture.recording_clipboard();
-    // A selector pointed at a missing program would error if it were spawned.
-    let missing_selector = RecallSelector::new(
-        fixture
-            .path("does-not-exist")
-            .to_string_lossy()
-            .into_owned(),
-        Vec::new(),
-    );
+    let (selector, selector_rows) = fixture.selector_recording_rows();
     let recall = TranscriptRecall::new(
         fixture.history_store(),
-        missing_selector,
+        selector,
         clipboard,
         HistoryLimit::new(20),
     );
@@ -125,6 +131,10 @@ fn recall_over_empty_history_reports_empty_and_never_invokes_the_selector() {
     assert_eq!(
         recall.run().expect("run recall"),
         RecallOutcome::EmptyHistory
+    );
+    assert_eq!(
+        fs::read_to_string(&selector_rows).expect("selector rows"),
+        "-\tNo transcript history yet"
     );
     assert!(
         !clipboard_output.exists(),

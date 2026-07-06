@@ -21,6 +21,7 @@ use crate::{
 
 const DEFAULT_RECALL_LIMIT: usize = 20;
 const MAXIMUM_PREVIEW_CHARACTERS: usize = 160;
+const EMPTY_HISTORY_PICKER_ROW: &str = "-\tNo transcript history yet";
 
 /// The recall flow: read history, pick one transcript, copy it to the clipboard.
 pub struct TranscriptRecall {
@@ -57,6 +58,7 @@ impl TranscriptRecall {
     pub fn run(&self) -> Result<RecallOutcome> {
         let entries = self.history_store.read_recent(self.limit)?;
         if entries.is_empty() {
+            self.selector.show_empty_history()?;
             return Ok(RecallOutcome::EmptyHistory);
         }
 
@@ -152,6 +154,11 @@ impl RecallSelector {
             program: program.into(),
             arguments,
         }
+    }
+
+    /// Show a visible empty-history picker row and ignore any accepted token.
+    fn show_empty_history(&self) -> Result<()> {
+        self.select(EMPTY_HISTORY_PICKER_ROW).map(|_| ())
     }
 
     /// Feed the tab-separated `index<TAB>preview` rows to the selector and read
