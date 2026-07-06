@@ -80,6 +80,13 @@
               cargoTestExtraArgs = "--test configuration";
             }
           );
+          test-transcription = context.craneLib.cargoTest (
+            context.commonArgs
+            // {
+              inherit (context) cargoArtifacts;
+              cargoTestExtraArgs = "--test transcription";
+            }
+          );
           test-history = context.craneLib.cargoTest (
             context.commonArgs
             // {
@@ -129,6 +136,10 @@
           recall = {
             type = "app";
             program = "${package}/bin/listener-recall";
+          };
+          transcription-customization = {
+            type = "app";
+            program = "${package}/bin/listener-transcription-customization";
           };
           meta = {
             type = "app";

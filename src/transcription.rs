@@ -1,4 +1,11 @@
-use std::{fs, path::PathBuf, process::Command, sync::mpsc, thread, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
 
 use signal_listener::{DurableAudioArtifact, TranscriptText};
 
@@ -9,7 +16,9 @@ use crate::{Error, RecordingAudioFormat, RecordingSampleFormat, Result, StatusPu
 const OPENAI_TRANSCRIPTION_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
 const OPENAI_TRANSCRIPTION_MODEL: &str = "gpt-4o-transcribe";
 const OPENAI_TRANSCRIPTION_LANGUAGE: &str = "en";
-const OPENAI_TRANSCRIPTION_PROMPT: &str = "Transcribe spoken English as dictated text. Preserve technical names such as Codex, Claude, CriomOS, Niri, Colemak, OpenAI, gopass, Whisrs, Hyprvoice, and Listener. Do not translate.";
+const OPENAI_TRANSCRIPTION_GENERIC_INSTRUCTION: &str = "Transcribe spoken English as dictated text. Preserve technical names, product names, and acronyms exactly when spoken. Do not translate.";
+pub const TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_ENVIRONMENT_VARIABLE: &str =
+    "LISTENER_TRANSCRIPTION_CUSTOMIZATION_ARCHIVE";
 const OPENAI_MAXIMUM_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 const TRANSCRIPTION_ACTOR_QUEUE_CAPACITY: usize = 1;
 const TRANSCRIPTION_ACTOR_REPLY_TIMEOUT: Duration = Duration::from_secs(75);
@@ -90,6 +99,130 @@ impl BatchTranscriptionInput {
 pub enum BatchTranscriptionInputFormat {
     ListenerRecordingLog,
     SignedSixteenBitLittleEndianPcm { audio_format: RecordingAudioFormat },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct TranscriptionCustomization {
+    vocabulary_terms: Vec<String>,
+}
+
+impl TranscriptionCustomization {
+    pub fn new(vocabulary_terms: Vec<String>) -> Self {
+        Self { vocabulary_terms }
+    }
+
+    pub fn vocabulary_terms(&self) -> &[String] {
+        &self.vocabulary_terms
+    }
+
+    pub fn from_rkyv_bytes(bytes: &[u8]) -> Result<Self> {
+        rkyv::from_bytes::<Self, rkyv::rancor::Error>(bytes)
+            .map_err(|_| Error::TranscriptionCustomizationDecode)
+    }
+
+    pub fn to_rkyv_bytes(&self) -> Result<Vec<u8>> {
+        rkyv::to_bytes::<rkyv::rancor::Error>(self)
+            .map(|bytes| bytes.to_vec())
+            .map_err(|_| Error::TranscriptionCustomizationEncode)
+    }
+
+    pub fn from_archive_path(path: impl AsRef<Path>) -> Result<Self> {
+        let bytes = fs::read(path)?;
+        Self::from_rkyv_bytes(&bytes)
+    }
+
+    pub fn prompt(&self) -> TranscriptionPrompt {
+        TranscriptionPrompt::with_customization(self)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptionCustomizationTextSource {
+    text: String,
+}
+
+impl TranscriptionCustomizationTextSource {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
+    }
+
+    pub fn into_customization(self) -> TranscriptionCustomization {
+        let vocabulary_terms = self
+            .text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+        TranscriptionCustomization::new(vocabulary_terms)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptionCustomizationEnvironment {
+    archive_path: Option<PathBuf>,
+}
+
+impl TranscriptionCustomizationEnvironment {
+    pub fn from_process() -> Self {
+        Self {
+            archive_path: std::env::var_os(
+                TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_ENVIRONMENT_VARIABLE,
+            )
+            .map(PathBuf::from),
+        }
+    }
+
+    pub fn new(archive_path: Option<PathBuf>) -> Self {
+        Self { archive_path }
+    }
+
+    pub fn archive_path(&self) -> Option<&Path> {
+        self.archive_path.as_deref()
+    }
+
+    pub fn prompt(&self) -> Result<TranscriptionPrompt> {
+        match self.archive_path() {
+            Some(path) => TranscriptionCustomization::from_archive_path(path)
+                .map(|customization| customization.prompt()),
+            None => Ok(TranscriptionPrompt::generic()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptionPrompt {
+    text: String,
+}
+
+impl TranscriptionPrompt {
+    pub fn generic() -> Self {
+        Self {
+            text: OPENAI_TRANSCRIPTION_GENERIC_INSTRUCTION.to_owned(),
+        }
+    }
+
+    pub fn with_customization(customization: &TranscriptionCustomization) -> Self {
+        let mut prompt = Self::generic();
+        if !customization.vocabulary_terms().is_empty() {
+            prompt
+                .text
+                .push_str("\nVocabulary terms to preserve exactly when spoken: ");
+            prompt
+                .text
+                .push_str(&customization.vocabulary_terms().join(", "));
+            prompt.text.push('.');
+        }
+        prompt
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    pub fn into_string(self) -> String {
+        self.text
+    }
 }
 
 pub struct OpenAiBatchTranscriptionActor {
@@ -237,7 +370,9 @@ impl OpenAiRestTranscriber {
                 .build()
                 .unwrap_or_else(|_| reqwest::blocking::Client::new()),
             OpenAiCredentialSource::gopass("openai/api-key"),
-            OpenAiTranscriptionRequestConfiguration::default(),
+            OpenAiTranscriptionRequestConfiguration::from_environment().unwrap_or_else(|error| {
+                panic!("failed to load Listener transcription customization: {error}")
+            }),
         )
     }
 
@@ -277,7 +412,7 @@ impl OpenAiRestTranscriber {
             .text("prompt", self.request_configuration.prompt().to_owned());
         let response = self
             .client
-            .post(OPENAI_TRANSCRIPTION_URL)
+            .post(self.request_configuration.endpoint())
             .bearer_auth(api_key)
             .multipart(form)
             .send()
@@ -290,19 +425,36 @@ impl OpenAiRestTranscriber {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenAiCredentialSource {
-    secret_name: String,
+    kind: OpenAiCredentialKind,
 }
 
 impl OpenAiCredentialSource {
     pub fn gopass(secret_name: impl Into<String>) -> Self {
         Self {
-            secret_name: secret_name.into(),
+            kind: OpenAiCredentialKind::Gopass {
+                secret_name: secret_name.into(),
+            },
+        }
+    }
+
+    pub fn literal(api_key: impl Into<String>) -> Self {
+        Self {
+            kind: OpenAiCredentialKind::Literal {
+                api_key: api_key.into(),
+            },
         }
     }
 
     pub fn resolve(&self) -> Result<String> {
+        match &self.kind {
+            OpenAiCredentialKind::Gopass { secret_name } => self.resolve_gopass(secret_name),
+            OpenAiCredentialKind::Literal { api_key } => Ok(api_key.clone()),
+        }
+    }
+
+    fn resolve_gopass(&self, secret_name: &str) -> Result<String> {
         let output = Command::new("gopass")
-            .args(["show", "-o", self.secret_name.as_str()])
+            .args(["show", "-o", secret_name])
             .output()
             .map_err(|error| Error::TranscriptionBackendUnavailable {
                 message: format!("failed to start gopass for OpenAI credential: {error}"),
@@ -324,7 +476,14 @@ impl OpenAiCredentialSource {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum OpenAiCredentialKind {
+    Gopass { secret_name: String },
+    Literal { api_key: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenAiTranscriptionRequestConfiguration {
+    endpoint: String,
     model: String,
     language: String,
     prompt: String,
@@ -336,11 +495,43 @@ impl OpenAiTranscriptionRequestConfiguration {
         language: impl Into<String>,
         prompt: impl Into<String>,
     ) -> Self {
+        Self::new_with_endpoint(OPENAI_TRANSCRIPTION_URL, model, language, prompt)
+    }
+
+    pub fn new_with_endpoint(
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+        language: impl Into<String>,
+        prompt: impl Into<String>,
+    ) -> Self {
         Self {
+            endpoint: endpoint.into(),
             model: model.into(),
             language: language.into(),
             prompt: prompt.into(),
         }
+    }
+
+    pub fn from_environment() -> Result<Self> {
+        let prompt = TranscriptionCustomizationEnvironment::from_process().prompt()?;
+        Ok(Self::new(
+            OPENAI_TRANSCRIPTION_MODEL,
+            OPENAI_TRANSCRIPTION_LANGUAGE,
+            prompt.into_string(),
+        ))
+    }
+
+    pub fn from_customization_archive_path(path: impl Into<PathBuf>) -> Result<Self> {
+        let prompt = TranscriptionCustomizationEnvironment::new(Some(path.into())).prompt()?;
+        Ok(Self::new(
+            OPENAI_TRANSCRIPTION_MODEL,
+            OPENAI_TRANSCRIPTION_LANGUAGE,
+            prompt.into_string(),
+        ))
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     pub fn model(&self) -> &str {
@@ -361,7 +552,7 @@ impl Default for OpenAiTranscriptionRequestConfiguration {
         Self::new(
             OPENAI_TRANSCRIPTION_MODEL,
             OPENAI_TRANSCRIPTION_LANGUAGE,
-            OPENAI_TRANSCRIPTION_PROMPT,
+            TranscriptionPrompt::generic().into_string(),
         )
     }
 }

@@ -55,5 +55,8 @@ pub use transcription::{
     BatchTranscriptionRequest, ConfiguredBatchTranscriber, HonestStubTranscriber,
     OpenAiBatchTranscriptionActor, OpenAiCredentialSource, OpenAiRestTranscriber,
     OpenAiTranscriptionRequestConfiguration,
+    TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_ENVIRONMENT_VARIABLE, TranscriptionCustomization,
+    TranscriptionCustomizationEnvironment, TranscriptionCustomizationTextSource,
+    TranscriptionPrompt,
 };
 pub use transport::{ContractFrameCodec, ContractFrameStream, MaximumFrameLength};

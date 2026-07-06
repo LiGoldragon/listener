@@ -26,6 +26,10 @@ name = "listener-recall"
 path = "src/bin/listener_recall.rs"
 
 [[bin]]
+name = "listener-transcription-customization"
+path = "src/bin/listener_transcription_customization.rs"
+
+[[bin]]
 name = "meta-listener"
 path = "src/bin/meta_listener.rs"
 required-features = ["nota-text"]

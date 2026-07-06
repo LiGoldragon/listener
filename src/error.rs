@@ -12,6 +12,12 @@ pub enum Error {
     #[error("configuration archive decode failed")]
     ConfigurationDecode,
 
+    #[error("transcription customization archive encode failed")]
+    TranscriptionCustomizationEncode,
+
+    #[error("transcription customization archive decode failed")]
+    TranscriptionCustomizationDecode,
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
