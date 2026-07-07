@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -7,7 +7,10 @@ use std::{
 
 use signal_listener::{CaptureSession, InputSource};
 
-use crate::{Error, Result};
+use crate::{
+    Error, Result,
+    artifact_privacy::{OwnerPrivateDirectory, OwnerPrivateFile},
+};
 
 const FILE_MAGIC: [u8; 8] = *b"LSTNLOG1";
 const RECORD_MAGIC: [u8; 8] = *b"LSTNREC1";
@@ -469,13 +472,10 @@ impl RecordingLogWriter {
                 path: path.display().to_string(),
             })?
             .to_path_buf();
-        fs::create_dir_all(&parent)?;
+        OwnerPrivateDirectory::new(&parent).ensure()?;
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        let mut file = OwnerPrivateFile::new(&path)
+            .create_new_read_write()
             .map_err(|error| match error.kind() {
                 ErrorKind::AlreadyExists => Error::recording_log_already_exists(&path),
                 _ => Error::Io(error),
@@ -696,11 +696,11 @@ impl RecoveredRecordingLog {
     pub fn export_raw_pcm(&self, destination: impl AsRef<Path>) -> Result<RawPcmExport> {
         let destination = destination.as_ref().to_path_buf();
         if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
+            OwnerPrivateDirectory::new(parent).ensure()?;
         }
 
         let mut source = File::open(&self.path)?;
-        let mut output = File::create(&destination)?;
+        let mut output = OwnerPrivateFile::new(&destination).create_truncated_write()?;
         let mut payload = Vec::new();
         for record in &self.records {
             source.seek(SeekFrom::Start(record.payload_position()))?;

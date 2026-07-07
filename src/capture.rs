@@ -14,6 +14,7 @@ use signal_listener::{
 use crate::{
     Configuration, Error, RecordingAudioFormat, RecordingLog, RecordingLogHeader,
     RecordingLogWriter, RecoveredRecordingLog, Result, StatusPublisher,
+    artifact_privacy::OwnerPrivateDirectory,
 };
 
 const LIVE_LEVEL_SAMPLE_DURATION: Duration = Duration::from_millis(50);
@@ -93,7 +94,7 @@ impl CaptureStore {
     }
 
     pub fn prepare(&self) -> Result<()> {
-        fs::create_dir_all(&self.directory)?;
+        OwnerPrivateDirectory::new(&self.directory).ensure()?;
         Ok(())
     }
 
@@ -325,7 +326,7 @@ impl AudioCaptureCommand {
             .ok_or_else(|| Error::PathParentMissing {
                 path: artifact_path.display().to_string(),
             })?;
-        fs::create_dir_all(parent)?;
+        OwnerPrivateDirectory::new(parent).ensure()?;
 
         let header = RecordingLogHeader::from_capture_start(
             request.session(),

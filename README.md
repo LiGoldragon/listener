@@ -22,9 +22,11 @@ payload length, CRC32 checksum, payload bytes, and a commit trailer. Listener
 flushes and `fdatasync`s the file after the header and after each payload
 record, then fsyncs the parent directory after creating the file. Recovery scans
 only the valid prefix and truncates the first incomplete or corrupt record tail.
-The writer creates `.listenerlog` files exclusively. On daemon restart, Listener
-scans existing capture logs, recovers idle orphan logs, and allocates the next
-active artifact after the existing `capture-<session>.listenerlog` names.
+The writer creates `.listenerlog` files exclusively with owner-only permissions;
+capture-store directories and raw PCM exports are also owner-only. On daemon
+restart, Listener scans existing capture logs, recovers idle orphan logs, and
+allocates the next active artifact after the existing
+`capture-<session>.listenerlog` names.
 
 Start/stop/cancel state conflicts are returned as typed public replies from
 `signal-listener`: already-active capture, no active capture, and active versus

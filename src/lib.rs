@@ -4,6 +4,7 @@
 //! transcription on stop, and configured output delivery. Its public wire
 //! vocabularies live in `signal-listener` and `meta-signal-listener`.
 
+mod artifact_privacy;
 pub mod capture;
 pub mod client;
 #[cfg(feature = "nota-text")]

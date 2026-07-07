@@ -1,11 +1,12 @@
 use std::{
     fs::{self, File},
     io::{Read, Write},
+    os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex},
 };
 
 use listener::{
-    RecordingAudioFormat, RecordingInputSource, RecordingLog, RecordingLogDurability,
+    CaptureStore, RecordingAudioFormat, RecordingInputSource, RecordingLog, RecordingLogDurability,
     RecordingLogHeader, RecordingLogWriter, RecordingStartTime, capture::CaptureWriter,
 };
 use signal_listener::CaptureSession;
@@ -38,6 +39,25 @@ impl CaptureWriterFixture {
         )
         .expect("recording header")
     }
+}
+
+#[test]
+fn capture_store_prepare_uses_owner_only_directory_permissions() {
+    let directory = TempDir::new().expect("temp directory");
+    let capture_store_path = directory.path().join("captures");
+    let capture_store = CaptureStore::new(&capture_store_path);
+
+    capture_store.prepare().expect("prepare capture store");
+
+    let directory_mode = fs::metadata(&capture_store_path)
+        .expect("capture store metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        directory_mode, 0o700,
+        "capture store directory must be owner-only"
+    );
 }
 
 #[test]

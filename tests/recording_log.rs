@@ -1,6 +1,7 @@
 use std::{
     fs::{self, OpenOptions},
     io::Write,
+    os::unix::fs::PermissionsExt,
     path::PathBuf,
 };
 
@@ -78,6 +79,43 @@ fn header_and_complete_records_recover() {
         fs::read(export.path()).expect("raw bytes"),
         vec![0, 1, 2, 3, 4, 5, 6, 7]
     );
+}
+
+#[test]
+fn recording_log_and_raw_export_use_owner_only_permissions() {
+    let fixture = RecordingLogFixture::new();
+    let private_parent = fixture.directory.path().join("private");
+    let path = private_parent.join("capture.listenerlog");
+    let mut writer = RecordingLogWriter::create(&path, fixture.header()).expect("create log");
+    writer
+        .append_record(&[0, 1, 2, 3])
+        .expect("append complete record");
+    writer.finish().expect("finish log");
+
+    let recovered = RecordingLog::new(&path).recover().expect("recover log");
+    let export = recovered
+        .export_raw_pcm(private_parent.join("capture.raw.s16le"))
+        .expect("export raw pcm");
+
+    let parent_mode = fs::metadata(&private_parent)
+        .expect("private parent metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    let log_mode = fs::metadata(&path)
+        .expect("listenerlog metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    let raw_mode = fs::metadata(export.path())
+        .expect("raw export metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    assert_eq!(parent_mode, 0o700, "artifact parent must be owner-only");
+    assert_eq!(log_mode, 0o600, "listenerlog must be owner-only");
+    assert_eq!(raw_mode, 0o600, "raw PCM export must be owner-only");
 }
 
 #[test]

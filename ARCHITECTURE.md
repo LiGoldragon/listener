@@ -106,9 +106,10 @@ header records version, `s16le` sample format, sample rate, channel count,
 frame size, input source, session, and start time. Each PCM record carries
 sequence, cumulative frame and byte offsets, payload length, CRC32 checksum,
 payload bytes, and a commit trailer. The writer flushes and `fdatasync`s after
-the header and each record, creates the log path exclusively, and fsyncs the
-parent directory after creating the file so the path is discoverable after a
-crash.
+the header and each record, creates the log path exclusively with owner-only
+permissions, and fsyncs the parent directory after creating the file so the path
+is discoverable after a crash. Capture-store directories and raw PCM exports are
+also owner-only.
 
 On stop, Listener scans the log from the header, accepts only complete records
 with matching sequence, offsets, checksums, and commit trailers, and truncates

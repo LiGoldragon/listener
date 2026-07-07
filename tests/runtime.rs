@@ -1,7 +1,7 @@
 use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
-    os::unix::net::UnixStream,
+    os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -602,6 +602,28 @@ fn cancel_stops_capture_retains_artifact_and_skips_transcription_and_delivery() 
         .export_raw_pcm(fixture.directory.path().join("cancelled.raw.s16le"))
         .expect("export cancelled raw pcm");
     let retained_bytes = fs::read(retained_export.path()).expect("cancelled raw bytes");
+    let capture_directory_mode = fs::metadata(
+        PathBuf::from(artifact.path().as_str())
+            .parent()
+            .expect("artifact parent"),
+    )
+    .expect("capture directory metadata")
+    .permissions()
+    .mode()
+        & 0o777;
+    let retained_artifact_mode = fs::metadata(artifact.path().as_str())
+        .expect("retained artifact metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        capture_directory_mode, 0o700,
+        "cancel-retained capture directory must stay owner-only"
+    );
+    assert_eq!(
+        retained_artifact_mode, 0o600,
+        "cancel-retained artifact must stay owner-only"
+    );
     let mut expected = Vec::new();
     expected.extend_from_slice(ACTIVE_AUDIO_BYTES);
     expected.extend_from_slice(STOPPED_AUDIO_BYTES);
