@@ -1,8 +1,5 @@
 # Agent Instructions - Listener
 
-You MUST read lore's `AGENTS.md` and the primary workspace orchestration
-protocol before editing this repository.
-
 ## Repo Role
 
 Listener is the speech-to-text component runtime. It owns the `listener` CLI,
