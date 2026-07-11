@@ -11,7 +11,10 @@ use signal_listener::{DurableAudioArtifact, TranscriptText};
 
 use serde::Deserialize;
 
-use crate::{Error, RecordingAudioFormat, RecordingSampleFormat, Result, StatusPublisher};
+use crate::{
+    CompactAudioArtifact, Error, OpusWebmEncoder, RecordingAudioFormat, RecordingSampleFormat,
+    Result, StatusPublisher,
+};
 
 const OPENAI_TRANSCRIPTION_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
 const OPENAI_TRANSCRIPTION_MODEL: &str = "gpt-4o-transcribe";
@@ -21,7 +24,7 @@ pub const TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_ENVIRONMENT_VARIABLE: &str =
     "LISTENER_TRANSCRIPTION_CUSTOMIZATION_ARCHIVE";
 const OPENAI_MAXIMUM_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 const TRANSCRIPTION_ACTOR_QUEUE_CAPACITY: usize = 1;
-const TRANSCRIPTION_ACTOR_REPLY_TIMEOUT: Duration = Duration::from_secs(75);
+const TRANSCRIPTION_ACTOR_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
 const TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_MAGIC: [u8; 8] = *b"LSTNVOC\0";
 const TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_VERSION: u32 = 1;
 
@@ -88,6 +91,13 @@ impl BatchTranscriptionInput {
         }
     }
 
+    pub fn webm_opus(path: PathBuf) -> Self {
+        Self {
+            path,
+            format: BatchTranscriptionInputFormat::WebmOpus,
+        }
+    }
+
     pub fn path(&self) -> &PathBuf {
         &self.path
     }
@@ -101,6 +111,7 @@ impl BatchTranscriptionInput {
 pub enum BatchTranscriptionInputFormat {
     ListenerRecordingLog,
     SignedSixteenBitLittleEndianPcm { audio_format: RecordingAudioFormat },
+    WebmOpus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -483,19 +494,51 @@ impl OpenAiRestTranscriber {
     }
 
     pub fn transcribe(&self, request: BatchTranscriptionRequest) -> Result<TranscriptText> {
-        let upload = WavAudioUpload::from_batch_input(request.input())?;
-        if upload.bytes().len() > OPENAI_MAXIMUM_UPLOAD_BYTES {
+        match request.input().format() {
+            BatchTranscriptionInputFormat::WebmOpus => {
+                self.transcribe_webm_opus(request.input_path())
+            }
+            _ => self.transcribe_upload(
+                WavAudioUpload::from_batch_input(request.input())?.into_upload(),
+            ),
+        }
+    }
+
+    fn transcribe_webm_opus(&self, path: &Path) -> Result<TranscriptText> {
+        let artifact = CompactAudioArtifact::new(path);
+        artifact.validate()?;
+        let encoder = OpusWebmEncoder::from_environment();
+        let duration_seconds = encoder.duration_seconds(path)?;
+        let mut transcripts = Vec::new();
+        for start_seconds in (0..duration_seconds).step_by(600) {
+            let bytes = if duration_seconds <= 600 {
+                fs::read(path)?
+            } else {
+                encoder.chunk_webm(path, start_seconds, 600)?
+            };
+            transcripts.push(self.transcribe_upload(OpenAiAudioUpload::webm(bytes))?);
+        }
+        let text = transcripts
+            .iter()
+            .map(TranscriptText::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(TranscriptText::new(text))
+    }
+
+    fn transcribe_upload(&self, upload: OpenAiAudioUpload) -> Result<TranscriptText> {
+        if upload.bytes.len() > OPENAI_MAXIMUM_UPLOAD_BYTES {
             return Err(Error::TranscriptionBackendUnavailable {
                 message: format!(
                     "OpenAI upload is {} bytes, above the 25 MiB limit",
-                    upload.bytes().len()
+                    upload.bytes.len()
                 ),
             });
         }
         let api_key = self.credentials.resolve()?;
-        let file_part = reqwest::blocking::multipart::Part::bytes(upload.into_bytes())
-            .file_name("listener-input.wav")
-            .mime_str("audio/wav")
+        let file_part = reqwest::blocking::multipart::Part::bytes(upload.bytes)
+            .file_name(upload.file_name)
+            .mime_str(&upload.mime)
             .map_err(|error| Error::TranscriptionBackendUnavailable {
                 message: format!("failed to prepare OpenAI audio upload: {error}"),
             })?;
@@ -699,6 +742,23 @@ impl OpenAiTranscriptionResponseBody {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct OpenAiAudioUpload {
+    bytes: Vec<u8>,
+    file_name: String,
+    mime: String,
+}
+
+impl OpenAiAudioUpload {
+    fn webm(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            file_name: "listener-input.webm".to_owned(),
+            mime: "audio/webm".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct WavAudioUpload {
     bytes: Vec<u8>,
 }
@@ -709,9 +769,10 @@ impl WavAudioUpload {
             BatchTranscriptionInputFormat::SignedSixteenBitLittleEndianPcm { audio_format } => {
                 Self::from_raw_pcm(input.path(), *audio_format)
             }
-            BatchTranscriptionInputFormat::ListenerRecordingLog => {
+            BatchTranscriptionInputFormat::ListenerRecordingLog
+            | BatchTranscriptionInputFormat::WebmOpus => {
                 Err(Error::TranscriptionBackendUnavailable {
-                    message: "OpenAI transcription requires exported raw PCM input".to_owned(),
+                    message: "OpenAI WAV upload requires raw PCM input".to_owned(),
                 })
             }
         }
@@ -775,12 +836,12 @@ impl WavAudioUpload {
         Ok(Self { bytes })
     }
 
-    fn bytes(&self) -> &[u8] {
-        self.bytes.as_slice()
-    }
-
-    fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+    fn into_upload(self) -> OpenAiAudioUpload {
+        OpenAiAudioUpload {
+            bytes: self.bytes,
+            file_name: "listener-input.wav".to_owned(),
+            mime: "audio/wav".to_owned(),
+        }
     }
 }
 

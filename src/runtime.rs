@@ -1,16 +1,18 @@
 use signal_listener::{
     ActiveCapture, ActiveCaptureSession, CancelCapture, CancelledSession, CaptureAlreadyActive,
-    CaptureCancelled, CaptureSession, CaptureSessionMismatch, CaptureStarted, CaptureStatus,
-    CaptureStopped, DeliveryOutcome, DeliveryOutcomes, Input, NoActiveCapture, OperationKind,
-    Output, Reason, RequestUnimplemented, RequestedCaptureSession, StartCapture, StartedSession,
-    StatusRequest, StopCapture, StoppedSession, TranscriptText, UnimplementedOperationKind,
-    UnimplementedReason,
+    CaptureArtifactBytes, CaptureArtifactDurationMilliseconds, CaptureArtifactState,
+    CaptureArtifactStateValue, CaptureCancelled, CaptureListReport, CaptureRetried, CaptureSession,
+    CaptureSessionMismatch, CaptureStarted, CaptureStatus, CaptureStopped, CaptureSummaries,
+    CaptureSummary, DeliveryOutcome, DeliveryOutcomes, Input, ListCapturesRequest, NoActiveCapture,
+    OperationKind, Output, Reason, RequestUnimplemented, RequestedCaptureSession, RetriedSession,
+    RetryCapture, StartCapture, StartedSession, StatusRequest, StopCapture, StoppedSession,
+    TranscriptText, UnimplementedOperationKind, UnimplementedReason,
 };
 
 use crate::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureStore, Configuration, Error,
-    OpenAiBatchTranscriptionActor, OutputTargetDispatcher, RecordingLog,
-    RecoveredCaptureRecordings, Result, TranscriptHistoryEntry, TranscriptHistoryStore,
+    OpenAiBatchTranscriptionActor, OutputTargetDispatcher, RecoveredCaptureRecordings, Result,
+    TranscriptHistoryEntry, TranscriptHistoryStore,
 };
 use crate::{
     BatchTranscriber, BatchTranscriptionInput, BatchTranscriptionRequest,
@@ -82,6 +84,12 @@ impl ListenerRuntime {
             Input::Status(status) => self
                 .status(status)
                 .unwrap_or_else(|error| error.into_unimplemented_reply(OperationKind::Status)),
+            Input::ListCaptures(request) => self.list_captures(request).unwrap_or_else(|error| {
+                error.into_unimplemented_reply(OperationKind::ListCaptures)
+            }),
+            Input::Retry(request) => self
+                .retry_capture(request)
+                .unwrap_or_else(|error| error.into_unimplemented_reply(OperationKind::Retry)),
         }
     }
 
@@ -107,40 +115,31 @@ impl ListenerRuntime {
                 return Err(error);
             }
         };
-        let recovered_log = match RecordingLog::new(stopped_capture.artifact_path()).recover() {
-            Ok(recovered_log) => recovered_log,
+        let compact_artifact = match self
+            .capture_store
+            .compact_audio_for_session(stopped_capture.session())
+        {
+            Ok(artifact) => artifact,
             Err(error) => {
+                self.capture_store
+                    .mark_transcription_failed(stopped_capture.session())
+                    .ok();
                 self.status_publisher.publish_error();
                 return Err(error);
             }
         };
-        let raw_pcm_export = match recovered_log.export_raw_pcm(
-            self.capture_store
-                .raw_pcm_export_for_artifact(stopped_capture.artifact()),
-        ) {
-            Ok(raw_pcm_export) => raw_pcm_export,
+        let transcript_text = match self
+            .transcribe_compact_capture(stopped_capture.session(), compact_artifact.clone())
+        {
+            Ok(transcript_text) => transcript_text,
             Err(error) => {
+                self.capture_store
+                    .mark_transcription_failed(stopped_capture.session())
+                    .ok();
                 self.status_publisher.publish_error();
                 return Err(error);
             }
         };
-        let transcription_input = BatchTranscriptionInput::signed_sixteen_bit_little_endian_pcm(
-            raw_pcm_export.path().to_path_buf(),
-            raw_pcm_export.audio_format(),
-        );
-        let transcript_text =
-            match self
-                .transcriber
-                .transcribe(BatchTranscriptionRequest::new_with_input(
-                    stopped_capture.artifact().clone(),
-                    transcription_input,
-                )) {
-                Ok(transcript_text) => transcript_text,
-                Err(error) => {
-                    self.status_publisher.publish_error();
-                    return Err(error);
-                }
-            };
         self.record_transcript_history(stopped_capture.session(), &transcript_text);
         let delivery_outcomes = self
             .output_target_dispatcher
@@ -149,9 +148,70 @@ impl ListenerRuntime {
 
         Ok(Output::Stopped(CaptureStopped {
             stopped_session: StoppedSession::new(stopped_capture.session().clone()),
-            durable_audio_artifact: stopped_capture.artifact().clone(),
+            durable_audio_artifact: compact_artifact,
             transcript_text,
             delivery_outcomes,
+        }))
+    }
+
+    pub fn list_captures(&mut self, _request: ListCapturesRequest) -> Result<Output> {
+        self.capture_store.prepare()?;
+        let mut summaries = Vec::new();
+        for session in self.capture_store.known_sessions()? {
+            let compact_path = self.capture_store.compact_audio_path_for_session(&session);
+            let log_artifact = self.capture_store.artifact_for_session(&session);
+            let failed = self
+                .capture_store
+                .failed_marker_path_for_session(&session)
+                .exists();
+            let completed = self.history_store.contains_session(&session)?;
+            let state = if completed {
+                CaptureArtifactState::Completed
+            } else if failed {
+                CaptureArtifactState::Failed
+            } else if compact_path.exists() {
+                CaptureArtifactState::Retryable
+            } else {
+                CaptureArtifactState::Recovering
+            };
+            let artifact = if compact_path.exists() {
+                self.capture_store.compact_artifact_for_session(&session)
+            } else {
+                log_artifact
+            };
+            let bytes = std::fs::metadata(artifact.path().as_str())?.len();
+            summaries.push(CaptureSummary {
+                capture_session: session,
+                capture_artifact_state_value: CaptureArtifactStateValue::new(state),
+                durable_audio_artifact: artifact,
+                capture_artifact_bytes: CaptureArtifactBytes::new(bytes),
+                capture_artifact_duration_milliseconds: CaptureArtifactDurationMilliseconds::new(0),
+            });
+        }
+        Ok(Output::CapturesListed(CaptureListReport::new(
+            CaptureSummaries::new(summaries),
+        )))
+    }
+
+    pub fn retry_capture(&mut self, request: RetryCapture) -> Result<Output> {
+        let session = request.into_payload();
+        let compact_artifact = self.capture_store.compact_audio_for_session(&session)?;
+        let transcript_text = match self.transcribe_compact_capture(&session, compact_artifact) {
+            Ok(transcript) => transcript,
+            Err(error) => {
+                self.capture_store.mark_transcription_failed(&session).ok();
+                return Err(error);
+            }
+        };
+        self.record_transcript_history(&session, &transcript_text);
+        let outcomes = self
+            .output_target_dispatcher
+            .deliver(self.configuration.output_targets(), &transcript_text);
+        RuntimeDeliveryStatus::from_outcomes(&outcomes).publish(&self.status_publisher);
+        Ok(Output::Retried(CaptureRetried {
+            retried_session: RetriedSession::new(session),
+            transcript_text,
+            delivery_outcomes: outcomes,
         }))
     }
 
@@ -177,6 +237,24 @@ impl ListenerRuntime {
     /// best-effort convenience projection: the transcript is already in the stop
     /// reply and about to be delivered, so a history-write failure must not abort
     /// the stop or lose the transcript. A cancelled capture never reaches here.
+    fn transcribe_compact_capture(
+        &self,
+        session: &CaptureSession,
+        compact_artifact: signal_listener::DurableAudioArtifact,
+    ) -> Result<TranscriptText> {
+        let input = BatchTranscriptionInput::webm_opus(std::path::PathBuf::from(
+            compact_artifact.path().as_str(),
+        ));
+        let transcript = self
+            .transcriber
+            .transcribe(BatchTranscriptionRequest::new_with_input(
+                compact_artifact,
+                input,
+            ))?;
+        self.capture_store.clear_transcription_failure(session)?;
+        Ok(transcript)
+    }
+
     fn record_transcript_history(
         &self,
         session: &CaptureSession,
@@ -397,7 +475,7 @@ impl StoppedCapture {
 impl Error {
     pub fn into_start_reply(self) -> Output {
         match self {
-            Self::CaptureAlreadyActive { session } => Output::CaptureAlreadyActive(
+            Self::CaptureAlreadyActive { session } => Output::AlreadyActive(
                 CaptureAlreadyActive::new(ActiveCaptureSession::new(CaptureSession::new(session))),
             ),
             error => error.into_unimplemented_reply(OperationKind::Start),
@@ -406,9 +484,9 @@ impl Error {
 
     pub fn into_stop_reply(self) -> Output {
         match self {
-            Self::NoActiveCapture => Output::NoActiveCapture(NoActiveCapture {}),
+            Self::NoActiveCapture => Output::NoActive(NoActiveCapture {}),
             Self::CaptureSessionMismatch { active, requested } => {
-                Output::CaptureSessionMismatch(CaptureSessionMismatch {
+                Output::SessionMismatch(CaptureSessionMismatch {
                     active_capture_session: ActiveCaptureSession::new(CaptureSession::new(active)),
                     requested_capture_session: RequestedCaptureSession::new(CaptureSession::new(
                         requested,
@@ -421,9 +499,9 @@ impl Error {
 
     pub fn into_cancel_reply(self) -> Output {
         match self {
-            Self::NoActiveCapture => Output::NoActiveCapture(NoActiveCapture {}),
+            Self::NoActiveCapture => Output::NoActive(NoActiveCapture {}),
             Self::CaptureSessionMismatch { active, requested } => {
-                Output::CaptureSessionMismatch(CaptureSessionMismatch {
+                Output::SessionMismatch(CaptureSessionMismatch {
                     active_capture_session: ActiveCaptureSession::new(CaptureSession::new(active)),
                     requested_capture_session: RequestedCaptureSession::new(CaptureSession::new(
                         requested,
@@ -435,7 +513,7 @@ impl Error {
     }
 
     pub fn into_unimplemented_reply(self, operation_kind: OperationKind) -> Output {
-        Output::RequestUnimplemented(RequestUnimplemented {
+        Output::Unimplemented(RequestUnimplemented {
             unimplemented_operation_kind: UnimplementedOperationKind::new(operation_kind),
             reason: Reason::new(self.unimplemented_reason()),
         })
@@ -447,7 +525,9 @@ impl Error {
                 UnimplementedReason::AudioBackendUnavailable
             }
             Self::TranscriptionBackendUnavailable { .. }
-            | Self::TranscriptionActorUnavailable { .. } => {
+            | Self::TranscriptionActorUnavailable { .. }
+            | Self::CompactAudioEncode { .. }
+            | Self::CompactAudioInvalid { .. } => {
                 UnimplementedReason::TranscriptionBackendUnavailable
             }
             Self::OutputTargetRejected { .. } => UnimplementedReason::OutputTargetUnavailable,
@@ -459,7 +539,8 @@ impl Error {
             | Self::IncompletePcmFrame { .. }
             | Self::HistoryEntryEncode { .. }
             | Self::HistoryEntryDecode { .. }
-            | Self::SystemClockBeforeUnixEpoch { .. } => UnimplementedReason::StoreUnavailable,
+            | Self::SystemClockBeforeUnixEpoch { .. }
+            | Self::CaptureNotFound { .. } => UnimplementedReason::StoreUnavailable,
             _ => UnimplementedReason::NotBuiltYet,
         }
     }

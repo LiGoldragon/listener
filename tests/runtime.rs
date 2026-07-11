@@ -19,10 +19,10 @@ use listener::{
 use signal_frame::{ExchangeIdentifier, ExchangeLane, LaneSequence, Reply, SessionEpoch, SubReply};
 use signal_listener::{
     ActiveCapture, CaptureSession, CaptureStatus, DeliveryOutcome, DurableAudioArtifact, Frame,
-    FrameBody, Input, InputSource, ListenerDaemonConfiguration, MetaSocketMode, MetaSocketPath,
-    OperationKind, Output, OutputTarget, OutputTargets, SocketMode, StartCapture, StatusRequest,
-    TranscriptText, TranscriptionMode, UnimplementedReason, WirePath, WorkingSocketMode,
-    WorkingSocketPath,
+    FrameBody, Input, InputSource, ListCapturesRequest, ListenerDaemonConfiguration,
+    MetaSocketMode, MetaSocketPath, OperationKind, Output, OutputTarget, OutputTargets,
+    RetryCapture, SocketMode, StartCapture, StatusRequest, TranscriptText, TranscriptionMode,
+    UnimplementedReason, WirePath, WorkingSocketMode, WorkingSocketPath,
 };
 use tempfile::TempDir;
 
@@ -368,17 +368,59 @@ fn start_writes_active_capture_artifact_before_stop() {
     let active_bytes = fs::read(active_export.path()).expect("active artifact bytes");
     assert_eq!(active_bytes, ACTIVE_AUDIO_BYTES);
 
-    runtime.handle_input(Input::stop(session));
-    let stopped_export = RecordingLog::new(artifact.path().as_str())
-        .recover()
-        .expect("recover stopped recording log")
-        .export_raw_pcm(fixture.directory.path().join("stopped.raw.s16le"))
-        .expect("export stopped raw pcm");
-    let stopped_bytes = fs::read(stopped_export.path()).expect("stopped artifact bytes");
-    let mut expected = Vec::new();
-    expected.extend_from_slice(ACTIVE_AUDIO_BYTES);
-    expected.extend_from_slice(STOPPED_AUDIO_BYTES);
-    assert_eq!(stopped_bytes, expected);
+    let stop_reply = runtime.handle_input(Input::stop(session));
+    let stopped = match stop_reply {
+        Output::Stopped(stopped) => stopped,
+        other => panic!("expected stopped reply, got {other:?}"),
+    };
+    assert!(
+        stopped
+            .durable_audio_artifact
+            .path()
+            .as_str()
+            .ends_with(".webm"),
+        "completed captures retain the compact retry artifact"
+    );
+    assert!(
+        !Path::new(artifact.path().as_str()).exists(),
+        "the crash-recovery listener log is removed after compact validation"
+    );
+}
+
+#[test]
+fn list_and_retry_operate_on_compact_capture_artifacts() {
+    let fixture = RuntimeFixture::new();
+    let mut runtime = fixture.runtime();
+    let session = match runtime.handle_input(Input::Start(StartCapture {})) {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected started reply, got {other:?}"),
+    };
+    match runtime.handle_input(Input::stop(session.clone())) {
+        Output::Stopped(_) => {}
+        other => panic!("expected stopped reply, got {other:?}"),
+    }
+
+    match runtime.handle_input(Input::ListCaptures(ListCapturesRequest {})) {
+        Output::CapturesListed(report) => {
+            assert_eq!(report.payload().payload().len(), 1);
+            assert!(
+                report.payload().payload()[0]
+                    .durable_audio_artifact
+                    .path()
+                    .as_str()
+                    .ends_with(".webm"),
+                "list must expose the retryable compact artifact"
+            );
+        }
+        other => panic!("expected capture list, got {other:?}"),
+    }
+
+    match runtime.handle_input(Input::Retry(RetryCapture::new(session))) {
+        Output::Retried(retried) => {
+            assert_eq!(retried.transcript_text.as_str(), "transcribed text")
+        }
+        other => panic!("expected retry reply, got {other:?}"),
+    }
 }
 
 #[test]
@@ -526,7 +568,7 @@ fn stop_returns_artifact_transcript_and_delivery_outcome() {
             .durable_audio_artifact
             .path()
             .as_str()
-            .ends_with(".listenerlog")
+            .ends_with(".webm")
     );
     let transcription_inputs = fixture.transcription_inputs();
     assert_eq!(transcription_inputs.len(), 1);
@@ -534,14 +576,11 @@ fn stop_returns_artifact_transcript_and_delivery_outcome() {
         transcription_inputs[0]
             .path()
             .to_string_lossy()
-            .ends_with(".raw.s16le")
+            .ends_with(".webm")
     );
     match transcription_inputs[0].format() {
-        BatchTranscriptionInputFormat::SignedSixteenBitLittleEndianPcm { audio_format } => {
-            assert_eq!(audio_format.sample_rate(), 16_000);
-            assert_eq!(audio_format.channel_count(), 1);
-        }
-        other => panic!("expected raw PCM transcription input, got {other:?}"),
+        BatchTranscriptionInputFormat::WebmOpus => {}
+        other => panic!("expected compact WebM/Opus transcription input, got {other:?}"),
     }
     assert_eq!(stopped.transcript_text.as_str(), "transcribed text");
     assert_eq!(
@@ -744,7 +783,7 @@ fn stop_actor_unavailable_returns_transcription_backend_unavailable_reply() {
     };
 
     match runtime.handle_input(Input::stop(session)) {
-        Output::RequestUnimplemented(unimplemented) => {
+        Output::Unimplemented(unimplemented) => {
             assert_eq!(
                 unimplemented.unimplemented_operation_kind.payload(),
                 &OperationKind::Stop
@@ -796,7 +835,7 @@ fn start_while_active_returns_typed_conflict_reply() {
     };
 
     match runtime.handle_input(Input::Start(StartCapture {})) {
-        Output::CaptureAlreadyActive(conflict) => {
+        Output::AlreadyActive(conflict) => {
             assert_eq!(conflict.payload().payload(), &session);
         }
         other => panic!("expected active-capture conflict, got {other:?}"),
@@ -811,7 +850,7 @@ fn stop_while_idle_returns_typed_conflict_reply() {
     let mut runtime = fixture.runtime();
 
     match runtime.handle_input(Input::stop(CaptureSession::new(1))) {
-        Output::NoActiveCapture(_) => {}
+        Output::NoActive(_) => {}
         other => panic!("expected no-active-capture conflict, got {other:?}"),
     }
 }
@@ -828,7 +867,7 @@ fn stop_with_wrong_session_returns_typed_conflict_reply_and_preserves_active_cap
     let requested_session = CaptureSession::new(session.value() + 1);
 
     match runtime.handle_input(Input::stop(requested_session.clone())) {
-        Output::CaptureSessionMismatch(conflict) => {
+        Output::SessionMismatch(conflict) => {
             assert_eq!(conflict.active_capture_session.payload(), &session);
             assert_eq!(
                 conflict.requested_capture_session.payload(),
@@ -858,7 +897,7 @@ fn cancel_while_idle_returns_typed_conflict_reply() {
     let mut runtime = fixture.runtime();
 
     match runtime.handle_input(Input::cancel(CaptureSession::new(1))) {
-        Output::NoActiveCapture(_) => {}
+        Output::NoActive(_) => {}
         other => panic!("expected no-active-capture conflict, got {other:?}"),
     }
 }
@@ -875,7 +914,7 @@ fn cancel_with_wrong_session_returns_typed_conflict_reply_and_preserves_active_c
     let requested_session = CaptureSession::new(session.value() + 1);
 
     match runtime.handle_input(Input::cancel(requested_session.clone())) {
-        Output::CaptureSessionMismatch(conflict) => {
+        Output::SessionMismatch(conflict) => {
             assert_eq!(conflict.active_capture_session.payload(), &session);
             assert_eq!(
                 conflict.requested_capture_session.payload(),
@@ -1011,7 +1050,7 @@ fn socket_server_answers_public_conflict_frame_with_matching_exchange() {
                         1 + additional_replies.len()
                     );
                     match reply {
-                        SubReply::Ok(Output::NoActiveCapture(_)) => {}
+                        SubReply::Ok(Output::NoActive(_)) => {}
                         other => panic!("expected no-active-capture reply, got {other:?}"),
                     }
                 }

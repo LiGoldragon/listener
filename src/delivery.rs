@@ -153,6 +153,9 @@ impl ClipboardCommand {
     }
 
     fn failure(target: OutputTarget, reason: DeliveryFailureReason) -> DeliveryOutcome {
-        DeliveryOutcome::Failed(DeliveryFailure { target, reason })
+        DeliveryOutcome::Failed(DeliveryFailure {
+            output_target: target,
+            delivery_failure_reason: reason,
+        })
     }
 }

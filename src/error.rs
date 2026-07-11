@@ -100,6 +100,15 @@ pub enum Error {
     #[error("transcription backend unavailable: {message}")]
     TranscriptionBackendUnavailable { message: String },
 
+    #[error("compact audio encode failed: {message}")]
+    CompactAudioEncode { message: String },
+
+    #[error("compact audio artifact is invalid: {path}")]
+    CompactAudioInvalid { path: String },
+
+    #[error("capture session {session} does not exist")]
+    CaptureNotFound { session: u64 },
+
     #[error("transcription actor unavailable: {message}")]
     TranscriptionActorUnavailable { message: String },
 

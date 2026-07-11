@@ -191,6 +191,13 @@ impl TranscriptHistoryStore {
     /// Read the most recent transcripts, newest first, up to `limit`. A missing
     /// store reads as empty; a malformed line is skipped rather than failing the
     /// whole read.
+    pub fn contains_session(&self, session: &CaptureSession) -> Result<bool> {
+        Ok(self
+            .read_recent(HistoryLimit::new(usize::MAX))?
+            .iter()
+            .any(|entry| entry.session() == session))
+    }
+
     pub fn read_recent(&self, limit: HistoryLimit) -> Result<Vec<TranscriptHistoryEntry>> {
         if !self.path.exists() {
             return Ok(Vec::new());

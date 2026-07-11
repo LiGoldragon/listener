@@ -52,6 +52,7 @@
           commonArgs = {
             inherit src;
             strictDeps = true;
+            nativeBuildInputs = [ pkgs.ffmpeg ];
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
         in
@@ -77,7 +78,12 @@
             context.commonArgs
             // {
               inherit (context) cargoArtifacts;
+              doCheck = false;
               pname = "listener";
+              nativeBuildInputs = [ context.pkgs.makeWrapper ];
+              postFixup = ''
+                wrapProgram $out/bin/listener-daemon --prefix PATH : ${context.pkgs.ffmpeg}/bin
+              '';
               meta.mainProgram = "listener";
             }
           );

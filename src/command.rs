@@ -1,6 +1,9 @@
 use std::io::Write;
 
-use signal_listener::{CancelCapture, CaptureSession, Input, StartCapture, StatusRequest};
+use signal_listener::{
+    CancelCapture, CaptureSession, Input, ListCapturesRequest, RetryCapture, StartCapture,
+    StatusRequest,
+};
 
 use crate::{Error, ListenerClient, Result};
 
@@ -38,6 +41,8 @@ pub enum ListenerCommand {
     Stop(CaptureSession),
     Cancel(CaptureSession),
     Status,
+    List,
+    Retry(CaptureSession),
 }
 
 impl ListenerCommand {
@@ -47,11 +52,13 @@ impl ListenerCommand {
             Some("stop") => Self::stop_from_arguments(arguments),
             Some("cancel") => Self::cancel_from_arguments(arguments),
             Some("status") => Ok(Self::Status),
+            Some("list") => Ok(Self::List),
+            Some("retry") => Ok(Self::Retry(Self::capture_session_from_arguments(arguments, "retry")?)),
             Some(command) => Err(Error::InvalidCommand {
                 message: format!("unknown listener command `{command}`"),
             }),
             None => Err(Error::InvalidCommand {
-                message: "expected one of: start, stop <session>, cancel <session>, status"
+                message: "expected one of: start, stop <session>, cancel <session>, status, list, retry <session>"
                     .to_owned(),
             }),
         }
@@ -63,6 +70,8 @@ impl ListenerCommand {
             Self::Stop(session) => Input::stop(session),
             Self::Cancel(session) => Input::Cancel(CancelCapture::new(session)),
             Self::Status => Input::Status(StatusRequest {}),
+            Self::List => Input::ListCaptures(ListCapturesRequest {}),
+            Self::Retry(session) => Input::Retry(RetryCapture::new(session)),
         }
     }
 
@@ -114,6 +123,24 @@ mod tests {
         match command.into_input() {
             Input::Cancel(cancel) => assert_eq!(cancel.payload().value(), 7),
             other => panic!("expected typed cancel input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_and_retry_commands_build_typed_capture_operations() {
+        let list = ListenerCommand::from_arguments(&["listener".to_owned(), "list".to_owned()])
+            .expect("parse list command");
+        assert!(matches!(list.into_input(), Input::ListCaptures(_)));
+
+        let retry = ListenerCommand::from_arguments(&[
+            "listener".to_owned(),
+            "retry".to_owned(),
+            "87".to_owned(),
+        ])
+        .expect("parse retry command");
+        match retry.into_input() {
+            Input::Retry(retry) => assert_eq!(retry.payload().value(), 87),
+            other => panic!("expected typed retry input, got {other:?}"),
         }
     }
 }

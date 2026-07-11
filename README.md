@@ -1,74 +1,101 @@
 # listener
 
-`listener` is the speech-to-text component runtime. It owns the `listener` CLI,
-`meta-listener` CLI, and `listener-daemon` process.
+`listener` is the supervised speech-to-text component. `listener` is a thin
+client for `listener-daemon`; it never reads or mutates captures directly.
 
-The first implementation slice is scoped to default input capture, continuous
-durable disk write, internal OpenAI batch transcription on stop, system
-clipboard delivery, typed cancellation, and a UI-safe status stream. The daemon
-listens on the configured working socket, starts capture from the system default
-input through `parecord --device=@DEFAULT_SOURCE@`, writes a single growing
-Listener recording log while recording, recovers that log on stop, exports a raw
-`s16le` PCM view for batch transcription, and dispatches the transcript to
-configured output targets. Cancel stops the active capture and retains the
-`.listenerlog` artifact without exporting audio for transcription, calling
-OpenAI, or delivering text.
+## Commands
 
-The active capture artifact is a custom `.listenerlog` file, not a standard
-audio container. It starts with a self-describing header for version, `s16le`
-format, sample rate, channel count, frame size, source, session, and start time.
-Each appended record carries sequence, cumulative frame and byte offsets,
-payload length, CRC32 checksum, payload bytes, and a commit trailer. Listener
-flushes and `fdatasync`s the file after the header and after each payload
-record, then fsyncs the parent directory after creating the file. Recovery scans
-only the valid prefix and truncates the first incomplete or corrupt record tail.
-The writer creates `.listenerlog` files exclusively with owner-only permissions;
-capture-store directories and raw PCM exports are also owner-only. On daemon
-restart, Listener scans existing capture logs, recovers idle orphan logs, and
-allocates the next active artifact after the existing
-`capture-<session>.listenerlog` names.
+```sh
+listener start
+listener status
+listener stop <session>
+listener cancel <session>
+listener list
+listener retry <session>
+```
 
-Start/stop/cancel state conflicts are returned as typed public replies from
-`signal-listener`: already-active capture, no active capture, and active versus
-requested session mismatch.
+`start` returns a session number. Pass that number to `stop` or `cancel`.
+`status` reports the active session without exposing transcript text.
 
-When a capture stops with a successful transcript, Listener appends the
-transcript to a private, append-only history file at
-`$XDG_DATA_HOME/listener/history.jsonl` (typically
-`~/.local/share/listener/history.jsonl`), created with owner-only directory and
-file permissions. Each JSON line records the Unix-millisecond timestamp, the
-capture session, and the transcript text. A cancelled capture writes no history
-entry. The `listener-recall` client reads that history newest first, shows a
-`fuzzel --dmenu` picker over one-line previews, and copies the full chosen
-transcript back to the system clipboard. Recall reads the history file directly
-and does not require the daemon.
+`list` returns one typed record per known capture. Its state is:
 
-Production transcription is Listener-owned. The daemon runs a bounded internal
-OpenAI transcription actor that converts the recovered raw `s16le` PCM export
-to a WAV upload, reads the provider credential at request time with
-`gopass show -o openai/api-key`, calls OpenAI REST transcription with
-`gpt-4o-transcribe`, and returns only the transcript to the existing stop reply
-and delivery path. The development-only `LISTENER_DEVELOPMENT_TRANSCRIPTION_PROGRAM`
-seam may be used for local backend experiments; it is not the normal production
-path.
+- `Recovering`: a crash-recovery `.listenerlog` is still present;
+- `Retryable`: a compact WebM/Opus artifact is ready to transcribe;
+- `Failed`: the most recent conversion or provider attempt failed; retry is
+  still safe;
+- `Completed`: a transcript exists in Listener history.
 
-The UI-safe status stream is a newline-delimited JSON Unix socket at
-`$XDG_RUNTIME_DIR/listener/status.sock` by default. Frames are shaped as
-`{"state":"idle|recording|transcribing|cancelled|copied|error","level":0.0}`
-and never include transcript text. The default `parecord` capture command
-requests low-latency capture, and the writer samples live recording levels in
-roughly 50 ms PCM windows while keeping `.listenerlog` record durability intact.
+For example, retry a failed capture after inspecting it:
 
-Environment knobs:
+```sh
+listener list
+listener retry 87
+listener list
+```
 
-- `LISTENER_SOCKET`: ordinary daemon socket path.
-- `LISTENER_META_SOCKET`: owner/meta socket path.
-- `LISTENER_STATUS_SOCKET`: UI-safe status stream socket path.
-- `LISTENER_CAPTURE_STORE`: durable capture directory.
-- `LISTENER_CAPTURE_PROGRAM`: parecord-compatible capture command.
-- `LISTENER_DEVELOPMENT_TRANSCRIPTION_PROGRAM`: development-only batch
-  transcription command.
-- `LISTENER_CLIPBOARD_PROGRAM`: clipboard command, default `wl-copy`.
-- `LISTENER_HISTORY_STORE`: transcript history file, default
-  `$XDG_DATA_HOME/listener/history.jsonl`.
-- `LISTENER_RECALL_SELECTOR`: recall picker command, default `fuzzel`.
+`retry` uses the retained compact artifact (or first recovers and compacts a
+legacy `.listenerlog`), calls the configured OpenAI transcription backend, then
+sends the transcript to configured outputs and appends it to history. A failed
+retry leaves its compact artifact in place and marks it `Failed`; it is not
+lost and can be retried again.
+
+## Capture and artifact lifecycle
+
+While recording, Listener writes exactly one owner-only (`0700` directory,
+`0600` file) crash-recoverable `capture-<session>.listenerlog` under
+`$XDG_STATE_HOME/listener/captures` (normally
+`~/.local/state/listener/captures`). It is not a second recording: it is the
+durable write-ahead recording format. Its per-record headers, checksums, and
+commit trailers account for its small overhead.
+
+On stop or retry, Listener validates the log, exports a short-lived raw `s16le`
+working file, and encodes `capture-<session>.webm`: mono 16 kHz Opus-in-WebM,
+24 kbit/s with the Opus `voip` application. WebM is OpenAI-supported and is
+appropriate for ordinary microphone speech. The temporary raw file is removed.
+After the compact file has been validated, Listener removes the `.listenerlog`
+and any legacy `capture-<session>.raw.s16le` export. The compact WebM is the
+single retained audio source for retry; there is no cron job or background
+retention sweep.
+
+Completed transcript history is an owner-only append-only projection at
+`$XDG_DATA_HOME/listener/history.jsonl` (normally
+`~/.local/share/listener/history.jsonl`). `listener-recall` reads this history
+newest first and copies a selected transcript to the clipboard.
+
+For long recordings, Listener slices the compact artifact into 600-second Opus
+WebM requests before uploading, joins the returned transcript parts in order,
+and therefore does not rely on a single upload fitting the provider's duration
+or token limit. Each request is also checked against OpenAI's 25 MiB upload
+limit.
+
+## Service and configuration
+
+Run the daemon through the installed service; the ordinary CLI talks to its
+working Unix socket. The normal user-visible workflow is:
+
+```sh
+listener start
+# dictate
+listener status
+listener stop <session>
+listener-recall
+```
+
+`cancel <session>` stops active recording and retains its recoverable log; it
+does not upload or deliver text. It can later be recovered with
+`listener retry <session>`.
+
+Environment configuration:
+
+- `LISTENER_SOCKET`: ordinary daemon socket.
+- `LISTENER_STATUS_SOCKET`: UI-safe status stream socket.
+- `LISTENER_CAPTURE_STORE`: capture directory.
+- `LISTENER_CAPTURE_PROGRAM`: `parecord`-compatible capture command.
+- `LISTENER_FFMPEG_PROGRAM`: FFmpeg-compatible encoder (default `ffmpeg`).
+- `LISTENER_HISTORY_STORE`: transcript history file.
+- `LISTENER_CLIPBOARD_PROGRAM`: clipboard command (default `wl-copy`).
+- `LISTENER_TRANSCRIPTION_CUSTOMIZATION_ARCHIVE`: optional vocabulary archive.
+
+The production backend reads the existing OpenAI credential at request time
+and uses `gpt-4o-transcribe`. The development-only
+`LISTENER_DEVELOPMENT_TRANSCRIPTION_PROGRAM` seam is not the production path.

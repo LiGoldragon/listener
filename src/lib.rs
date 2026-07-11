@@ -9,6 +9,7 @@ pub mod capture;
 pub mod client;
 #[cfg(feature = "nota-text")]
 pub mod command;
+pub mod compact_audio;
 pub mod configuration;
 pub mod daemon;
 pub mod delivery;
@@ -30,6 +31,7 @@ pub use capture::{
 pub use client::ListenerClient;
 #[cfg(feature = "nota-text")]
 pub use command::CommandLine;
+pub use compact_audio::{CompactAudioArtifact, OpusWebmEncoder};
 pub use configuration::{Configuration, ConfigurationEnvironment};
 pub use daemon::ListenerDaemon;
 pub use delivery::{

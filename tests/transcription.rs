@@ -9,9 +9,9 @@ use std::{
 };
 
 use listener::{
-    BatchTranscriber, BatchTranscriptionInput, BatchTranscriptionRequest, Error,
-    OpenAiCredentialSource, OpenAiRestTranscriber, OpenAiTranscriptionRequestConfiguration,
-    RecordingAudioFormat, TranscriptionCustomization, TranscriptionCustomizationEnvironment,
+    BatchTranscriptionInput, BatchTranscriptionRequest, Error, OpenAiCredentialSource,
+    OpenAiRestTranscriber, OpenAiTranscriptionRequestConfiguration, RecordingAudioFormat,
+    TranscriptionCustomization, TranscriptionCustomizationEnvironment,
     TranscriptionCustomizationTextSource,
 };
 use signal_listener::{AudioArtifactPath, DurableAudioArtifact, WirePath};

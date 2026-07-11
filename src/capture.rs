@@ -12,9 +12,9 @@ use signal_listener::{
 };
 
 use crate::{
-    Configuration, Error, RecordingAudioFormat, RecordingLog, RecordingLogHeader,
-    RecordingLogWriter, RecoveredRecordingLog, Result, StatusPublisher,
-    artifact_privacy::OwnerPrivateDirectory,
+    CompactAudioArtifact, Configuration, Error, OpusWebmEncoder, RecordingAudioFormat,
+    RecordingLog, RecordingLogHeader, RecordingLogWriter, RecoveredRecordingLog, Result,
+    StatusPublisher, artifact_privacy::OwnerPrivateDirectory,
 };
 
 const LIVE_LEVEL_SAMPLE_DURATION: Duration = Duration::from_millis(50);
@@ -120,6 +120,98 @@ impl CaptureStore {
         let mut path = PathBuf::from(artifact.path().as_str());
         path.set_extension("raw.s16le");
         path
+    }
+
+    pub fn compact_audio_path_for_session(&self, session: &CaptureSession) -> PathBuf {
+        self.directory
+            .join(format!("capture-{}.webm", session.value()))
+    }
+
+    pub fn compact_artifact_for_session(&self, session: &CaptureSession) -> DurableAudioArtifact {
+        DurableAudioArtifact::new(AudioArtifactPath::new(WirePath::new(
+            self.compact_audio_path_for_session(session)
+                .to_string_lossy()
+                .into_owned(),
+        )))
+    }
+
+    pub fn failed_marker_path_for_session(&self, session: &CaptureSession) -> PathBuf {
+        self.directory
+            .join(format!("capture-{}.transcription-failed", session.value()))
+    }
+
+    pub fn mark_transcription_failed(&self, session: &CaptureSession) -> Result<()> {
+        self.prepare()?;
+        fs::write(self.failed_marker_path_for_session(session), [])?;
+        Ok(())
+    }
+
+    pub fn clear_transcription_failure(&self, session: &CaptureSession) -> Result<()> {
+        match fs::remove_file(self.failed_marker_path_for_session(session)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn known_sessions(&self) -> Result<Vec<CaptureSession>> {
+        let entries = match fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut sessions = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if let Some(session) = CaptureArtifactPathCandidate::new(&path).any_session_value() {
+                sessions.push(CaptureSession::new(session));
+            }
+        }
+        sessions.sort_by_key(CaptureSession::value);
+        sessions.dedup_by_key(|session| session.value());
+        Ok(sessions)
+    }
+
+    pub fn compact_audio_for_session(
+        &self,
+        session: &CaptureSession,
+    ) -> Result<DurableAudioArtifact> {
+        self.prepare()?;
+        let compact_path = self.compact_audio_path_for_session(session);
+        let compact = CompactAudioArtifact::new(&compact_path);
+        let recording_log_path = PathBuf::from(self.artifact_for_session(session).path().as_str());
+        if compact_path.exists() {
+            compact.validate()?;
+            if recording_log_path.exists() {
+                fs::remove_file(&recording_log_path)?;
+                let _ = fs::remove_file(
+                    self.raw_pcm_export_for_artifact(&self.artifact_for_session(session)),
+                );
+            }
+            return Ok(self.compact_artifact_for_session(session));
+        }
+        if !recording_log_path.exists() {
+            return Err(Error::CaptureNotFound {
+                session: session.value(),
+            });
+        }
+        let recovered = RecordingLog::new(&recording_log_path).recover()?;
+        let temporary_pcm = self
+            .directory
+            .join(format!("capture-{}.encoding.s16le", session.value()));
+        let export = recovered.export_raw_pcm(&temporary_pcm)?;
+        let encoding = OpusWebmEncoder::from_environment().encode_pcm(
+            export.path(),
+            export.audio_format(),
+            compact,
+        );
+        let _ = fs::remove_file(&temporary_pcm);
+        let compact = encoding?;
+        compact.validate()?;
+        fs::remove_file(&recording_log_path)?;
+        let _ =
+            fs::remove_file(self.raw_pcm_export_for_artifact(&self.artifact_for_session(session)));
+        Ok(self.compact_artifact_for_session(session))
     }
 
     fn recording_logs(&self) -> Result<CaptureStoreRecordingLogs> {
@@ -241,6 +333,12 @@ impl<'a> CaptureArtifactPathCandidate<'a> {
             .strip_suffix(".listenerlog")?
             .parse()
             .ok()
+    }
+
+    fn any_session_value(&self) -> Option<u64> {
+        let file_name = self.path.file_name()?.to_str()?;
+        let session = file_name.strip_prefix("capture-")?.split('.').next()?;
+        session.parse().ok()
     }
 }
 

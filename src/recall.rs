@@ -79,7 +79,7 @@ impl TranscriptRecall {
             DeliveryOutcome::Failed(failure) => Err(Error::OutputTargetRejected {
                 message: format!(
                     "clipboard rejected recalled transcript: {:?}",
-                    failure.reason
+                    failure.delivery_failure_reason
                 ),
             }),
         }
