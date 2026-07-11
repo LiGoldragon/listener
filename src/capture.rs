@@ -12,9 +12,9 @@ use signal_listener::{
 };
 
 use crate::{
-    CompactAudioArtifact, Configuration, Error, OpusWebmEncoder, RecordingAudioFormat,
-    RecordingLog, RecordingLogHeader, RecordingLogWriter, RecoveredRecordingLog, Result,
-    StatusPublisher, artifact_privacy::OwnerPrivateDirectory,
+    CompactAudioArtifact, Configuration, Error, LiveOpusWebmEncoder, OpusWebmEncoder,
+    RecordingAudioFormat, RecordingLog, RecordingLogHeader, RecordingLogWriter,
+    RecoveredRecordingLog, Result, StatusPublisher, artifact_privacy::OwnerPrivateDirectory,
 };
 
 const LIVE_LEVEL_SAMPLE_DURATION: Duration = Duration::from_millis(50);
@@ -27,6 +27,10 @@ pub trait ActiveAudioCapture {
     fn artifact(&self) -> &DurableAudioArtifact;
 
     fn stop(self: Box<Self>) -> Result<DurableAudioArtifact>;
+
+    fn cancel(self: Box<Self>) -> Result<DurableAudioArtifact> {
+        self.stop()
+    }
 }
 
 #[derive(Clone)]
@@ -99,11 +103,25 @@ impl CaptureStore {
     }
 
     pub fn recover_recording_logs(&self) -> Result<RecoveredCaptureRecordings> {
-        self.recording_logs()?.recover()
+        let recovered = self.recording_logs()?.recover()?;
+        Ok(RecoveredCaptureRecordings::new(
+            recovered.recordings,
+            self.next_session_value_after_existing_artifacts()?,
+        ))
     }
 
     pub fn next_session_value_after_existing_artifacts(&self) -> Result<u64> {
-        self.recording_logs()?.next_session_value()
+        match self.known_sessions()?.last() {
+            Some(session) => {
+                session
+                    .value()
+                    .checked_add(1)
+                    .ok_or(Error::CaptureSessionSequenceExhausted {
+                        last_session: session.value(),
+                    })
+            }
+            None => Ok(1),
+        }
     }
 
     pub fn artifact_for_session(&self, session: &CaptureSession) -> DurableAudioArtifact {
@@ -172,6 +190,20 @@ impl CaptureStore {
         Ok(sessions)
     }
 
+    /// Returns the compact artifact after the live encoder has atomically
+    /// finalized it. The recovery log remains authoritative until this
+    /// validation succeeds.
+    pub fn finalize_live_compact_for_session(
+        &self,
+        session: &CaptureSession,
+    ) -> Result<DurableAudioArtifact> {
+        self.prepare()?;
+        let compact = CompactAudioArtifact::new(self.compact_audio_path_for_session(session));
+        compact.validate()?;
+        self.remove_recovery_material(session)?;
+        Ok(self.compact_artifact_for_session(session))
+    }
+
     pub fn compact_audio_for_session(
         &self,
         session: &CaptureSession,
@@ -181,15 +213,9 @@ impl CaptureStore {
         let compact = CompactAudioArtifact::new(&compact_path);
         let recording_log_path = PathBuf::from(self.artifact_for_session(session).path().as_str());
         if compact_path.exists() {
-            compact.validate()?;
-            if recording_log_path.exists() {
-                fs::remove_file(&recording_log_path)?;
-                let _ = fs::remove_file(
-                    self.raw_pcm_export_for_artifact(&self.artifact_for_session(session)),
-                );
-            }
-            return Ok(self.compact_artifact_for_session(session));
+            return self.finalize_live_compact_for_session(session);
         }
+        compact.discard_partial()?;
         if !recording_log_path.exists() {
             return Err(Error::CaptureNotFound {
                 session: session.value(),
@@ -206,12 +232,19 @@ impl CaptureStore {
             compact,
         );
         let _ = fs::remove_file(&temporary_pcm);
-        let compact = encoding?;
-        compact.validate()?;
-        fs::remove_file(&recording_log_path)?;
-        let _ =
-            fs::remove_file(self.raw_pcm_export_for_artifact(&self.artifact_for_session(session)));
-        Ok(self.compact_artifact_for_session(session))
+        encoding?;
+        self.finalize_live_compact_for_session(session)
+    }
+
+    fn remove_recovery_material(&self, session: &CaptureSession) -> Result<()> {
+        let recording_log = self.artifact_for_session(session);
+        match fs::remove_file(recording_log.path().as_str()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let _ = fs::remove_file(self.raw_pcm_export_for_artifact(&recording_log));
+        Ok(())
     }
 
     fn recording_logs(&self) -> Result<CaptureStoreRecordingLogs> {
@@ -281,33 +314,13 @@ impl CaptureStoreRecordingLogs {
     }
 
     fn recover(&self) -> Result<RecoveredCaptureRecordings> {
-        let next_session_value = self.next_session_value()?;
         let mut recordings = Vec::new();
         for path in &self.paths {
             if path.is_file() {
                 recordings.push(RecordingLog::new(path).recover()?);
             }
         }
-        Ok(RecoveredCaptureRecordings::new(
-            recordings,
-            next_session_value,
-        ))
-    }
-
-    fn next_session_value(&self) -> Result<u64> {
-        let latest_session_value = self
-            .paths
-            .iter()
-            .filter_map(|path| CaptureArtifactPathCandidate::new(path).session_value())
-            .max();
-        match latest_session_value {
-            Some(value) => value
-                .checked_add(1)
-                .ok_or(Error::CaptureSessionSequenceExhausted {
-                    last_session: value,
-                }),
-            None => Ok(1),
-        }
+        Ok(RecoveredCaptureRecordings::new(recordings, 1))
     }
 }
 
@@ -324,15 +337,6 @@ impl<'a> CaptureArtifactPathCandidate<'a> {
         self.path
             .extension()
             .is_some_and(|extension| extension == "listenerlog")
-    }
-
-    fn session_value(&self) -> Option<u64> {
-        let file_name = self.path.file_name()?.to_str()?;
-        file_name
-            .strip_prefix("capture-")?
-            .strip_suffix(".listenerlog")?
-            .parse()
-            .ok()
     }
 
     fn any_session_value(&self) -> Option<u64> {
@@ -432,6 +436,12 @@ impl AudioCaptureCommand {
             self.audio_format,
         )?;
         let recording_log = RecordingLogWriter::create(&artifact_path, header)?;
+        let compact_path = artifact_path.with_extension("webm");
+        let live_encoder = LiveOpusWebmEncoder::start(
+            OpusWebmEncoder::from_environment(),
+            self.audio_format,
+            CompactAudioArtifact::new(&compact_path),
+        )?;
         let mut child = Command::new(&self.program)
             .args(&self.arguments)
             .stdout(Stdio::piped())
@@ -445,25 +455,37 @@ impl AudioCaptureCommand {
             .stdout
             .take()
             .ok_or(Error::CaptureProcessStdoutUnavailable)?;
-        let writer = CaptureWriter::new(stdout, recording_log, request.status_publisher()).spawn();
+        let writer = CaptureWriter::new(
+            stdout,
+            recording_log,
+            request.status_publisher(),
+            Some(live_encoder.sender()),
+        )
+        .spawn();
 
         Ok(Box::new(ProcessAudioCapture {
-            artifact: request.artifact().clone(),
+            recovery_artifact: request.artifact().clone(),
+            compact_artifact: DurableAudioArtifact::new(AudioArtifactPath::new(WirePath::new(
+                compact_path.to_string_lossy().into_owned(),
+            ))),
             child,
             writer,
+            live_encoder,
         }))
     }
 }
 
 pub struct ProcessAudioCapture {
-    artifact: DurableAudioArtifact,
+    recovery_artifact: DurableAudioArtifact,
+    compact_artifact: DurableAudioArtifact,
     child: Child,
     writer: JoinHandle<Result<()>>,
+    live_encoder: LiveOpusWebmEncoder,
 }
 
 impl ActiveAudioCapture for ProcessAudioCapture {
     fn artifact(&self) -> &DurableAudioArtifact {
-        &self.artifact
+        &self.recovery_artifact
     }
 
     fn stop(mut self: Box<Self>) -> Result<DurableAudioArtifact> {
@@ -474,7 +496,22 @@ impl ActiveAudioCapture for ProcessAudioCapture {
         self.writer
             .join()
             .map_err(|_| Error::CaptureWriterThread)??;
-        Ok(self.artifact)
+        self.live_encoder.finish()?;
+        Ok(self.compact_artifact.clone())
+    }
+
+    fn cancel(mut self: Box<Self>) -> Result<DurableAudioArtifact> {
+        if self.child.try_wait()?.is_none() {
+            self.child.kill()?;
+        }
+        self.child.wait()?;
+        self.writer
+            .join()
+            .map_err(|_| Error::CaptureWriterThread)??;
+        let _ = self.live_encoder.finish();
+        let _ = fs::remove_file(self.compact_artifact.path().as_str());
+        let _ = CompactAudioArtifact::new(self.compact_artifact.path().as_str()).discard_partial();
+        Ok(self.recovery_artifact.clone())
     }
 }
 
@@ -483,6 +520,7 @@ pub struct CaptureWriter<Input> {
     recording_log: RecordingLogWriter,
     pending_pcm: CaptureWriterPendingPcm,
     status_publisher: StatusPublisher,
+    live_encoder: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     read_buffer_bytes: usize,
 }
 
@@ -491,6 +529,7 @@ impl<Input: Read> CaptureWriter<Input> {
         input: Input,
         recording_log: RecordingLogWriter,
         status_publisher: StatusPublisher,
+        live_encoder: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     ) -> Self {
         let pending_pcm = CaptureWriterPendingPcm::new(recording_log.audio_format());
         let read_buffer_bytes = CaptureWriterReadWindow::new(
@@ -504,6 +543,7 @@ impl<Input: Read> CaptureWriter<Input> {
             recording_log,
             pending_pcm,
             status_publisher,
+            live_encoder,
             read_buffer_bytes,
         }
     }
@@ -519,6 +559,7 @@ impl<Input: Read> CaptureWriter<Input> {
                 &read_buffer[..read_count],
                 &mut self.recording_log,
                 &self.status_publisher,
+                self.live_encoder.as_ref(),
             )?;
         }
         self.pending_pcm.finish()?;
@@ -581,6 +622,7 @@ impl CaptureWriterPendingPcm {
         bytes: &[u8],
         recording_log: &mut RecordingLogWriter,
         status_publisher: &StatusPublisher,
+        live_encoder: Option<&std::sync::mpsc::Sender<Vec<u8>>>,
     ) -> Result<()> {
         self.bytes.extend_from_slice(bytes);
         let bytes_per_frame = usize::from(self.audio_format.bytes_per_frame());
@@ -599,6 +641,9 @@ impl CaptureWriterPendingPcm {
                 ),
             );
             recording_log.append_record(payload)?;
+            if let Some(live_encoder) = live_encoder {
+                let _ = live_encoder.send(payload.to_vec());
+            }
         }
         Ok(())
     }

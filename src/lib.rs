@@ -31,7 +31,7 @@ pub use capture::{
 pub use client::ListenerClient;
 #[cfg(feature = "nota-text")]
 pub use command::CommandLine;
-pub use compact_audio::{CompactAudioArtifact, OpusWebmEncoder};
+pub use compact_audio::{CompactAudioArtifact, LiveOpusWebmEncoder, OpusWebmEncoder};
 pub use configuration::{Configuration, ConfigurationEnvironment};
 pub use daemon::ListenerDaemon;
 pub use delivery::{

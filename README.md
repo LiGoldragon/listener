@@ -41,21 +41,29 @@ lost and can be retried again.
 
 ## Capture and artifact lifecycle
 
-While recording, Listener writes exactly one owner-only (`0700` directory,
-`0600` file) crash-recoverable `capture-<session>.listenerlog` under
+While recording, Listener commits PCM records to one owner-only (`0700`
+directory, `0600` file) crash-recoverable `capture-<session>.listenerlog` under
 `$XDG_STATE_HOME/listener/captures` (normally
-`~/.local/state/listener/captures`). It is not a second recording: it is the
-durable write-ahead recording format. Its per-record headers, checksums, and
-commit trailers account for its small overhead.
+`~/.local/state/listener/captures`). In a separate encoder worker it immediately
+feeds each already-committed record to FFmpeg, which incrementally writes
+`capture-<session>.webm.part`: mono 16 kHz Opus-in-WebM, 24 kbit/s with the
+Opus `voip` application. This worker never blocks the capture writer; a failed
+encoder leaves the durable log intact for recovery.
 
-On stop or retry, Listener validates the log, exports a short-lived raw `s16le`
-working file, and encodes `capture-<session>.webm`: mono 16 kHz Opus-in-WebM,
-24 kbit/s with the Opus `voip` application. WebM is OpenAI-supported and is
-appropriate for ordinary microphone speech. The temporary raw file is removed.
-After the compact file has been validated, Listener removes the `.listenerlog`
-and any legacy `capture-<session>.raw.s16le` export. The compact WebM is the
-single retained audio source for retry; there is no cron job or background
-retention sweep.
+The `.part` file is an unfinished container, not a retry artifact and is not
+shown by `listener list`. On normal `stop`, Listener closes the encoder input,
+waits only for the active container to flush and finalizes it atomically as
+`capture-<session>.webm`; it does not re-encode the recording. Listener then
+validates the completed WebM before removing the `.listenerlog` and any legacy
+`capture-<session>.raw.s16le` export. The compact WebM is the single retained
+audio source for retry; there is no cron job or background retention sweep.
+
+If Listener or the host stops unexpectedly, the `.listenerlog` remains the
+recoverable source and the unfinished `.webm.part` is ignored. `listener retry
+<session>` discards that partial container, recovers the validated log records,
+and creates a fresh compact WebM before transcription. No raw full-duration
+working export is used for normal live captures; it remains only in the legacy
+recovery path.
 
 Completed transcript history is an owner-only append-only projection at
 `$XDG_DATA_HOME/listener/history.jsonl` (normally

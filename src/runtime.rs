@@ -115,10 +115,7 @@ impl ListenerRuntime {
                 return Err(error);
             }
         };
-        let compact_artifact = match self
-            .capture_store
-            .compact_audio_for_session(stopped_capture.session())
-        {
+        let compact_artifact = match self.compact_artifact_after_stop(&stopped_capture) {
             Ok(artifact) => artifact,
             Err(error) => {
                 self.capture_store
@@ -218,7 +215,7 @@ impl ListenerRuntime {
     pub fn cancel(&mut self, request: CancelCapture) -> Result<Output> {
         let active_capture = self.take_active_capture(request.into_payload())?;
 
-        let stopped_capture = match active_capture.stop() {
+        let stopped_capture = match active_capture.cancel() {
             Ok(stopped_capture) => stopped_capture,
             Err(error) => {
                 self.status_publisher.publish_error();
@@ -237,6 +234,24 @@ impl ListenerRuntime {
     /// best-effort convenience projection: the transcript is already in the stop
     /// reply and about to be delivered, so a history-write failure must not abort
     /// the stop or lose the transcript. A cancelled capture never reaches here.
+    fn compact_artifact_after_stop(
+        &self,
+        stopped_capture: &StoppedCapture,
+    ) -> Result<signal_listener::DurableAudioArtifact> {
+        if stopped_capture
+            .artifact()
+            .path()
+            .as_str()
+            .ends_with(".webm")
+        {
+            self.capture_store
+                .finalize_live_compact_for_session(stopped_capture.session())
+        } else {
+            self.capture_store
+                .compact_audio_for_session(stopped_capture.session())
+        }
+    }
+
     fn transcribe_compact_capture(
         &self,
         session: &CaptureSession,
@@ -444,6 +459,11 @@ impl RuntimeActiveCapture {
 
     pub fn stop(self) -> Result<StoppedCapture> {
         let artifact = self.capture.stop()?;
+        Ok(StoppedCapture::new(self.session, artifact))
+    }
+
+    pub fn cancel(self) -> Result<StoppedCapture> {
+        let artifact = self.capture.cancel()?;
         Ok(StoppedCapture::new(self.session, artifact))
     }
 }

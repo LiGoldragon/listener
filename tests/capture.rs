@@ -2,12 +2,14 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     os::unix::fs::PermissionsExt,
+    path::Path,
     sync::{Arc, Mutex},
 };
 
 use listener::{
-    CaptureStore, RecordingAudioFormat, RecordingInputSource, RecordingLog, RecordingLogDurability,
-    RecordingLogHeader, RecordingLogWriter, RecordingStartTime, capture::CaptureWriter,
+    CaptureStore, CompactAudioArtifact, LiveOpusWebmEncoder, OpusWebmEncoder, RecordingAudioFormat,
+    RecordingInputSource, RecordingLog, RecordingLogDurability, RecordingLogHeader,
+    RecordingLogWriter, RecordingStartTime, capture::CaptureWriter,
 };
 use signal_listener::CaptureSession;
 use tempfile::TempDir;
@@ -61,6 +63,26 @@ fn capture_store_prepare_uses_owner_only_directory_permissions() {
 }
 
 #[test]
+fn compact_retry_artifact_advances_next_capture_session() {
+    let fixture = CaptureWriterFixture::new();
+    let store = CaptureStore::new(fixture.directory.path().join("captures"));
+    store.prepare().expect("prepare capture store");
+    fs::write(
+        store.compact_audio_path_for_session(&CaptureSession::new(91)),
+        b"compact",
+    )
+    .expect("write retained retry artifact");
+
+    assert_eq!(
+        store
+            .next_session_value_after_existing_artifacts()
+            .expect("next session"),
+        92,
+        "a retained compact artifact must never be overwritten after daemon restart"
+    );
+}
+
+#[test]
 fn capture_writer_commits_record_before_input_end() {
     let fixture = CaptureWriterFixture::new();
     let path = fixture.path();
@@ -81,9 +103,14 @@ fn capture_writer_commits_record_before_input_end() {
         baseline_commit_count,
     );
 
-    CaptureWriter::new(input, recording_log, listener::StatusPublisher::silent())
-        .write_until_capture_stops()
-        .expect("write capture stream");
+    CaptureWriter::new(
+        input,
+        recording_log,
+        listener::StatusPublisher::silent(),
+        None,
+    )
+    .write_until_capture_stops()
+    .expect("write capture stream");
 
     let commit_count = fixture
         .committed_lengths
@@ -107,6 +134,88 @@ fn capture_writer_commits_record_before_input_end() {
 }
 
 #[test]
+fn live_opus_encoder_writes_compact_audio_before_finalization() {
+    let fixture = CaptureWriterFixture::new();
+    let destination = CompactAudioArtifact::new(fixture.directory.path().join("capture-91.webm"));
+    let encoder = LiveOpusWebmEncoder::start(
+        OpusWebmEncoder::from_environment(),
+        RecordingAudioFormat::signed_sixteen_bit_little_endian_mono_16khz(),
+        destination.clone(),
+    )
+    .expect("start live encoder");
+    let sender = encoder.sender();
+    sender
+        .send(vec![0_u8; 192_000])
+        .expect("queue six seconds of PCM without blocking capture");
+    let partial = fixture.directory.path().join("capture-91.webm.part");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while fs::metadata(&partial)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        == 0
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "live encoder did not write the in-progress container before stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    drop(sender);
+
+    let completed = encoder.finish().expect("finalize live encoder");
+    assert_eq!(completed.path(), destination.path());
+    assert!(completed.bytes().expect("compact bytes") > 0);
+    assert!(
+        !fixture
+            .directory
+            .path()
+            .join("capture-91.webm.part")
+            .exists(),
+        "finalization atomically removes the unfinished container name"
+    );
+}
+
+#[test]
+fn interrupted_live_partial_is_discarded_and_recovered_from_durable_log() {
+    let fixture = CaptureWriterFixture::new();
+    let capture_directory = fixture.directory.path().join("captures");
+    let store = CaptureStore::new(&capture_directory);
+    store.prepare().expect("prepare capture store");
+    let session = CaptureSession::new(91);
+    let recording_log = RecordingLogWriter::create(
+        store.artifact_for_session(&session).path().as_str(),
+        fixture.header(),
+    )
+    .expect("create durable recovery log");
+    let mut recording_log = recording_log;
+    for payload in vec![0_u8; 32_000].chunks(8_000) {
+        recording_log
+            .append_record(payload)
+            .expect("commit one second of recovery audio");
+    }
+    recording_log.finish().expect("finish recovery log");
+    fs::write(
+        capture_directory.join("capture-91.webm.part"),
+        b"interrupted container",
+    )
+    .expect("write interrupted partial");
+
+    let compact = store
+        .compact_audio_for_session(&session)
+        .expect("recover compact artifact from durable log");
+    assert!(compact.path().as_str().ends_with(".webm"));
+    assert!(Path::new(compact.path().as_str()).exists());
+    assert!(
+        !Path::new(store.artifact_for_session(&session).path().as_str()).exists(),
+        "only validated compact output permits removal of recovery source"
+    );
+    assert!(
+        !capture_directory.join("capture-91.webm.part").exists(),
+        "an interrupted live container is never treated as retryable"
+    );
+}
+
+#[test]
 fn capture_writer_samples_live_level_at_fifty_millisecond_pcm_window() {
     let fixture = CaptureWriterFixture::new();
     let path = fixture.path();
@@ -123,7 +232,7 @@ fn capture_writer_samples_live_level_at_fifty_millisecond_pcm_window() {
         vec![2; sample_window_bytes],
     ]);
 
-    CaptureWriter::new(input, recording_log, status_publisher)
+    CaptureWriter::new(input, recording_log, status_publisher, None)
         .write_until_capture_stops()
         .expect("write capture stream");
 
