@@ -120,16 +120,24 @@ past existing `capture-<session>.listenerlog` names before starting another
 recording. Cancel stops the active capture using the same capture shutdown path
 and returns the retained `.listenerlog` artifact without recovering/exporting
 audio for transcription, sending OpenAI actor mail, or invoking output delivery.
-Listener exports a recovered raw `s16le` PCM path on stop, sends that path as
-typed mail to the internal OpenAI transcription actor, converts it to an
-in-memory WAV upload, reads `gopass openai/api-key` at request time, and calls
-OpenAI REST transcription with `gpt-4o-transcribe`. Clipboard delivery uses
-`wl-copy` by default through the typed output-target dispatcher.
+Idle recovery removes abandoned `.webm.part`, `.webm.encoding`, and raw-export
+intermediates. Failed and cancelled terminal media can additionally be bounded
+by explicit `LISTENER_CAPTURE_RETENTION_DAYS` and/or
+`LISTENER_CAPTURE_RETENTION_MAXIMUM_BYTES` policy; both are disabled until an
+owner supplies a threshold, so no media default is silently chosen. Listener
+transcribes the compact WebM through its internal OpenAI actor, reads `gopass
+openai/api-key` at request time, and calls OpenAI REST transcription with
+`gpt-4o-transcribe`. Clipboard delivery uses `wl-copy` by default through the
+typed output-target dispatcher.
 
 On a successful stop, before delivery, the runtime appends the transcript to a
 private bounded history store at `$XDG_DATA_HOME/listener/history.jsonl`
 (overridable with `LISTENER_HISTORY_STORE`), created with owner-only directory
-and file permissions. The typed `TranscriptHistoryEntry` carries the record and
+and file permissions. Once that append succeeds, the transcript is the terminal
+artifact and Listener reclaims its `.listenerlog`, `.webm`, failure marker, and
+any raw/partial/encoding intermediates. If transcript persistence fails, the
+compact audio remains retryable rather than being silently discarded. The typed
+`TranscriptHistoryEntry` carries the record and
 its JSON line is the human/interchange projection: Unix-millisecond timestamp,
 capture session, and transcript text. The store atomically compacts before
 appends and reads, hard-deleting expired records and the oldest records beyond

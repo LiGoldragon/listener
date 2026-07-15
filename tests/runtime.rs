@@ -379,16 +379,20 @@ fn start_writes_active_capture_artifact_before_stop() {
             .path()
             .as_str()
             .ends_with(".webm"),
-        "completed captures retain the compact retry artifact"
+        "the stop reply names the compact artifact produced for transcription"
     );
     assert!(
         !Path::new(artifact.path().as_str()).exists(),
         "the crash-recovery listener log is removed after compact validation"
     );
+    assert!(
+        !Path::new(stopped.durable_audio_artifact.path().as_str()).exists(),
+        "a durable transcript supersedes the compact transcription input"
+    );
 }
 
 #[test]
-fn list_and_retry_operate_on_compact_capture_artifacts() {
+fn successful_capture_reclaims_compact_artifact_and_is_not_retryable() {
     let fixture = RuntimeFixture::new();
     let mut runtime = fixture.runtime();
     let session = match runtime.handle_input(Input::Start(StartCapture {})) {
@@ -401,26 +405,57 @@ fn list_and_retry_operate_on_compact_capture_artifacts() {
     }
 
     match runtime.handle_input(Input::ListCaptures(ListCapturesRequest {})) {
-        Output::CapturesListed(report) => {
-            assert_eq!(report.payload().payload().len(), 1);
-            assert!(
-                report.payload().payload()[0]
-                    .durable_audio_artifact
-                    .path()
-                    .as_str()
-                    .ends_with(".webm"),
-                "list must expose the retryable compact artifact"
-            );
-        }
+        Output::CapturesListed(report) => assert!(
+            report.payload().payload().is_empty(),
+            "terminal transcript success must reclaim the compact retry artifact"
+        ),
         other => panic!("expected capture list, got {other:?}"),
     }
 
     match runtime.handle_input(Input::Retry(RetryCapture::new(session))) {
-        Output::Retried(retried) => {
-            assert_eq!(retried.transcript_text.as_str(), "transcribed text")
-        }
-        other => panic!("expected retry reply, got {other:?}"),
+        Output::Unimplemented(unimplemented) => assert_eq!(
+            unimplemented.reason.payload(),
+            &UnimplementedReason::StoreUnavailable,
+            "a terminally converted capture has no retry media"
+        ),
+        other => panic!("expected store-unavailable retry reply, got {other:?}"),
     }
+}
+
+#[test]
+fn repeated_successful_captures_reclaim_each_terminal_audio_artifact() {
+    let fixture = RuntimeFixture::new();
+    let mut runtime = fixture.runtime();
+
+    for expected_session in [1, 2] {
+        let session = match runtime.handle_input(Input::Start(StartCapture {})) {
+            Output::Started(started) => started.payload().payload().clone(),
+            other => panic!("expected started reply, got {other:?}"),
+        };
+        assert_eq!(session.value(), expected_session);
+        match runtime.handle_input(Input::stop(session.clone())) {
+            Output::Stopped(_) => {}
+            other => panic!("expected stopped reply, got {other:?}"),
+        }
+        assert!(
+            !fixture.capture_path(session.value()).exists(),
+            "successful capture {expected_session} left a recovery log"
+        );
+        assert!(
+            !fixture
+                .directory
+                .path()
+                .join("captures")
+                .join(format!("capture-{}.webm", session.value()))
+                .exists(),
+            "successful capture {expected_session} left compact audio"
+        );
+    }
+
+    assert_eq!(
+        fixture.recorded_history(),
+        vec!["transcribed text".to_owned(), "transcribed text".to_owned()]
+    );
 }
 
 #[test]

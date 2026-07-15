@@ -101,7 +101,7 @@ impl ListenerRuntime {
         }
 
         self.capture_store.prepare()?;
-        self.recover_orphaned_recordings()?;
+        self.reclaim_idle_capture_artifacts()?;
         self.start_next_available_capture()
     }
 
@@ -137,7 +137,11 @@ impl ListenerRuntime {
                 return Err(error);
             }
         };
-        self.record_transcript_history(stopped_capture.session(), &transcript_text);
+        if self.record_transcript_history(stopped_capture.session(), &transcript_text) {
+            self.capture_store.reclaim_completed_captures(|session| {
+                self.history_store.contains_session(session)
+            })?;
+        }
         let delivery_outcomes = self
             .output_target_dispatcher
             .deliver(self.configuration.output_targets(), &transcript_text);
@@ -200,7 +204,12 @@ impl ListenerRuntime {
                 return Err(error);
             }
         };
-        self.record_transcript_history(&session, &transcript_text);
+        if self.record_transcript_history(&session, &transcript_text) {
+            self.capture_store
+                .reclaim_completed_captures(|capture_session| {
+                    self.history_store.contains_session(capture_session)
+                })?;
+        }
         let outcomes = self
             .output_target_dispatcher
             .deliver(self.configuration.output_targets(), &transcript_text);
@@ -274,17 +283,15 @@ impl ListenerRuntime {
         &self,
         session: &CaptureSession,
         transcript_text: &TranscriptText,
-    ) {
-        if let Ok(entry) =
-            TranscriptHistoryEntry::recorded_now(session.clone(), transcript_text.clone())
-        {
-            let _ = self.history_store.append(&entry);
-        }
+    ) -> bool {
+        TranscriptHistoryEntry::recorded_now(session.clone(), transcript_text.clone())
+            .and_then(|entry| self.history_store.append(&entry))
+            .is_ok()
     }
 
     pub fn status(&mut self, _request: StatusRequest) -> Result<Output> {
         if self.active_capture.is_none() {
-            self.recover_orphaned_recordings()?;
+            self.reclaim_idle_capture_artifacts()?;
         }
 
         Ok(Output::status_reported(
@@ -325,6 +332,13 @@ impl ListenerRuntime {
             .advance_to_at_least(orphaned_recordings.next_session_value());
         self.orphaned_recordings = orphaned_recordings;
         Ok(())
+    }
+
+    fn reclaim_idle_capture_artifacts(&mut self) -> Result<()> {
+        self.recover_orphaned_recordings()?;
+        self.capture_store
+            .reclaim_completed_captures(|session| self.history_store.contains_session(session))?;
+        self.capture_store.enforce_environment_retention()
     }
 
     fn start_next_available_capture(&mut self) -> Result<Output> {
@@ -560,6 +574,7 @@ impl Error {
             | Self::HistoryEntryEncode { .. }
             | Self::HistoryEntryDecode { .. }
             | Self::InvalidHistoryRetentionPolicy { .. }
+            | Self::InvalidCaptureRetentionPolicy { .. }
             | Self::SystemClockBeforeUnixEpoch { .. }
             | Self::CaptureNotFound { .. } => UnimplementedReason::StoreUnavailable,
             _ => UnimplementedReason::NotBuiltYet,

@@ -124,6 +124,9 @@ pub enum Error {
     #[error("invalid transcript history retention policy {variable}={value}")]
     InvalidHistoryRetentionPolicy { variable: String, value: String },
 
+    #[error("invalid capture retention policy {variable}={value}")]
+    InvalidCaptureRetentionPolicy { variable: String, value: String },
+
     #[error("recall selector `{program}` unavailable: {message}")]
     RecallSelectorUnavailable { program: String, message: String },
 

@@ -4,10 +4,12 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::Path,
     sync::{Arc, Mutex},
+    time::{Duration, SystemTime},
 };
 
 use listener::{
-    CaptureStore, CompactAudioArtifact, LiveOpusWebmEncoder, OpusWebmEncoder, RecordingAudioFormat,
+    CaptureRetentionAge, CaptureRetentionByteLimit, CaptureRetentionPolicy, CaptureStore,
+    CompactAudioArtifact, LiveOpusWebmEncoder, OpusWebmEncoder, RecordingAudioFormat,
     RecordingInputSource, RecordingLog, RecordingLogDurability, RecordingLogHeader,
     RecordingLogWriter, RecordingStartTime, capture::CaptureWriter,
 };
@@ -79,6 +81,64 @@ fn compact_retry_artifact_advances_next_capture_session() {
             .expect("next session"),
         92,
         "a retained compact artifact must never be overwritten after daemon restart"
+    );
+}
+
+#[test]
+fn retained_capture_media_requires_an_explicit_byte_bound_before_deletion() {
+    let fixture = CaptureWriterFixture::new();
+    let store = CaptureStore::new(fixture.directory.path().join("captures"));
+    store.prepare().expect("prepare capture store");
+    let first = CaptureSession::new(1);
+    let second = CaptureSession::new(2);
+    fs::write(store.artifact_for_session(&first).path().as_str(), b"first")
+        .expect("write first retained capture");
+    fs::write(store.compact_audio_path_for_session(&second), b"second")
+        .expect("write second retained capture");
+
+    store
+        .enforce_retention(CaptureRetentionPolicy::default())
+        .expect("disabled retention leaves captures intact");
+    assert!(Path::new(store.artifact_for_session(&first).path().as_str()).exists());
+    assert!(store.compact_audio_path_for_session(&second).exists());
+
+    store
+        .enforce_retention(CaptureRetentionPolicy::new(
+            None,
+            Some(CaptureRetentionByteLimit::new(6)),
+        ))
+        .expect("enforce explicit byte bound");
+    assert!(
+        !Path::new(store.artifact_for_session(&first).path().as_str()).exists(),
+        "the oldest session must be reclaimed first when the byte cap is exceeded"
+    );
+    assert!(
+        store.compact_audio_path_for_session(&second).exists(),
+        "the newest session remains within the configured byte cap"
+    );
+}
+
+#[test]
+fn retained_capture_age_bound_reclaims_abandoned_media_at_maintenance_time() {
+    let fixture = CaptureWriterFixture::new();
+    let store = CaptureStore::new(fixture.directory.path().join("captures"));
+    store.prepare().expect("prepare capture store");
+    let session = CaptureSession::new(1);
+    fs::write(
+        store.artifact_for_session(&session).path().as_str(),
+        b"abandoned",
+    )
+    .expect("write abandoned capture");
+
+    store
+        .enforce_retention_at(
+            CaptureRetentionPolicy::new(Some(CaptureRetentionAge::from_milliseconds(1)), None),
+            SystemTime::now() + Duration::from_secs(1),
+        )
+        .expect("enforce explicit age bound");
+    assert!(
+        !Path::new(store.artifact_for_session(&session).path().as_str()).exists(),
+        "capture older than the configured age bound must be reclaimed"
     );
 }
 
@@ -199,6 +259,23 @@ fn interrupted_live_partial_is_discarded_and_recovered_from_durable_log() {
         b"interrupted container",
     )
     .expect("write interrupted partial");
+    fs::write(capture_directory.join("capture-91.webm"), [])
+        .expect("write invalid interrupted compact output");
+    fs::write(
+        capture_directory.join("capture-91.raw.s16le"),
+        b"interrupted raw export",
+    )
+    .expect("write interrupted raw export");
+    fs::write(
+        capture_directory.join("capture-91.encoding.s16le"),
+        b"interrupted recovery pcm",
+    )
+    .expect("write interrupted recovery pcm");
+    fs::write(
+        capture_directory.join("capture-91.webm.encoding"),
+        b"interrupted encoding output",
+    )
+    .expect("write interrupted encoding output");
 
     let compact = store
         .compact_audio_for_session(&session)
@@ -206,12 +283,57 @@ fn interrupted_live_partial_is_discarded_and_recovered_from_durable_log() {
     assert!(compact.path().as_str().ends_with(".webm"));
     assert!(Path::new(compact.path().as_str()).exists());
     assert!(
+        fs::metadata(compact.path().as_str())
+            .expect("recovered compact metadata")
+            .len()
+            > 0,
+        "an invalid terminal WebM is replaced from its durable recording log"
+    );
+    assert!(
         !Path::new(store.artifact_for_session(&session).path().as_str()).exists(),
         "only validated compact output permits removal of recovery source"
     );
     assert!(
         !capture_directory.join("capture-91.webm.part").exists(),
         "an interrupted live container is never treated as retryable"
+    );
+    assert!(
+        !capture_directory.join("capture-91.raw.s16le").exists(),
+        "an abandoned raw export is removed before crash recovery"
+    );
+    assert!(
+        !capture_directory.join("capture-91.encoding.s16le").exists(),
+        "an abandoned recovery PCM export is removed before crash recovery"
+    );
+    assert!(
+        !capture_directory.join("capture-91.webm.encoding").exists(),
+        "an abandoned encoder output is removed before crash recovery"
+    );
+}
+
+#[test]
+fn recovery_discards_unusable_terminal_compact_artifact_without_a_recovery_log() {
+    let fixture = CaptureWriterFixture::new();
+    let store = CaptureStore::new(fixture.directory.path().join("captures"));
+    store.prepare().expect("prepare capture store");
+    let session = CaptureSession::new(91);
+    fs::write(store.compact_audio_path_for_session(&session), [])
+        .expect("write unusable compact artifact");
+    store
+        .mark_transcription_failed(&session)
+        .expect("mark failed terminal compact artifact");
+
+    store
+        .recover_recording_logs()
+        .expect("recover abandoned capture directory");
+
+    assert!(
+        !store.compact_audio_path_for_session(&session).exists(),
+        "a zero-byte terminal compact artifact cannot be retried and is reclaimed"
+    );
+    assert!(
+        !store.failed_marker_path_for_session(&session).exists(),
+        "the failure marker is reclaimed with its unusable terminal artifact"
     );
 }
 

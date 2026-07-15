@@ -1,10 +1,10 @@
 use std::{
-    fs,
+    env, fs,
     io::{ErrorKind, Read},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use signal_listener::{
@@ -18,6 +18,111 @@ use crate::{
 };
 
 const LIVE_LEVEL_SAMPLE_DURATION: Duration = Duration::from_millis(50);
+const MILLISECONDS_PER_DAY: u64 = 24 * 60 * 60 * 1_000;
+
+/// A finite age bound for retained capture media.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureRetentionAge {
+    milliseconds: u64,
+}
+
+impl CaptureRetentionAge {
+    pub fn from_days(days: u64) -> Option<Self> {
+        days.checked_mul(MILLISECONDS_PER_DAY)
+            .map(|milliseconds| Self { milliseconds })
+    }
+
+    pub fn from_milliseconds(milliseconds: u64) -> Self {
+        Self { milliseconds }
+    }
+
+    pub fn milliseconds(&self) -> u64 {
+        self.milliseconds
+    }
+
+    fn expires(&self, modified_at: SystemTime, evaluated_at: SystemTime) -> bool {
+        evaluated_at
+            .duration_since(modified_at)
+            .map(|elapsed| elapsed.as_millis() >= u128::from(self.milliseconds))
+            .unwrap_or(false)
+    }
+}
+
+/// A byte bound for all retained capture media.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureRetentionByteLimit {
+    bytes: u64,
+}
+
+impl CaptureRetentionByteLimit {
+    pub fn new(bytes: u64) -> Self {
+        Self { bytes }
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+/// Explicit policy for abandoned, cancelled, or failed capture media.
+///
+/// No media is deleted by this policy until an owner configures at least one
+/// bound. `LISTENER_CAPTURE_RETENTION_DAYS` and
+/// `LISTENER_CAPTURE_RETENTION_MAXIMUM_BYTES` may be set independently.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureRetentionPolicy {
+    maximum_age: Option<CaptureRetentionAge>,
+    maximum_bytes: Option<CaptureRetentionByteLimit>,
+}
+
+impl CaptureRetentionPolicy {
+    pub fn new(
+        maximum_age: Option<CaptureRetentionAge>,
+        maximum_bytes: Option<CaptureRetentionByteLimit>,
+    ) -> Self {
+        Self {
+            maximum_age,
+            maximum_bytes,
+        }
+    }
+
+    pub fn from_environment() -> Result<Self> {
+        let maximum_age = match Self::environment_u64("LISTENER_CAPTURE_RETENTION_DAYS")? {
+            Some(days) => Some(CaptureRetentionAge::from_days(days).ok_or_else(|| {
+                Error::InvalidCaptureRetentionPolicy {
+                    variable: "LISTENER_CAPTURE_RETENTION_DAYS".to_owned(),
+                    value: days.to_string(),
+                }
+            })?),
+            None => None,
+        };
+        let maximum_bytes = Self::environment_u64("LISTENER_CAPTURE_RETENTION_MAXIMUM_BYTES")?
+            .map(CaptureRetentionByteLimit::new);
+        Ok(Self::new(maximum_age, maximum_bytes))
+    }
+
+    pub fn maximum_age(&self) -> Option<CaptureRetentionAge> {
+        self.maximum_age
+    }
+
+    pub fn maximum_bytes(&self) -> Option<CaptureRetentionByteLimit> {
+        self.maximum_bytes
+    }
+
+    fn environment_u64(variable: &str) -> Result<Option<u64>> {
+        let Some(value) = env::var_os(variable) else {
+            return Ok(None);
+        };
+        let value = value.to_string_lossy().into_owned();
+        value
+            .parse()
+            .map(Some)
+            .map_err(|_| Error::InvalidCaptureRetentionPolicy {
+                variable: variable.to_owned(),
+                value,
+            })
+    }
+}
 
 pub trait AudioCaptureBackend {
     fn start(&self, request: AudioCaptureStart) -> Result<Box<dyn ActiveAudioCapture>>;
@@ -103,11 +208,74 @@ impl CaptureStore {
     }
 
     pub fn recover_recording_logs(&self) -> Result<RecoveredCaptureRecordings> {
+        self.cleanup_abandoned_intermediates()?;
         let recovered = self.recording_logs()?.recover()?;
         Ok(RecoveredCaptureRecordings::new(
             recovered.recordings,
             self.next_session_value_after_existing_artifacts()?,
         ))
+    }
+
+    /// Remove capture media whose terminal transcript is already durable.
+    ///
+    /// Call only while no capture is active: the known-session scan includes
+    /// every canonical artifact name, including an active recording log.
+    pub fn reclaim_completed_captures<F>(&self, is_completed: F) -> Result<()>
+    where
+        F: Fn(&CaptureSession) -> Result<bool>,
+    {
+        for session in self.known_sessions()? {
+            if is_completed(&session)? {
+                self.remove_terminal_capture_artifacts(&session)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce an explicitly configured retention policy over capture media.
+    /// Older sessions are reclaimed first, preserving the most recent capture
+    /// that can fit in a configured byte budget.
+    pub fn enforce_retention(&self, retention: CaptureRetentionPolicy) -> Result<()> {
+        self.enforce_retention_at(retention, SystemTime::now())
+    }
+
+    /// Enforce retention against a supplied clock for deterministic maintenance
+    /// tests and future daemon-owned scheduling.
+    pub fn enforce_retention_at(
+        &self,
+        retention: CaptureRetentionPolicy,
+        evaluated_at: SystemTime,
+    ) -> Result<()> {
+        let mut retained = self.retained_captures()?;
+        if let Some(maximum_age) = retention.maximum_age() {
+            let mut still_retained = Vec::new();
+            for capture in retained {
+                if maximum_age.expires(capture.latest_modification, evaluated_at) {
+                    self.remove_terminal_capture_artifacts(&capture.session)?;
+                } else {
+                    still_retained.push(capture);
+                }
+            }
+            retained = still_retained;
+        }
+        if let Some(maximum_bytes) = retention.maximum_bytes() {
+            retained.sort_by_key(|capture| capture.session.value());
+            let mut retained_bytes = retained
+                .iter()
+                .fold(0_u64, |total, capture| total.saturating_add(capture.bytes));
+            for capture in retained {
+                if retained_bytes <= maximum_bytes.bytes() {
+                    break;
+                }
+                self.remove_terminal_capture_artifacts(&capture.session)?;
+                retained_bytes = retained_bytes.saturating_sub(capture.bytes);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn enforce_environment_retention(&self) -> Result<()> {
+        self.enforce_retention(CaptureRetentionPolicy::from_environment()?)
     }
 
     pub fn next_session_value_after_existing_artifacts(&self) -> Result<u64> {
@@ -213,7 +381,11 @@ impl CaptureStore {
         let compact = CompactAudioArtifact::new(&compact_path);
         let recording_log_path = PathBuf::from(self.artifact_for_session(session).path().as_str());
         if compact_path.exists() {
-            return self.finalize_live_compact_for_session(session);
+            match compact.validate() {
+                Ok(()) => return self.finalize_live_compact_for_session(session),
+                Err(Error::CompactAudioInvalid { .. }) => self.remove_if_exists(&compact_path)?,
+                Err(error) => return Err(error),
+            }
         }
         compact.discard_partial()?;
         if !recording_log_path.exists() {
@@ -222,29 +394,150 @@ impl CaptureStore {
             });
         }
         let recovered = RecordingLog::new(&recording_log_path).recover()?;
-        let temporary_pcm = self
-            .directory
-            .join(format!("capture-{}.encoding.s16le", session.value()));
-        let export = recovered.export_raw_pcm(&temporary_pcm)?;
+        let temporary_pcm = self.recovery_pcm_path_for_session(session);
+        let export = match recovered.export_raw_pcm(&temporary_pcm) {
+            Ok(export) => export,
+            Err(error) => {
+                self.remove_if_exists(&temporary_pcm)?;
+                return Err(error);
+            }
+        };
         let encoding = OpusWebmEncoder::from_environment().encode_pcm(
             export.path(),
             export.audio_format(),
             compact,
         );
-        let _ = fs::remove_file(&temporary_pcm);
+        self.remove_if_exists(&temporary_pcm)?;
         encoding?;
         self.finalize_live_compact_for_session(session)
     }
 
     fn remove_recovery_material(&self, session: &CaptureSession) -> Result<()> {
-        let recording_log = self.artifact_for_session(session);
-        match fs::remove_file(recording_log.path().as_str()) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        self.remove_if_exists(Path::new(
+            self.artifact_for_session(session).path().as_str(),
+        ))?;
+        self.remove_if_exists(&self.raw_pcm_export_path_for_session(session))
+    }
+
+    fn remove_terminal_capture_artifacts(&self, session: &CaptureSession) -> Result<()> {
+        for path in self.terminal_artifact_paths(session) {
+            self.remove_if_exists(&path)?;
         }
-        let _ = fs::remove_file(self.raw_pcm_export_for_artifact(&recording_log));
         Ok(())
+    }
+
+    fn cleanup_abandoned_intermediates(&self) -> Result<()> {
+        for session in self.known_sessions()? {
+            for path in self.intermediate_artifact_paths(&session) {
+                self.remove_if_exists(&path)?;
+            }
+            self.remove_unusable_compact_artifact(&session)?;
+        }
+        Ok(())
+    }
+
+    fn remove_unusable_compact_artifact(&self, session: &CaptureSession) -> Result<()> {
+        let compact_path = self.compact_audio_path_for_session(session);
+        if !compact_path.exists() {
+            return Ok(());
+        }
+        match CompactAudioArtifact::new(&compact_path).validate() {
+            Ok(()) => Ok(()),
+            Err(Error::CompactAudioInvalid { .. }) => {
+                self.remove_if_exists(&compact_path)?;
+                let recording_log = self.artifact_for_session(session);
+                if !Path::new(recording_log.path().as_str()).exists() {
+                    self.remove_if_exists(&self.failed_marker_path_for_session(session))?;
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn retained_captures(&self) -> Result<Vec<RetainedCapture>> {
+        let mut retained = Vec::new();
+        for session in self.known_sessions()? {
+            let mut bytes = 0_u64;
+            let mut latest_modification = SystemTime::UNIX_EPOCH;
+            let mut exists = false;
+            for path in self.retained_artifact_paths(&session) {
+                match fs::metadata(path) {
+                    Ok(metadata) => {
+                        exists = true;
+                        bytes = bytes.saturating_add(metadata.len());
+                        latest_modification = latest_modification.max(metadata.modified()?);
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if exists {
+                retained.push(RetainedCapture::new(session, bytes, latest_modification));
+            }
+        }
+        Ok(retained)
+    }
+
+    fn retained_artifact_paths(&self, session: &CaptureSession) -> [PathBuf; 3] {
+        [
+            PathBuf::from(self.artifact_for_session(session).path().as_str()),
+            self.compact_audio_path_for_session(session),
+            self.failed_marker_path_for_session(session),
+        ]
+    }
+
+    fn intermediate_artifact_paths(&self, session: &CaptureSession) -> [PathBuf; 4] {
+        [
+            self.raw_pcm_export_path_for_session(session),
+            self.recovery_pcm_path_for_session(session),
+            self.compact_partial_path_for_session(session),
+            self.compact_encoding_path_for_session(session),
+        ]
+    }
+
+    fn terminal_artifact_paths(&self, session: &CaptureSession) -> [PathBuf; 7] {
+        let [recording_log, compact, failed_marker] = self.retained_artifact_paths(session);
+        let [raw_pcm, recovery_pcm, compact_partial, compact_encoding] =
+            self.intermediate_artifact_paths(session);
+        [
+            recording_log,
+            compact,
+            failed_marker,
+            raw_pcm,
+            recovery_pcm,
+            compact_partial,
+            compact_encoding,
+        ]
+    }
+
+    fn raw_pcm_export_path_for_session(&self, session: &CaptureSession) -> PathBuf {
+        self.raw_pcm_export_for_artifact(&self.artifact_for_session(session))
+    }
+
+    fn recovery_pcm_path_for_session(&self, session: &CaptureSession) -> PathBuf {
+        self.directory
+            .join(format!("capture-{}.encoding.s16le", session.value()))
+    }
+
+    fn compact_partial_path_for_session(&self, session: &CaptureSession) -> PathBuf {
+        PathBuf::from(format!(
+            "{}.part",
+            self.compact_audio_path_for_session(session).display()
+        ))
+    }
+
+    fn compact_encoding_path_for_session(&self, session: &CaptureSession) -> PathBuf {
+        self.compact_audio_path_for_session(session)
+            .with_extension("webm.encoding")
+    }
+
+    fn remove_if_exists(&self, path: &Path) -> Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn recording_logs(&self) -> Result<CaptureStoreRecordingLogs> {
@@ -266,6 +559,23 @@ impl CaptureStore {
         }
         paths.sort();
         Ok(CaptureStoreRecordingLogs::new(paths))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RetainedCapture {
+    session: CaptureSession,
+    bytes: u64,
+    latest_modification: SystemTime,
+}
+
+impl RetainedCapture {
+    fn new(session: CaptureSession, bytes: u64, latest_modification: SystemTime) -> Self {
+        Self {
+            session,
+            bytes,
+            latest_modification,
+        }
     }
 }
 
