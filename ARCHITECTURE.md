@@ -74,7 +74,7 @@ store directly, or bypass the daemon path.
   explicit effect seams.
 - `src/status.rs` owns the local newline-JSON status stream and microphone
   level projection.
-- `src/history.rs` owns the typed append-only transcript history store and its
+- `src/history.rs` owns the typed, bounded transcript history store and its
   JSONL projection under the XDG data directory.
 - `src/recall.rs` owns the transcript recall flow: read history newest first,
   drive a fuzzel dmenu picker, and copy the chosen transcript to the clipboard.
@@ -127,11 +127,15 @@ OpenAI REST transcription with `gpt-4o-transcribe`. Clipboard delivery uses
 `wl-copy` by default through the typed output-target dispatcher.
 
 On a successful stop, before delivery, the runtime appends the transcript to a
-private append-only history store at `$XDG_DATA_HOME/listener/history.jsonl`
+private bounded history store at `$XDG_DATA_HOME/listener/history.jsonl`
 (overridable with `LISTENER_HISTORY_STORE`), created with owner-only directory
 and file permissions. The typed `TranscriptHistoryEntry` carries the record and
 its JSON line is the human/interchange projection: Unix-millisecond timestamp,
-capture session, and transcript text. History is a best-effort convenience
+capture session, and transcript text. The store atomically compacts before
+appends and reads, hard-deleting expired records and the oldest records beyond
+its byte budget. The provisional defaults are 90 days and 16 MiB, configurable
+through `LISTENER_HISTORY_RETENTION_DAYS` and
+`LISTENER_HISTORY_MAXIMUM_BYTES`. History is a best-effort convenience
 projection, so a history-write failure never aborts the stop or drops the
 already-produced transcript. A cancelled capture skips this step and writes no
 history entry. `listener-recall` reads the history newest first, presents a

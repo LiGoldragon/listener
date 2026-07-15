@@ -39,7 +39,10 @@ pub use delivery::{
     TranscriptDeliveryRequest,
 };
 pub use error::{Error, Result};
-pub use history::{HistoryLimit, HistoryTimestamp, TranscriptHistoryEntry, TranscriptHistoryStore};
+pub use history::{
+    HistoryByteLimit, HistoryLimit, HistoryRetentionAge, HistoryRetentionPolicy, HistoryTimestamp,
+    TranscriptHistoryEntry, TranscriptHistoryStore,
+};
 #[cfg(feature = "nota-text")]
 pub use meta::MetaCommandLine;
 pub use recall::{RecallOutcome, RecallSelector, TranscriptRecall};

@@ -101,7 +101,9 @@ Environment configuration:
 - `LISTENER_CAPTURE_PROGRAM`: `parecord`-compatible capture command.
 - `LISTENER_FFMPEG_PROGRAM`: FFmpeg-compatible encoder (default `ffmpeg`).
 - `LISTENER_HISTORY_STORE`: transcript history file.
-- `LISTENER_CLIPBOARD_PROGRAM`: clipboard command (default `wl-copy`).
+- `LISTENER_HISTORY_RETENTION_DAYS`: hard-delete transcript records older than this age (default: provisional 90 days).
+- `LISTENER_HISTORY_MAXIMUM_BYTES`: hard cap for the retained JSONL projection (default: provisional 16 MiB).
+- `LISTENER_CLIPBOARD_PROGRAM: clipboard command (default `wl-copy`).
 - `LISTENER_TRANSCRIPTION_CUSTOMIZATION_ARCHIVE`: optional vocabulary archive.
 
 The production backend reads the existing OpenAI credential at request time

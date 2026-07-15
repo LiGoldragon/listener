@@ -5,8 +5,9 @@ use std::{
 };
 
 use listener::{
-    ClipboardCommand, HistoryLimit, HistoryTimestamp, RecallOutcome, RecallSelector,
-    TranscriptHistoryEntry, TranscriptHistoryStore, TranscriptRecall,
+    ClipboardCommand, HistoryByteLimit, HistoryLimit, HistoryRetentionAge, HistoryRetentionPolicy,
+    HistoryTimestamp, RecallOutcome, RecallSelector, TranscriptHistoryEntry,
+    TranscriptHistoryStore, TranscriptRecall,
 };
 use signal_listener::{CaptureSession, TranscriptText};
 use tempfile::TempDir;
@@ -27,7 +28,13 @@ impl RecallFixture {
     }
 
     fn history_store(&self) -> TranscriptHistoryStore {
-        TranscriptHistoryStore::new(self.path("history.jsonl"))
+        TranscriptHistoryStore::new_with_retention(
+            self.path("history.jsonl"),
+            HistoryRetentionPolicy::new(
+                HistoryRetentionAge::from_days(36_500).expect("long-lived test age"),
+                HistoryByteLimit::new(1024 * 1024),
+            ),
+        )
     }
 
     fn seed(&self, session: u64, text: &str) {

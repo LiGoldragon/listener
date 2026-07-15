@@ -121,6 +121,9 @@ pub enum Error {
     #[error("transcript history entry decode failed: {message}")]
     HistoryEntryDecode { message: String },
 
+    #[error("invalid transcript history retention policy {variable}={value}")]
+    InvalidHistoryRetentionPolicy { variable: String, value: String },
+
     #[error("recall selector `{program}` unavailable: {message}")]
     RecallSelectorUnavailable { program: String, message: String },
 

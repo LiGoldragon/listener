@@ -48,7 +48,7 @@ impl ListenerRuntime {
                 status_publisher.clone(),
             )?),
             OutputTargetDispatcher::from_environment(),
-            TranscriptHistoryStore::from_environment(),
+            TranscriptHistoryStore::from_environment()?,
             status_publisher,
         ))
     }
@@ -559,6 +559,7 @@ impl Error {
             | Self::IncompletePcmFrame { .. }
             | Self::HistoryEntryEncode { .. }
             | Self::HistoryEntryDecode { .. }
+            | Self::InvalidHistoryRetentionPolicy { .. }
             | Self::SystemClockBeforeUnixEpoch { .. }
             | Self::CaptureNotFound { .. } => UnimplementedReason::StoreUnavailable,
             _ => UnimplementedReason::NotBuiltYet,

@@ -32,13 +32,13 @@ pub struct TranscriptRecall {
 }
 
 impl TranscriptRecall {
-    pub fn from_environment() -> Self {
-        Self::new(
-            TranscriptHistoryStore::from_environment(),
+    pub fn from_environment() -> Result<Self> {
+        Ok(Self::new(
+            TranscriptHistoryStore::from_environment()?,
             RecallSelector::from_environment(),
             ClipboardCommand::from_environment(),
             HistoryLimit::new(DEFAULT_RECALL_LIMIT),
-        )
+        ))
     }
 
     pub fn new(

@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use listener::TranscriptRecall;
 
 fn main() -> ExitCode {
-    match TranscriptRecall::from_environment().run() {
+    match TranscriptRecall::from_environment().and_then(|recall| recall.run()) {
         Ok(outcome) => {
             outcome.report();
             ExitCode::SUCCESS
