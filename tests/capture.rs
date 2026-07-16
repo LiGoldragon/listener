@@ -11,7 +11,7 @@ use listener::{
     CaptureRetentionAge, CaptureRetentionByteLimit, CaptureRetentionPolicy, CaptureStore,
     CompactAudioArtifact, LiveOpusWebmEncoder, OpusWebmEncoder, RecordingAudioFormat,
     RecordingInputSource, RecordingLog, RecordingLogDurability, RecordingLogHeader,
-    RecordingLogWriter, RecordingStartTime, capture::CaptureWriter,
+    RecordingLogWriter, RecordingStartTime, TerminalCaptureState, capture::CaptureWriter,
 };
 use signal_listener::CaptureSession;
 use tempfile::TempDir;
@@ -85,7 +85,7 @@ fn compact_retry_artifact_advances_next_capture_session() {
 }
 
 #[test]
-fn retained_capture_media_requires_an_explicit_byte_bound_before_deletion() {
+fn terminal_capture_media_reclaims_oldest_session_when_byte_bound_is_exceeded() {
     let fixture = CaptureWriterFixture::new();
     let store = CaptureStore::new(fixture.directory.path().join("captures"));
     store.prepare().expect("prepare capture store");
@@ -95,17 +95,23 @@ fn retained_capture_media_requires_an_explicit_byte_bound_before_deletion() {
         .expect("write first retained capture");
     fs::write(store.compact_audio_path_for_session(&second), b"second")
         .expect("write second retained capture");
+    store
+        .mark_terminal_capture(&first, TerminalCaptureState::Ready)
+        .expect("mark first terminal capture");
+    store
+        .mark_terminal_capture(&second, TerminalCaptureState::Ready)
+        .expect("mark second terminal capture");
 
     store
         .enforce_retention(CaptureRetentionPolicy::default())
-        .expect("disabled retention leaves captures intact");
+        .expect("default three-day retention leaves fresh captures intact");
     assert!(Path::new(store.artifact_for_session(&first).path().as_str()).exists());
     assert!(store.compact_audio_path_for_session(&second).exists());
 
     store
         .enforce_retention(CaptureRetentionPolicy::new(
             None,
-            Some(CaptureRetentionByteLimit::new(6)),
+            Some(CaptureRetentionByteLimit::new(30)),
         ))
         .expect("enforce explicit byte bound");
     assert!(
@@ -115,6 +121,33 @@ fn retained_capture_media_requires_an_explicit_byte_bound_before_deletion() {
     assert!(
         store.compact_audio_path_for_session(&second).exists(),
         "the newest session remains within the configured byte cap"
+    );
+}
+
+#[test]
+fn default_three_day_terminal_retention_reclaims_terminal_media() {
+    let fixture = CaptureWriterFixture::new();
+    let store = CaptureStore::new(fixture.directory.path().join("captures"));
+    store.prepare().expect("prepare capture store");
+    let session = CaptureSession::new(1);
+    fs::write(
+        store.artifact_for_session(&session).path().as_str(),
+        b"terminal media",
+    )
+    .expect("write terminal capture");
+    store
+        .mark_terminal_capture(&session, TerminalCaptureState::Cancelled)
+        .expect("mark terminal capture");
+
+    store
+        .enforce_retention_at(
+            CaptureRetentionPolicy::default(),
+            SystemTime::now() + Duration::from_secs(4 * 24 * 60 * 60),
+        )
+        .expect("enforce default three-day retention");
+    assert!(
+        !Path::new(store.artifact_for_session(&session).path().as_str()).exists(),
+        "default policy must reap terminal media after its three-day horizon"
     );
 }
 
@@ -129,6 +162,9 @@ fn retained_capture_age_bound_reclaims_abandoned_media_at_maintenance_time() {
         b"abandoned",
     )
     .expect("write abandoned capture");
+    store
+        .mark_terminal_capture(&session, TerminalCaptureState::Ready)
+        .expect("mark abandoned capture terminal");
 
     store
         .enforce_retention_at(
@@ -324,16 +360,103 @@ fn recovery_discards_unusable_terminal_compact_artifact_without_a_recovery_log()
         .expect("mark failed terminal compact artifact");
 
     store
-        .recover_recording_logs()
-        .expect("recover abandoned capture directory");
+        .migrate_terminal_captures()
+        .expect("migrate abandoned capture directory");
 
     assert!(
         !store.compact_audio_path_for_session(&session).exists(),
-        "a zero-byte terminal compact artifact cannot be retried and is reclaimed"
+        "a zero-byte terminal compact artifact cannot be retained"
+    );
+    assert_eq!(
+        store
+            .terminal_capture_state(&session)
+            .expect("read terminal state"),
+        Some(TerminalCaptureState::Failed),
+        "failed conversion remains observable until terminal retention reaps its metadata"
+    );
+}
+
+#[test]
+fn idle_migration_reencodes_terminal_legacy_log_once_and_leaves_only_webm_opus() {
+    let fixture = CaptureWriterFixture::new();
+    let store = CaptureStore::new(fixture.directory.path().join("captures"));
+    store.prepare().expect("prepare capture store");
+    let session = CaptureSession::new(91);
+    let mut writer = RecordingLogWriter::create(
+        store.artifact_for_session(&session).path().as_str(),
+        fixture.header(),
+    )
+    .expect("create terminal legacy log");
+    for payload in vec![0_u8; 32_000].chunks(8_000) {
+        writer
+            .append_record(payload)
+            .expect("write one second of terminal audio");
+    }
+    writer.finish().expect("finish terminal log");
+    store
+        .mark_terminal_capture(&session, TerminalCaptureState::Cancelled)
+        .expect("mark cancelled terminal capture");
+
+    store
+        .migrate_terminal_captures()
+        .expect("migrate terminal legacy log");
+    store
+        .migrate_terminal_captures()
+        .expect("repeat idle migration idempotently");
+
+    assert!(store.compact_audio_path_for_session(&session).exists());
+    assert!(
+        !Path::new(store.artifact_for_session(&session).path().as_str()).exists(),
+        "a verified canonical WebM/Opus artifact replaces the legacy recovery log"
+    );
+    assert_eq!(
+        store
+            .terminal_capture_state(&session)
+            .expect("read terminal state"),
+        Some(TerminalCaptureState::Cancelled),
+        "migration must not rewrite the terminal outcome"
+    );
+}
+
+#[test]
+fn idle_migration_reencodes_decodable_legacy_container_before_deleting_source() {
+    let fixture = CaptureWriterFixture::new();
+    let store = CaptureStore::new(fixture.directory.path().join("captures"));
+    store.prepare().expect("prepare capture store");
+    let session = CaptureSession::new(92);
+    let raw_path = fixture.directory.path().join("legacy.s16le");
+    let legacy_path = fixture.directory.path().join("captures/capture-92.wav");
+    fs::write(&raw_path, vec![0_u8; 32_000]).expect("write legacy PCM fixture");
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-i",
+        ])
+        .arg(&raw_path)
+        .arg(&legacy_path)
+        .status()
+        .expect("start ffmpeg for legacy WAV fixture");
+    assert!(status.success(), "create decodable legacy WAV fixture");
+
+    store
+        .migrate_terminal_captures()
+        .expect("migrate decodable legacy container");
+
+    assert!(
+        store.compact_audio_path_for_session(&session).exists(),
+        "a decodable legacy container is atomically replaced with WebM/Opus"
     );
     assert!(
-        !store.failed_marker_path_for_session(&session).exists(),
-        "the failure marker is reclaimed with its unusable terminal artifact"
+        !legacy_path.exists(),
+        "the legacy source is deleted only after canonical validation"
     );
 }
 

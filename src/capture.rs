@@ -19,6 +19,9 @@ use crate::{
 
 const LIVE_LEVEL_SAMPLE_DURATION: Duration = Duration::from_millis(50);
 const MILLISECONDS_PER_DAY: u64 = 24 * 60 * 60 * 1_000;
+const DEFAULT_CAPTURE_RETENTION_DAYS: u64 = 3;
+const TERMINAL_CAPTURE_MAGIC: [u8; 8] = *b"LSTNTERM";
+const TERMINAL_CAPTURE_RECORD_LENGTH: usize = 24;
 
 /// A finite age bound for retained capture media.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,12 +67,10 @@ impl CaptureRetentionByteLimit {
     }
 }
 
-/// Explicit policy for abandoned, cancelled, or failed capture media.
-///
-/// No media is deleted by this policy until an owner configures at least one
-/// bound. `LISTENER_CAPTURE_RETENTION_DAYS` and
-/// `LISTENER_CAPTURE_RETENTION_MAXIMUM_BYTES` may be set independently.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Policy for terminal capture media. By default Listener retains canonical
+/// audio for three days from terminal capture completion. The optional byte
+/// cap may reclaim older terminal captures earlier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CaptureRetentionPolicy {
     maximum_age: Option<CaptureRetentionAge>,
     maximum_bytes: Option<CaptureRetentionByteLimit>,
@@ -87,15 +88,14 @@ impl CaptureRetentionPolicy {
     }
 
     pub fn from_environment() -> Result<Self> {
-        let maximum_age = match Self::environment_u64("LISTENER_CAPTURE_RETENTION_DAYS")? {
-            Some(days) => Some(CaptureRetentionAge::from_days(days).ok_or_else(|| {
-                Error::InvalidCaptureRetentionPolicy {
-                    variable: "LISTENER_CAPTURE_RETENTION_DAYS".to_owned(),
-                    value: days.to_string(),
-                }
-            })?),
-            None => None,
-        };
+        let days = Self::environment_u64("LISTENER_CAPTURE_RETENTION_DAYS")?
+            .unwrap_or(DEFAULT_CAPTURE_RETENTION_DAYS);
+        let maximum_age = Some(CaptureRetentionAge::from_days(days).ok_or_else(|| {
+            Error::InvalidCaptureRetentionPolicy {
+                variable: "LISTENER_CAPTURE_RETENTION_DAYS".to_owned(),
+                value: days.to_string(),
+            }
+        })?);
         let maximum_bytes = Self::environment_u64("LISTENER_CAPTURE_RETENTION_MAXIMUM_BYTES")?
             .map(CaptureRetentionByteLimit::new);
         Ok(Self::new(maximum_age, maximum_bytes))
@@ -121,6 +121,18 @@ impl CaptureRetentionPolicy {
                 variable: variable.to_owned(),
                 value,
             })
+    }
+}
+
+impl Default for CaptureRetentionPolicy {
+    fn default() -> Self {
+        Self::new(
+            Some(
+                CaptureRetentionAge::from_days(DEFAULT_CAPTURE_RETENTION_DAYS)
+                    .expect("default capture retention age fits u64"),
+            ),
+            None,
+        )
     }
 }
 
@@ -182,6 +194,85 @@ impl AudioCaptureStart {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalCaptureState {
+    Ready,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+impl TerminalCaptureState {
+    fn code(&self) -> u8 {
+        match self {
+            Self::Ready => 1,
+            Self::Completed => 2,
+            Self::Cancelled => 3,
+            Self::Failed => 4,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Ready),
+            2 => Some(Self::Completed),
+            3 => Some(Self::Cancelled),
+            4 => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalCaptureRecord {
+    state: TerminalCaptureState,
+    completed_at_milliseconds: u64,
+}
+
+impl TerminalCaptureRecord {
+    fn now(state: TerminalCaptureState) -> Result<Self> {
+        let completed_at_milliseconds = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|error| Error::SystemClockBeforeUnixEpoch {
+                message: error.to_string(),
+            })?
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        Ok(Self {
+            state,
+            completed_at_milliseconds,
+        })
+    }
+
+    fn with_state(self, state: TerminalCaptureState) -> Self {
+        Self { state, ..self }
+    }
+
+    fn completed_at(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_millis(self.completed_at_milliseconds)
+    }
+
+    fn to_bytes(self) -> [u8; TERMINAL_CAPTURE_RECORD_LENGTH] {
+        let mut bytes = [0_u8; TERMINAL_CAPTURE_RECORD_LENGTH];
+        bytes[..TERMINAL_CAPTURE_MAGIC.len()].copy_from_slice(&TERMINAL_CAPTURE_MAGIC);
+        bytes[8] = 1;
+        bytes[9] = self.state.code();
+        bytes[16..24].copy_from_slice(&self.completed_at_milliseconds.to_le_bytes());
+        bytes
+    }
+
+    fn from_bytes(bytes: [u8; TERMINAL_CAPTURE_RECORD_LENGTH]) -> Option<Self> {
+        if bytes[..TERMINAL_CAPTURE_MAGIC.len()] != TERMINAL_CAPTURE_MAGIC || bytes[8] != 1 {
+            return None;
+        }
+        Some(Self {
+            state: TerminalCaptureState::from_code(bytes[9])?,
+            completed_at_milliseconds: u64::from_le_bytes(bytes[16..24].try_into().ok()?),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CaptureStore {
     directory: PathBuf,
@@ -207,29 +298,51 @@ impl CaptureStore {
         Ok(())
     }
 
-    pub fn recover_recording_logs(&self) -> Result<RecoveredCaptureRecordings> {
+    /// Record the terminal completion time once. Later outcome changes preserve
+    /// that clock, so retention is measured from capture completion rather than
+    /// from retry, migration, or failure handling.
+    pub fn mark_terminal_capture(
+        &self,
+        session: &CaptureSession,
+        state: TerminalCaptureState,
+    ) -> Result<()> {
+        self.prepare()?;
+        let record = self
+            .terminal_capture_record(session)?
+            .unwrap_or(TerminalCaptureRecord::now(state)?)
+            .with_state(state);
+        self.write_terminal_capture_record(session, record)
+    }
+
+    pub fn terminal_capture_state(
+        &self,
+        session: &CaptureSession,
+    ) -> Result<Option<TerminalCaptureState>> {
+        Ok(self
+            .terminal_capture_record(session)?
+            .map(|record| record.state))
+    }
+
+    /// Migrate terminal recordings only while the runtime is idle. The active
+    /// capture is never marked terminal and is therefore never considered here.
+    /// Every source survives until a verified canonical WebM/Opus replacement
+    /// exists; a failed conversion leaves a durable failed state for inspection
+    /// and the normal three-day terminal reaper.
+    pub fn migrate_terminal_captures(&self) -> Result<()> {
+        self.prepare()?;
+        for session in self.known_sessions()? {
+            self.migrate_terminal_capture(&session)?;
+        }
         self.cleanup_abandoned_intermediates()?;
+        Ok(())
+    }
+
+    pub fn recover_recording_logs(&self) -> Result<RecoveredCaptureRecordings> {
         let recovered = self.recording_logs()?.recover()?;
         Ok(RecoveredCaptureRecordings::new(
             recovered.recordings,
             self.next_session_value_after_existing_artifacts()?,
         ))
-    }
-
-    /// Remove capture media whose terminal transcript is already durable.
-    ///
-    /// Call only while no capture is active: the known-session scan includes
-    /// every canonical artifact name, including an active recording log.
-    pub fn reclaim_completed_captures<F>(&self, is_completed: F) -> Result<()>
-    where
-        F: Fn(&CaptureSession) -> Result<bool>,
-    {
-        for session in self.known_sessions()? {
-            if is_completed(&session)? {
-                self.remove_terminal_capture_artifacts(&session)?;
-            }
-        }
-        Ok(())
     }
 
     /// Enforce an explicitly configured retention policy over capture media.
@@ -326,15 +439,23 @@ impl CaptureStore {
             .join(format!("capture-{}.transcription-failed", session.value()))
     }
 
+    pub fn terminal_record_path_for_session(&self, session: &CaptureSession) -> PathBuf {
+        self.directory
+            .join(format!("capture-{}.terminal", session.value()))
+    }
+
     pub fn mark_transcription_failed(&self, session: &CaptureSession) -> Result<()> {
-        self.prepare()?;
+        self.mark_terminal_capture(session, TerminalCaptureState::Failed)?;
         fs::write(self.failed_marker_path_for_session(session), [])?;
         Ok(())
     }
 
     pub fn clear_transcription_failure(&self, session: &CaptureSession) -> Result<()> {
         match fs::remove_file(self.failed_marker_path_for_session(session)) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.mark_terminal_capture(session, TerminalCaptureState::Ready)?;
+                Ok(())
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
@@ -412,6 +533,140 @@ impl CaptureStore {
         self.finalize_live_compact_for_session(session)
     }
 
+    fn migrate_terminal_capture(&self, session: &CaptureSession) -> Result<()> {
+        let canonical = self.compact_audio_path_for_session(session);
+        if canonical.exists() {
+            match OpusWebmEncoder::from_environment().validate_webm(&canonical) {
+                Ok(()) => {
+                    self.remove_recovery_material(session)?;
+                    for legacy in self.legacy_container_paths(session)? {
+                        self.remove_if_exists(&legacy)?;
+                    }
+                    self.ensure_terminal_capture(session, TerminalCaptureState::Ready)?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.remove_if_exists(&canonical)?;
+                    self.mark_terminal_capture(session, TerminalCaptureState::Failed)?;
+                }
+            }
+        }
+
+        let recording_log = PathBuf::from(self.artifact_for_session(session).path().as_str());
+        if recording_log.exists() {
+            match self.compact_audio_for_session(session) {
+                Ok(_) => {
+                    self.ensure_terminal_capture(session, TerminalCaptureState::Ready)?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.remove_if_exists(&recording_log)?;
+                    self.mark_transcription_failed(session)?;
+                    return Ok(());
+                }
+            }
+        }
+
+        let raw_pcm = self.raw_pcm_export_path_for_session(session);
+        if raw_pcm.exists() {
+            match OpusWebmEncoder::from_environment().encode_pcm(
+                &raw_pcm,
+                RecordingAudioFormat::signed_sixteen_bit_little_endian_mono_16khz(),
+                CompactAudioArtifact::new(&canonical),
+            ) {
+                Ok(_) => {
+                    self.remove_if_exists(&raw_pcm)?;
+                    self.ensure_terminal_capture(session, TerminalCaptureState::Ready)?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.remove_if_exists(&raw_pcm)?;
+                    self.mark_transcription_failed(session)?;
+                    return Ok(());
+                }
+            }
+        }
+
+        for legacy in self.legacy_container_paths(session)? {
+            match OpusWebmEncoder::from_environment()
+                .encode_legacy_audio(&legacy, CompactAudioArtifact::new(&canonical))
+            {
+                Ok(_) => {
+                    self.remove_if_exists(&legacy)?;
+                    self.ensure_terminal_capture(session, TerminalCaptureState::Ready)?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.remove_if_exists(&legacy)?;
+                    self.mark_transcription_failed(session)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn legacy_container_paths(&self, session: &CaptureSession) -> Result<Vec<PathBuf>> {
+        let entries = match fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if CaptureArtifactPathCandidate::new(&path).is_legacy_container_for(session) {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    fn ensure_terminal_capture(
+        &self,
+        session: &CaptureSession,
+        state: TerminalCaptureState,
+    ) -> Result<()> {
+        if self.terminal_capture_record(session)?.is_none() {
+            self.mark_terminal_capture(session, state)?;
+        }
+        Ok(())
+    }
+
+    fn terminal_capture_record(
+        &self,
+        session: &CaptureSession,
+    ) -> Result<Option<TerminalCaptureRecord>> {
+        let path = self.terminal_record_path_for_session(session);
+        let mut bytes = [0_u8; TERMINAL_CAPTURE_RECORD_LENGTH];
+        match fs::File::open(path) {
+            Ok(mut file) => {
+                file.read_exact(&mut bytes)?;
+                Ok(TerminalCaptureRecord::from_bytes(bytes))
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn write_terminal_capture_record(
+        &self,
+        session: &CaptureSession,
+        record: TerminalCaptureRecord,
+    ) -> Result<()> {
+        let path = self.terminal_record_path_for_session(session);
+        let temporary = path.with_extension("terminal.tmp");
+        let _ = fs::remove_file(&temporary);
+        let mut file =
+            crate::artifact_privacy::OwnerPrivateFile::new(&temporary).create_truncated_write()?;
+        use std::io::Write;
+        file.write_all(&record.to_bytes())?;
+        file.sync_all()?;
+        fs::rename(temporary, path)?;
+        fs::File::open(&self.directory)?.sync_all()?;
+        Ok(())
+    }
+
     fn remove_recovery_material(&self, session: &CaptureSession) -> Result<()> {
         self.remove_if_exists(Path::new(
             self.artifact_for_session(session).path().as_str(),
@@ -458,32 +713,38 @@ impl CaptureStore {
     fn retained_captures(&self) -> Result<Vec<RetainedCapture>> {
         let mut retained = Vec::new();
         for session in self.known_sessions()? {
+            let Some(terminal) = self.terminal_capture_record(&session)? else {
+                continue;
+            };
             let mut bytes = 0_u64;
-            let mut latest_modification = SystemTime::UNIX_EPOCH;
             let mut exists = false;
             for path in self.retained_artifact_paths(&session) {
                 match fs::metadata(path) {
                     Ok(metadata) => {
                         exists = true;
                         bytes = bytes.saturating_add(metadata.len());
-                        latest_modification = latest_modification.max(metadata.modified()?);
                     }
                     Err(error) if error.kind() == ErrorKind::NotFound => {}
                     Err(error) => return Err(error.into()),
                 }
             }
             if exists {
-                retained.push(RetainedCapture::new(session, bytes, latest_modification));
+                retained.push(RetainedCapture::new(
+                    session,
+                    bytes,
+                    terminal.completed_at(),
+                ));
             }
         }
         Ok(retained)
     }
 
-    fn retained_artifact_paths(&self, session: &CaptureSession) -> [PathBuf; 3] {
+    fn retained_artifact_paths(&self, session: &CaptureSession) -> [PathBuf; 4] {
         [
             PathBuf::from(self.artifact_for_session(session).path().as_str()),
             self.compact_audio_path_for_session(session),
             self.failed_marker_path_for_session(session),
+            self.terminal_record_path_for_session(session),
         ]
     }
 
@@ -496,14 +757,16 @@ impl CaptureStore {
         ]
     }
 
-    fn terminal_artifact_paths(&self, session: &CaptureSession) -> [PathBuf; 7] {
-        let [recording_log, compact, failed_marker] = self.retained_artifact_paths(session);
+    fn terminal_artifact_paths(&self, session: &CaptureSession) -> [PathBuf; 8] {
+        let [recording_log, compact, failed_marker, terminal_record] =
+            self.retained_artifact_paths(session);
         let [raw_pcm, recovery_pcm, compact_partial, compact_encoding] =
             self.intermediate_artifact_paths(session);
         [
             recording_log,
             compact,
             failed_marker,
+            terminal_record,
             raw_pcm,
             recovery_pcm,
             compact_partial,
@@ -653,6 +916,31 @@ impl<'a> CaptureArtifactPathCandidate<'a> {
         let file_name = self.path.file_name()?.to_str()?;
         let session = file_name.strip_prefix("capture-")?.split('.').next()?;
         session.parse().ok()
+    }
+
+    fn is_legacy_container_for(&self, session: &CaptureSession) -> bool {
+        if self.any_session_value().as_ref() != Some(&session.value()) || !self.path.is_file() {
+            return false;
+        }
+        let Some(file_name) = self.path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let prefix = format!("capture-{}.", session.value());
+        let Some(suffix) = file_name.strip_prefix(&prefix) else {
+            return false;
+        };
+        !matches!(
+            suffix,
+            "listenerlog"
+                | "webm"
+                | "webm.part"
+                | "webm.encoding"
+                | "raw.s16le"
+                | "encoding.s16le"
+                | "transcription-failed"
+                | "terminal"
+                | "terminal.tmp"
+        )
     }
 }
 

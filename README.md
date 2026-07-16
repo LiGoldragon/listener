@@ -23,12 +23,12 @@ listener retry <session>
 - `Retryable`: a compact WebM/Opus artifact is ready to transcribe;
 - `Failed`: the most recent conversion or provider attempt failed; retry is
   still safe;
-- `Completed`: a legacy compact artifact whose transcript exists in Listener
-  history; it is reclaimed on the next idle maintenance pass.
+- `Completed`: a canonical WebM/Opus artifact whose transcript exists in
+  Listener history; it remains available until its three-day terminal retention
+  horizon expires.
 
-Terminally successful captures are normally absent from `list`: their durable
-transcript supersedes their audio. For example, retry a failed capture after
-inspecting it:
+Terminal captures remain in `list` while their canonical audio is retained.
+Retry a failed capture after inspecting it:
 
 ```sh
 listener list
@@ -56,21 +56,28 @@ encoder leaves the durable log intact for recovery.
 The `.part` file is an unfinished container, not a retry artifact and is not
 shown by `listener list`. On normal `stop`, Listener closes the encoder input,
 waits only for the active container to flush and finalizes it atomically as
-`capture-<session>.webm`; it does not re-encode the recording. Listener then
-validates the completed WebM before removing the `.listenerlog` and any legacy
-`capture-<session>.raw.s16le` export. Once Listener has durably appended the
-successful transcript, it removes the compact WebM and failure marker too: the
-text is the terminal artifact, not a retry source. Failed and cancelled captures
-retain their recoverable media for `retry` until an owner-configured capture
-retention bound reclaims them.
+`capture-<session>.webm`. It validates that the container decodes as Opus before
+removing the active `.listenerlog` and any raw PCM export. This WebM extension
+is the sole canonical retained audio format: it provides a broadly interoperable
+container around Opus and is also the transcription input.
 
-If Listener or the host stops unexpectedly, the `.listenerlog` remains the
-recoverable source and the unfinished `.webm.part` is ignored. `listener retry
-<session>` discards that partial container, recovers the validated log records,
-and creates a fresh compact WebM before transcription. Idle recovery also
-removes abandoned `.part`, `.encoding`, and raw-export intermediates. No raw
-full-duration working export is used for normal live captures; it remains only
-in the legacy recovery path.
+A private `capture-<session>.terminal` record is capture-store metadata, not
+audio. It records terminal outcome and the terminal completion clock. Idle
+maintenance, never an active capture, recovers a crash-survived `.listenerlog`,
+re-encodes every decodable legacy `capture-<session>.*` audio container through
+a temporary WebM/Opus file, verifies it before deleting the source, and removes
+any duplicate legacy source once a canonical artifact exists. A corrupt or
+non-convertible source is removed and remains observable as `Failed` through
+its terminal record. Exactly one canonical retained audio artifact remains for
+each terminal capture.
+
+The default terminal audio horizon is three days from terminal capture
+completion (`LISTENER_CAPTURE_RETENTION_DAYS` may override it); an optional
+`LISTENER_CAPTURE_RETENTION_MAXIMUM_BYTES` can reclaim older terminal captures
+earlier. Reaping removes audio and terminal metadata together. Failed,
+cancelled, corrupt, and non-convertible terminal artifacts follow the same
+three-day bound. The separate transcript history policy remains independent:
+completed transcripts are history, not old audio.
 
 Completed transcript history is an owner-only append-only projection at
 `$XDG_DATA_HOME/listener/history.jsonl` (normally

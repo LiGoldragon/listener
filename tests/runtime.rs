@@ -386,13 +386,13 @@ fn start_writes_active_capture_artifact_before_stop() {
         "the crash-recovery listener log is removed after compact validation"
     );
     assert!(
-        !Path::new(stopped.durable_audio_artifact.path().as_str()).exists(),
-        "a durable transcript supersedes the compact transcription input"
+        Path::new(stopped.durable_audio_artifact.path().as_str()).exists(),
+        "a durable transcript retains exactly one canonical compact audio artifact for three days"
     );
 }
 
 #[test]
-fn successful_capture_reclaims_compact_artifact_and_is_not_retryable() {
+fn successful_capture_retains_canonical_opus_artifact_and_is_not_retryable() {
     let fixture = RuntimeFixture::new();
     let mut runtime = fixture.runtime();
     let session = match runtime.handle_input(Input::Start(StartCapture {})) {
@@ -405,10 +405,22 @@ fn successful_capture_reclaims_compact_artifact_and_is_not_retryable() {
     }
 
     match runtime.handle_input(Input::ListCaptures(ListCapturesRequest {})) {
-        Output::CapturesListed(report) => assert!(
-            report.payload().payload().is_empty(),
-            "terminal transcript success must reclaim the compact retry artifact"
-        ),
+        Output::CapturesListed(report) => {
+            let captures = report.payload().payload();
+            assert_eq!(
+                captures.len(),
+                1,
+                "the terminal canonical audio is retained"
+            );
+            assert!(
+                captures[0]
+                    .durable_audio_artifact
+                    .path()
+                    .as_str()
+                    .ends_with(".webm"),
+                "the retained audio is the canonical WebM/Opus artifact"
+            );
+        }
         other => panic!("expected capture list, got {other:?}"),
     }
 
@@ -423,7 +435,7 @@ fn successful_capture_reclaims_compact_artifact_and_is_not_retryable() {
 }
 
 #[test]
-fn repeated_successful_captures_reclaim_each_terminal_audio_artifact() {
+fn repeated_successful_captures_retain_one_canonical_opus_artifact_each() {
     let fixture = RuntimeFixture::new();
     let mut runtime = fixture.runtime();
 
@@ -442,13 +454,13 @@ fn repeated_successful_captures_reclaim_each_terminal_audio_artifact() {
             "successful capture {expected_session} left a recovery log"
         );
         assert!(
-            !fixture
+            fixture
                 .directory
                 .path()
                 .join("captures")
                 .join(format!("capture-{}.webm", session.value()))
                 .exists(),
-            "successful capture {expected_session} left compact audio"
+            "successful capture {expected_session} retains its canonical compact audio"
         );
     }
 
@@ -459,10 +471,10 @@ fn repeated_successful_captures_reclaim_each_terminal_audio_artifact() {
 }
 
 #[test]
-fn fresh_runtime_start_preserves_existing_listenerlog_and_allocates_next_artifact() {
+fn fresh_runtime_start_migrates_existing_terminal_listenerlog_before_allocating_next_artifact() {
     let fixture = RuntimeFixture::new();
     let existing_path = fixture.write_recording_log(1, &[20, 21, 22, 23]);
-    let original_bytes = fs::read(&existing_path).expect("existing log bytes");
+    let canonical_path = fixture.directory.path().join("captures/capture-1.webm");
     let mut runtime = fixture.runtime();
 
     let session = match runtime.handle_input(Input::Start(StartCapture {})) {
@@ -470,7 +482,15 @@ fn fresh_runtime_start_preserves_existing_listenerlog_and_allocates_next_artifac
         other => panic!("expected started reply, got {other:?}"),
     };
     assert_eq!(session.value(), 2);
-    assert_eq!(runtime.orphaned_recordings().as_slice().len(), 1);
+    assert!(runtime.orphaned_recordings().as_slice().is_empty());
+    assert!(
+        !existing_path.exists(),
+        "restart migration must not leave a duplicate legacy recording log"
+    );
+    assert!(
+        canonical_path.exists(),
+        "restart migration creates canonical Opus"
+    );
 
     let status_reply = runtime.handle_input(Input::Status(StatusRequest {}));
     let artifact = match status_reply {
@@ -483,12 +503,9 @@ fn fresh_runtime_start_preserves_existing_listenerlog_and_allocates_next_artifac
         },
         other => panic!("expected status reply, got {other:?}"),
     };
-    let active_path = PathBuf::from(artifact.path().as_str());
-    assert_eq!(active_path, fixture.capture_path(2));
-    assert_ne!(active_path, existing_path);
     assert_eq!(
-        fs::read(&existing_path).expect("existing log after start"),
-        original_bytes
+        PathBuf::from(artifact.path().as_str()),
+        fixture.capture_path(2)
     );
 
     runtime.handle_input(Input::stop(session));
@@ -530,7 +547,7 @@ fn start_retries_when_artifact_appears_after_allocation() {
 }
 
 #[test]
-fn idle_status_recovers_orphaned_listenerlog_idempotently_and_leaves_it_exportable() {
+fn idle_status_migrates_crash_survived_listenerlog_idempotently_to_one_canonical_opus() {
     let fixture = RuntimeFixture::new();
     let existing_path = fixture.write_recording_log(1, &[30, 31, 32, 33]);
     OpenOptions::new()
@@ -539,46 +556,36 @@ fn idle_status_recovers_orphaned_listenerlog_idempotently_and_leaves_it_exportab
         .expect("open orphan log for torn tail")
         .write_all(b"torn listener tail")
         .expect("append torn tail");
-    let torn_length = fs::metadata(&existing_path).expect("torn metadata").len();
+    let canonical_path = fixture.directory.path().join("captures/capture-1.webm");
     let mut runtime = fixture.runtime();
 
     match runtime.handle_input(Input::Status(StatusRequest {})) {
         Output::StatusReported(report) => assert_eq!(report.status(), &CaptureStatus::Idle),
         other => panic!("expected idle status reply, got {other:?}"),
     }
-
-    let length_after_first_recovery = fs::metadata(&existing_path)
-        .expect("metadata after first recovery")
+    assert!(
+        !existing_path.exists(),
+        "torn legacy source is replaced only after recovery"
+    );
+    assert!(
+        canonical_path.exists(),
+        "idle recovery writes canonical WebM/Opus"
+    );
+    assert!(runtime.orphaned_recordings().as_slice().is_empty());
+    let canonical_length = fs::metadata(&canonical_path)
+        .expect("canonical metadata")
         .len();
-    {
-        let recordings = runtime.orphaned_recordings();
-        assert_eq!(recordings.next_session_value(), 2);
-        assert_eq!(recordings.as_slice().len(), 1);
-        let recovered = &recordings.as_slice()[0];
-        assert_eq!(recovered.path(), existing_path.as_path());
-        assert_eq!(recovered.truncated_from(), Some(torn_length));
-        assert_eq!(recovered.records().len(), 1);
-        let export = recovered
-            .export_raw_pcm(fixture.directory.path().join("orphan.raw.s16le"))
-            .expect("export recovered orphan");
-        assert_eq!(
-            fs::read(export.path()).expect("orphan raw bytes"),
-            vec![30, 31, 32, 33]
-        );
-    }
 
     match runtime.handle_input(Input::Status(StatusRequest {})) {
         Output::StatusReported(report) => assert_eq!(report.status(), &CaptureStatus::Idle),
         other => panic!("expected second idle status reply, got {other:?}"),
     }
-    let recordings = runtime.orphaned_recordings();
-    assert_eq!(recordings.as_slice().len(), 1);
-    assert_eq!(recordings.as_slice()[0].truncated_from(), None);
     assert_eq!(
-        fs::metadata(&existing_path)
-            .expect("metadata after second recovery")
+        fs::metadata(&canonical_path)
+            .expect("canonical metadata after repeated idle maintenance")
             .len(),
-        length_after_first_recovery
+        canonical_length,
+        "repeated restart maintenance must not produce a duplicate canonical recording"
     );
 }
 

@@ -222,6 +222,75 @@ pub struct OpusWebmEncoder {
     program: String,
 }
 
+struct CompactAudioEncodingInput<'a> {
+    path: &'a Path,
+    format: CompactAudioEncodingInputFormat,
+}
+
+enum CompactAudioEncodingInputFormat {
+    RawPcm(RecordingAudioFormat),
+    Container,
+}
+
+impl<'a> CompactAudioEncodingInput<'a> {
+    fn pcm(path: &'a Path, audio_format: RecordingAudioFormat) -> Self {
+        Self {
+            path,
+            format: CompactAudioEncodingInputFormat::RawPcm(audio_format),
+        }
+    }
+
+    fn container(path: &'a Path) -> Self {
+        Self {
+            path,
+            format: CompactAudioEncodingInputFormat::Container,
+        }
+    }
+
+    fn encode_with(
+        &self,
+        encoder: &OpusWebmEncoder,
+        temporary: &Path,
+    ) -> Result<std::process::Output> {
+        let mut command = Command::new(&encoder.program);
+        command.args(["-hide_banner", "-loglevel", "error"]);
+        match self.format {
+            CompactAudioEncodingInputFormat::RawPcm(audio_format) => {
+                command.args([
+                    "-f",
+                    "s16le",
+                    "-ar",
+                    &audio_format.sample_rate().to_string(),
+                    "-ac",
+                    &audio_format.channel_count().to_string(),
+                ]);
+            }
+            CompactAudioEncodingInputFormat::Container => {}
+        }
+        command
+            .arg("-i")
+            .arg(self.path)
+            .args([
+                "-vn",
+                "-map",
+                "0:a:0",
+                "-c:a",
+                "libopus",
+                "-application",
+                "voip",
+                "-b:a",
+                "24k",
+                "-f",
+                "webm",
+            ])
+            .arg(temporary)
+            .output()
+            .map_err(|error| Error::CompactAudioEncode {
+                message: format!("failed to start {}: {error}", encoder.program),
+            })
+    }
+}
+
 impl OpusWebmEncoder {
     pub fn from_environment() -> Self {
         Self::new(std::env::var("LISTENER_FFMPEG_PROGRAM").unwrap_or_else(|_| "ffmpeg".to_owned()))
@@ -239,6 +308,25 @@ impl OpusWebmEncoder {
         audio_format: RecordingAudioFormat,
         output: CompactAudioArtifact,
     ) -> Result<CompactAudioArtifact> {
+        self.encode(CompactAudioEncodingInput::pcm(input, audio_format), output)
+    }
+
+    /// Decode a legacy audio container and atomically replace it with the
+    /// Listener canonical WebM/Opus artifact. The source stays untouched until
+    /// the temporary output is verified as decodable Opus.
+    pub fn encode_legacy_audio(
+        &self,
+        input: &Path,
+        output: CompactAudioArtifact,
+    ) -> Result<CompactAudioArtifact> {
+        self.encode(CompactAudioEncodingInput::container(input), output)
+    }
+
+    fn encode(
+        &self,
+        input: CompactAudioEncodingInput<'_>,
+        output: CompactAudioArtifact,
+    ) -> Result<CompactAudioArtifact> {
         let parent = output
             .path()
             .parent()
@@ -248,36 +336,7 @@ impl OpusWebmEncoder {
         OwnerPrivateDirectory::new(parent).ensure()?;
         let temporary = output.path().with_extension("webm.encoding");
         let _ = fs::remove_file(&temporary);
-        let result = Command::new(&self.program)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "s16le",
-                "-ar",
-                &audio_format.sample_rate().to_string(),
-                "-ac",
-                &audio_format.channel_count().to_string(),
-                "-i",
-            ])
-            .arg(input)
-            .args([
-                "-vn",
-                "-c:a",
-                "libopus",
-                "-application",
-                "voip",
-                "-b:a",
-                "24k",
-                "-f",
-                "webm",
-            ])
-            .arg(&temporary)
-            .output()
-            .map_err(|error| Error::CompactAudioEncode {
-                message: format!("failed to start {}: {error}", self.program),
-            })?;
+        let result = input.encode_with(self, &temporary)?;
         if !result.status.success() {
             let _ = fs::remove_file(&temporary);
             return Err(Error::CompactAudioEncode {
@@ -290,22 +349,25 @@ impl OpusWebmEncoder {
         )?;
         let temporary_artifact = CompactAudioArtifact::new(&temporary);
         temporary_artifact.validate()?;
+        self.validate_webm(&temporary)?;
+        temporary_artifact.sync_file()?;
         fs::rename(&temporary, output.path())?;
-        self.validate_webm(output.path())?;
+        output.sync_directory()?;
         output.validate()?;
         Ok(output)
     }
 
     pub fn validate_webm(&self, input: &Path) -> Result<()> {
         let output = Command::new(&self.program)
-            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .args(["-hide_banner", "-i"])
             .arg(input)
-            .args(["-f", "null", "-"])
+            .args(["-map", "0:a:0", "-f", "null", "-"])
             .output()
             .map_err(|error| Error::CompactAudioEncode {
                 message: format!("failed to start {}: {error}", self.program),
             })?;
-        if output.status.success() {
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() && diagnostic.contains("Audio: opus") {
             Ok(())
         } else {
             Err(Error::CompactAudioInvalid {

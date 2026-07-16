@@ -115,6 +115,10 @@ impl ListenerRuntime {
                 return Err(error);
             }
         };
+        self.capture_store.mark_terminal_capture(
+            stopped_capture.session(),
+            crate::TerminalCaptureState::Ready,
+        )?;
         let compact_artifact = match self.compact_artifact_after_stop(&stopped_capture) {
             Ok(artifact) => artifact,
             Err(error) => {
@@ -138,9 +142,10 @@ impl ListenerRuntime {
             }
         };
         if self.record_transcript_history(stopped_capture.session(), &transcript_text) {
-            self.capture_store.reclaim_completed_captures(|session| {
-                self.history_store.contains_session(session)
-            })?;
+            self.capture_store.mark_terminal_capture(
+                stopped_capture.session(),
+                crate::TerminalCaptureState::Completed,
+            )?;
         }
         let delivery_outcomes = self
             .output_target_dispatcher
@@ -161,7 +166,10 @@ impl ListenerRuntime {
         for session in self.capture_store.known_sessions()? {
             let compact_path = self.capture_store.compact_audio_path_for_session(&session);
             let log_artifact = self.capture_store.artifact_for_session(&session);
-            let failed = self
+            let failed = matches!(
+                self.capture_store.terminal_capture_state(&session)?,
+                Some(crate::TerminalCaptureState::Failed)
+            ) || self
                 .capture_store
                 .failed_marker_path_for_session(&session)
                 .exists();
@@ -196,6 +204,11 @@ impl ListenerRuntime {
 
     pub fn retry_capture(&mut self, request: RetryCapture) -> Result<Output> {
         let session = request.into_payload();
+        if self.history_store.contains_session(&session)? {
+            return Err(Error::CaptureNotFound {
+                session: session.value(),
+            });
+        }
         let compact_artifact = self.capture_store.compact_audio_for_session(&session)?;
         let transcript_text = match self.transcribe_compact_capture(&session, compact_artifact) {
             Ok(transcript) => transcript,
@@ -206,9 +219,7 @@ impl ListenerRuntime {
         };
         if self.record_transcript_history(&session, &transcript_text) {
             self.capture_store
-                .reclaim_completed_captures(|capture_session| {
-                    self.history_store.contains_session(capture_session)
-                })?;
+                .mark_terminal_capture(&session, crate::TerminalCaptureState::Completed)?;
         }
         let outcomes = self
             .output_target_dispatcher
@@ -231,6 +242,10 @@ impl ListenerRuntime {
                 return Err(error);
             }
         };
+        self.capture_store.mark_terminal_capture(
+            stopped_capture.session(),
+            crate::TerminalCaptureState::Cancelled,
+        )?;
         self.status_publisher.publish_cancelled();
 
         Ok(Output::Cancelled(CaptureCancelled {
@@ -335,9 +350,8 @@ impl ListenerRuntime {
     }
 
     fn reclaim_idle_capture_artifacts(&mut self) -> Result<()> {
+        self.capture_store.migrate_terminal_captures()?;
         self.recover_orphaned_recordings()?;
-        self.capture_store
-            .reclaim_completed_captures(|session| self.history_store.contains_session(session))?;
         self.capture_store.enforce_environment_retention()
     }
 
