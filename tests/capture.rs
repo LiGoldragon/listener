@@ -152,6 +152,96 @@ fn default_three_day_terminal_retention_reclaims_terminal_media() {
 }
 
 #[test]
+fn retention_never_reaps_an_active_capture_without_terminal_metadata() {
+    let fixture = CaptureWriterFixture::new();
+    let store = CaptureStore::new(fixture.directory.path().join("captures"));
+    store.prepare().expect("prepare capture store");
+    let session = CaptureSession::new(1);
+    let active_path = store.artifact_for_session(&session);
+    fs::write(active_path.path().as_str(), b"active capture media").expect("write active capture");
+
+    store
+        .enforce_retention_at(
+            CaptureRetentionPolicy::default(),
+            SystemTime::now() + Duration::from_secs(4 * 24 * 60 * 60),
+        )
+        .expect("enforce retention around active capture");
+
+    assert!(
+        Path::new(active_path.path().as_str()).exists(),
+        "only terminal metadata admits a capture to retention"
+    );
+}
+
+#[test]
+fn retention_does_not_treat_non_audio_capture_history_as_legacy_audio() {
+    let fixture = CaptureWriterFixture::new();
+    let store = CaptureStore::new(fixture.directory.path().join("captures"));
+    store.prepare().expect("prepare capture store");
+    let session = CaptureSession::new(2);
+    let history_path = fixture
+        .directory
+        .path()
+        .join("captures/capture-2.history.json");
+    fs::write(&history_path, b"durable non-audio history").expect("write history");
+    store
+        .mark_terminal_capture(&session, TerminalCaptureState::Completed)
+        .expect("mark terminal capture");
+
+    store
+        .migrate_terminal_captures()
+        .expect("migrate terminal capture directory");
+    store
+        .enforce_retention_at(
+            CaptureRetentionPolicy::default(),
+            SystemTime::now() + Duration::from_secs(4 * 24 * 60 * 60),
+        )
+        .expect("reap terminal capture media");
+
+    assert!(
+        history_path.exists(),
+        "non-audio durable history is outside Listener's audio retention set"
+    );
+}
+
+#[test]
+fn failed_legacy_audio_migration_preserves_source_until_terminal_reaping() {
+    let fixture = CaptureWriterFixture::new();
+    let store = CaptureStore::new(fixture.directory.path().join("captures"));
+    store.prepare().expect("prepare capture store");
+    let session = CaptureSession::new(3);
+    let legacy_path = fixture.directory.path().join("captures/capture-3.wav");
+    fs::write(&legacy_path, b"not decodable audio").expect("write corrupt legacy audio");
+    store
+        .mark_terminal_capture(&session, TerminalCaptureState::Ready)
+        .expect("mark terminal capture");
+
+    store
+        .migrate_terminal_captures()
+        .expect("attempt legacy migration");
+
+    assert!(
+        legacy_path.exists(),
+        "a legacy source survives unless a validated canonical WebM/Opus artifact replaces it"
+    );
+    assert!(
+        !store.compact_audio_path_for_session(&session).exists(),
+        "failed migration cannot publish a canonical artifact"
+    );
+
+    store
+        .enforce_retention_at(
+            CaptureRetentionPolicy::default(),
+            SystemTime::now() + Duration::from_secs(4 * 24 * 60 * 60),
+        )
+        .expect("reap expired terminal legacy audio");
+    assert!(
+        !legacy_path.exists(),
+        "expired terminal legacy audio remains within the authorized reaper scope"
+    );
+}
+
+#[test]
 fn retained_capture_age_bound_reclaims_abandoned_media_at_maintenance_time() {
     let fixture = CaptureWriterFixture::new();
     let store = CaptureStore::new(fixture.directory.path().join("captures"));

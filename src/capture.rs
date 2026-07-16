@@ -22,6 +22,9 @@ const MILLISECONDS_PER_DAY: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_CAPTURE_RETENTION_DAYS: u64 = 3;
 const TERMINAL_CAPTURE_MAGIC: [u8; 8] = *b"LSTNTERM";
 const TERMINAL_CAPTURE_RECORD_LENGTH: usize = 24;
+const LEGACY_AUDIO_EXTENSIONS: [&str; 13] = [
+    "aac", "aif", "aiff", "flac", "m4a", "mka", "mp3", "mp4", "oga", "ogg", "opus", "wav", "wma",
+];
 
 /// A finite age bound for retained capture media.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -597,7 +600,6 @@ impl CaptureStore {
                     return Ok(());
                 }
                 Err(_) => {
-                    self.remove_if_exists(&legacy)?;
                     self.mark_transcription_failed(session)?;
                 }
             }
@@ -675,7 +677,7 @@ impl CaptureStore {
     }
 
     fn remove_terminal_capture_artifacts(&self, session: &CaptureSession) -> Result<()> {
-        for path in self.terminal_artifact_paths(session) {
+        for path in self.terminal_artifact_paths(session)? {
             self.remove_if_exists(&path)?;
         }
         Ok(())
@@ -718,7 +720,7 @@ impl CaptureStore {
             };
             let mut bytes = 0_u64;
             let mut exists = false;
-            for path in self.retained_artifact_paths(&session) {
+            for path in self.retained_artifact_paths(&session)? {
                 match fs::metadata(path) {
                     Ok(metadata) => {
                         exists = true;
@@ -739,13 +741,15 @@ impl CaptureStore {
         Ok(retained)
     }
 
-    fn retained_artifact_paths(&self, session: &CaptureSession) -> [PathBuf; 4] {
-        [
+    fn retained_artifact_paths(&self, session: &CaptureSession) -> Result<Vec<PathBuf>> {
+        let mut paths = vec![
             PathBuf::from(self.artifact_for_session(session).path().as_str()),
             self.compact_audio_path_for_session(session),
             self.failed_marker_path_for_session(session),
             self.terminal_record_path_for_session(session),
-        ]
+        ];
+        paths.extend(self.legacy_container_paths(session)?);
+        Ok(paths)
     }
 
     fn intermediate_artifact_paths(&self, session: &CaptureSession) -> [PathBuf; 4] {
@@ -757,21 +761,10 @@ impl CaptureStore {
         ]
     }
 
-    fn terminal_artifact_paths(&self, session: &CaptureSession) -> [PathBuf; 8] {
-        let [recording_log, compact, failed_marker, terminal_record] =
-            self.retained_artifact_paths(session);
-        let [raw_pcm, recovery_pcm, compact_partial, compact_encoding] =
-            self.intermediate_artifact_paths(session);
-        [
-            recording_log,
-            compact,
-            failed_marker,
-            terminal_record,
-            raw_pcm,
-            recovery_pcm,
-            compact_partial,
-            compact_encoding,
-        ]
+    fn terminal_artifact_paths(&self, session: &CaptureSession) -> Result<Vec<PathBuf>> {
+        let mut paths = self.retained_artifact_paths(session)?;
+        paths.extend(self.intermediate_artifact_paths(session));
+        Ok(paths)
     }
 
     fn raw_pcm_export_path_for_session(&self, session: &CaptureSession) -> PathBuf {
@@ -922,25 +915,10 @@ impl<'a> CaptureArtifactPathCandidate<'a> {
         if self.any_session_value().as_ref() != Some(&session.value()) || !self.path.is_file() {
             return false;
         }
-        let Some(file_name) = self.path.file_name().and_then(|name| name.to_str()) else {
-            return false;
-        };
-        let prefix = format!("capture-{}.", session.value());
-        let Some(suffix) = file_name.strip_prefix(&prefix) else {
-            return false;
-        };
-        !matches!(
-            suffix,
-            "listenerlog"
-                | "webm"
-                | "webm.part"
-                | "webm.encoding"
-                | "raw.s16le"
-                | "encoding.s16le"
-                | "transcription-failed"
-                | "terminal"
-                | "terminal.tmp"
-        )
+        self.path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| LEGACY_AUDIO_EXTENSIONS.contains(&extension))
     }
 }
 
