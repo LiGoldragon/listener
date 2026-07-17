@@ -6,13 +6,13 @@ use signal_listener::{
     CaptureSummary, DeliveryOutcome, DeliveryOutcomes, Input, ListCapturesRequest, NoActiveCapture,
     OperationKind, Output, Reason, RequestUnimplemented, RequestedCaptureSession, RetriedSession,
     RetryCapture, StartCapture, StartedSession, StatusRequest, StopCapture, StoppedSession,
-    TranscriptText, UnimplementedOperationKind, UnimplementedReason,
+    ToggleCapture, TranscriptText, UnimplementedOperationKind, UnimplementedReason,
 };
 
 use crate::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureStore, Configuration, Error,
-    OpenAiBatchTranscriptionActor, OutputTargetDispatcher, RecoveredCaptureRecordings, Result,
-    TranscriptHistoryEntry, TranscriptHistoryStore,
+    LatencyInstrumentation, OpenAiBatchTranscriptionActor, OutputTargetDispatcher,
+    RecoveredCaptureRecordings, Result, TranscriptHistoryEntry, TranscriptHistoryStore,
 };
 use crate::{
     BatchTranscriber, BatchTranscriptionInput, BatchTranscriptionRequest,
@@ -27,6 +27,7 @@ pub struct ListenerRuntime {
     output_target_dispatcher: OutputTargetDispatcher,
     history_store: TranscriptHistoryStore,
     status_publisher: StatusPublisher,
+    latency_instrumentation: LatencyInstrumentation,
     session_sequence: CaptureSessionSequence,
     active_capture: Option<RuntimeActiveCapture>,
     orphaned_recordings: RecoveredCaptureRecordings,
@@ -41,7 +42,19 @@ impl ListenerRuntime {
         configuration: Configuration,
         status_publisher: StatusPublisher,
     ) -> Result<Self> {
-        Ok(Self::with_dependencies(
+        Self::from_configuration_with_status_and_latency(
+            configuration,
+            status_publisher,
+            LatencyInstrumentation::disabled(),
+        )
+    }
+
+    pub fn from_configuration_with_status_and_latency(
+        configuration: Configuration,
+        status_publisher: StatusPublisher,
+        latency_instrumentation: LatencyInstrumentation,
+    ) -> Result<Self> {
+        Ok(Self::with_dependencies_and_latency(
             configuration,
             Box::new(ProcessAudioCaptureBackend::from_environment()),
             Box::new(OpenAiBatchTranscriptionActor::from_environment(
@@ -50,6 +63,7 @@ impl ListenerRuntime {
             OutputTargetDispatcher::from_environment(),
             TranscriptHistoryStore::from_environment()?,
             status_publisher,
+            latency_instrumentation,
         ))
     }
 
@@ -61,6 +75,26 @@ impl ListenerRuntime {
         history_store: TranscriptHistoryStore,
         status_publisher: StatusPublisher,
     ) -> Self {
+        Self::with_dependencies_and_latency(
+            configuration,
+            capture_backend,
+            transcriber,
+            output_target_dispatcher,
+            history_store,
+            status_publisher,
+            LatencyInstrumentation::disabled(),
+        )
+    }
+
+    pub fn with_dependencies_and_latency(
+        configuration: Configuration,
+        capture_backend: Box<dyn AudioCaptureBackend>,
+        transcriber: Box<dyn BatchTranscriber>,
+        output_target_dispatcher: OutputTargetDispatcher,
+        history_store: TranscriptHistoryStore,
+        status_publisher: StatusPublisher,
+        latency_instrumentation: LatencyInstrumentation,
+    ) -> Self {
         let capture_store = CaptureStore::from_configuration(&configuration);
         Self {
             configuration,
@@ -70,6 +104,7 @@ impl ListenerRuntime {
             output_target_dispatcher,
             history_store,
             status_publisher,
+            latency_instrumentation,
             session_sequence: CaptureSessionSequence::new(1),
             active_capture: None,
             orphaned_recordings: RecoveredCaptureRecordings::empty(),
@@ -90,6 +125,9 @@ impl ListenerRuntime {
             Input::Retry(request) => self
                 .retry_capture(request)
                 .unwrap_or_else(|error| error.into_unimplemented_reply(OperationKind::Retry)),
+            Input::Toggle(request) => self
+                .toggle(request)
+                .unwrap_or_else(Error::into_toggle_reply),
         }
     }
 
@@ -100,8 +138,8 @@ impl ListenerRuntime {
             });
         }
 
+        self.status_publisher.publish_starting();
         self.capture_store.prepare()?;
-        self.reclaim_idle_capture_artifacts()?;
         self.start_next_available_capture()
     }
 
@@ -158,6 +196,20 @@ impl ListenerRuntime {
             transcript_text,
             delivery_outcomes,
         }))
+    }
+
+    /// Atomically chooses the next capture transition from daemon-owned state.
+    /// Callers never need a status-to-start/stop read-modify-write sequence.
+    pub fn toggle(&mut self, _request: ToggleCapture) -> Result<Output> {
+        match self
+            .active_capture
+            .as_ref()
+            .map(RuntimeActiveCapture::session)
+            .cloned()
+        {
+            Some(session) => self.stop(StopCapture::new(session)),
+            None => self.start(StartCapture {}),
+        }
     }
 
     pub fn list_captures(&mut self, _request: ListCapturesRequest) -> Result<Output> {
@@ -304,11 +356,9 @@ impl ListenerRuntime {
             .is_ok()
     }
 
+    /// Return only the runtime-owned active slot. This must remain O(1):
+    /// recovery, migration, and retention run in the finite startup task.
     pub fn status(&mut self, _request: StatusRequest) -> Result<Output> {
-        if self.active_capture.is_none() {
-            self.reclaim_idle_capture_artifacts()?;
-        }
-
         Ok(Output::status_reported(
             self.active_capture
                 .as_ref()
@@ -341,38 +391,25 @@ impl ListenerRuntime {
         Ok(active_capture)
     }
 
-    fn recover_orphaned_recordings(&mut self) -> Result<()> {
-        let orphaned_recordings = self.capture_store.recover_recording_logs()?;
-        self.session_sequence
-            .advance_to_at_least(orphaned_recordings.next_session_value());
-        self.orphaned_recordings = orphaned_recordings;
-        Ok(())
-    }
-
-    fn reclaim_idle_capture_artifacts(&mut self) -> Result<()> {
-        self.capture_store.migrate_terminal_captures()?;
-        self.recover_orphaned_recordings()?;
-        self.capture_store.enforce_environment_retention()
-    }
-
     fn start_next_available_capture(&mut self) -> Result<Output> {
         loop {
             let session = self.session_sequence.next_session()?;
             let artifact = self.capture_store.artifact_for_session(&session);
-            match self.capture_backend.start(AudioCaptureStart::new(
-                session.clone(),
-                artifact.clone(),
-                self.configuration.input_source(),
-                self.status_publisher.clone(),
-            )) {
+            match self.capture_backend.start(
+                AudioCaptureStart::new(
+                    session.clone(),
+                    artifact.clone(),
+                    self.configuration.input_source(),
+                    self.status_publisher.clone(),
+                )
+                .with_latency_instrumentation(self.latency_instrumentation.clone()),
+            ) {
                 Ok(capture) => {
                     self.active_capture = Some(RuntimeActiveCapture::new(
                         session.clone(),
                         artifact,
                         capture,
                     ));
-                    self.status_publisher
-                        .publish_recording_level(crate::MicrophoneLevel::silent());
                     return Ok(Output::Started(CaptureStarted::new(StartedSession::new(
                         session,
                     ))));
@@ -543,6 +580,10 @@ impl Error {
             }
             error => error.into_unimplemented_reply(OperationKind::Stop),
         }
+    }
+
+    pub fn into_toggle_reply(self) -> Output {
+        self.into_unimplemented_reply(OperationKind::Toggle)
     }
 
     pub fn into_cancel_reply(self) -> Output {

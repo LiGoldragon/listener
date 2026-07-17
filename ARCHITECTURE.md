@@ -69,11 +69,16 @@ store directly, or bypass the daemon path.
 - `src/command.rs` is the thin ordinary CLI client.
 - `src/daemon.rs` owns the blocking Unix-socket daemon loop.
 - `src/runtime.rs` lowers `signal-listener` operations into runtime state and
-  effects, including idle orphan recording-log discovery.
+  effects. Status is a direct projection of that state; `Toggle` atomically
+  selects start or stop from the daemon-owned active slot.
 - `src/capture.rs`, `src/transcription.rs`, and `src/delivery.rs` hold the
   explicit effect seams.
 - `src/status.rs` owns the local newline-JSON status stream and microphone
-  level projection.
+  level projection through blocking accept and event waits, not a polling loop.
+- `src/maintenance.rs` owns one snapshot-bounded background startup pass for
+  recovery, migration, intermediate cleanup, and retention.
+- `src/latency.rs` owns opt-in, transition-only latency timestamps; it is
+  entirely dormant without `LISTENER_LATENCY_TRACE`.
 - `src/history.rs` owns the typed, bounded transcript history store and its
   JSONL projection under the XDG data directory.
 - `src/recall.rs` owns the transcript recall flow: read history newest first,
@@ -114,10 +119,12 @@ also owner-only.
 On stop, Listener scans the log from the header, accepts only complete records
 with matching sequence, offsets, checksums, and commit trailers, and truncates
 the first incomplete or corrupt tail to the last valid record boundary.
-Recovery is idempotent. While idle, Listener also scans existing `.listenerlog`
-files, recovers crash-survived orphan logs, and advances new capture sessions
-past existing `capture-<session>.listenerlog` names before starting another
-recording. Cancel stops the active capture using the same capture shutdown path
+Recovery is idempotent. At daemon startup, Listener snapshots existing capture
+sessions and performs one background maintenance pass over only that snapshot:
+it recovers crash-survived logs, migrates them, cleans intermediates, and
+applies retention without racing a newly started capture. `status` never scans
+storage; first-start collisions advance past existing artifact names only when
+the collision is encountered. Cancel stops the active capture using the same capture shutdown path
 and returns the retained `.listenerlog` artifact without recovering/exporting
 audio for transcription, sending OpenAI actor mail, or invoking output delivery.
 Idle recovery removes abandoned `.webm.part`, `.webm.encoding`, and raw-export
@@ -162,17 +169,27 @@ public Signal reply. `listener-daemon` starts a state-bearing newline-JSON Unix
 socket server at `$XDG_RUNTIME_DIR/listener/status.sock` by default. New clients
 receive the current event immediately, then pushed events. Events contain only
 `state` and normalized microphone `level`; transcript text stays only in the
-existing typed stop reply and delivery path. Recording levels are RMS over
-`s16le` PCM with `1.0 - exp(-rms * 18.0)`, clamped to `0.0..=1.0`. The default
-`parecord` command requests low-latency delivery, and the capture writer samples
-live levels in roughly 50 ms PCM windows instead of waiting for the
-`.listenerlog` maximum record payload. Copied, cancelled, and error events are
-terminal UI events and the stream returns to idle after a short delay. Status
-clients are written nonblocking so a slow reader is dropped instead of blocking
-publication to other clients.
+existing typed stop reply and delivery path. `starting` is published before
+capture setup, while `recording` is published only when the capture writer has
+committed PCM; the widget therefore reacts immediately without treating process
+startup as recorded audio. Recording levels are RMS over `s16le` PCM with
+`1.0 - exp(-rms * 18.0)`, clamped to `0.0..=1.0`. The default `parecord`
+command requests low-latency delivery, starts before FFmpeg setup, and the
+capture writer samples live levels in roughly 50 ms PCM windows instead of
+waiting for the `.listenerlog` maximum record payload. The socket acceptor
+blocks for clients and the broadcaster blocks for events or the terminal-idle
+deadline; the former 25 ms polling wakeup is absent. Copied, cancelled, and
+error events are terminal UI events and the stream returns to idle after a
+short delay. Status clients are written nonblocking so a slow reader is dropped
+instead of blocking publication to other clients. When
+`LISTENER_LATENCY_TRACE` is set, only request receipt, capture/encoder startup,
+and state-transition publications append owner-private timestamps; default
+operation performs no instrumentation I/O.
 
 Ordinary lifecycle conflicts stay on the public reply surface as typed
 `signal-listener` outcomes: start while recording reports the active session,
 stop or cancel while idle reports no active capture, and stop or cancel with a
-different session reports both active and requested sessions. These are not
-lowered to `RequestUnimplemented`.
+different session reports both active and requested sessions. `Toggle` selects
+start or stop atomically in this same daemon state transition, so hotkeys never
+read status to choose a follow-up operation. These are not lowered to
+`RequestUnimplemented`.

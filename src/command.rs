@@ -2,7 +2,7 @@ use std::io::Write;
 
 use signal_listener::{
     CancelCapture, CaptureSession, Input, ListCapturesRequest, RetryCapture, StartCapture,
-    StatusRequest,
+    StatusRequest, ToggleCapture,
 };
 
 use crate::{Error, ListenerClient, Result};
@@ -41,6 +41,7 @@ pub enum ListenerCommand {
     Stop(CaptureSession),
     Cancel(CaptureSession),
     Status,
+    Toggle,
     List,
     Retry(CaptureSession),
 }
@@ -52,13 +53,14 @@ impl ListenerCommand {
             Some("stop") => Self::stop_from_arguments(arguments),
             Some("cancel") => Self::cancel_from_arguments(arguments),
             Some("status") => Ok(Self::Status),
+            Some("toggle") => Ok(Self::Toggle),
             Some("list") => Ok(Self::List),
             Some("retry") => Ok(Self::Retry(Self::capture_session_from_arguments(arguments, "retry")?)),
             Some(command) => Err(Error::InvalidCommand {
                 message: format!("unknown listener command `{command}`"),
             }),
             None => Err(Error::InvalidCommand {
-                message: "expected one of: start, stop <session>, cancel <session>, status, list, retry <session>"
+                message: "expected one of: start, stop <session>, cancel <session>, status, toggle, list, retry <session>"
                     .to_owned(),
             }),
         }
@@ -70,6 +72,7 @@ impl ListenerCommand {
             Self::Stop(session) => Input::stop(session),
             Self::Cancel(session) => Input::Cancel(CancelCapture::new(session)),
             Self::Status => Input::Status(StatusRequest {}),
+            Self::Toggle => Input::Toggle(ToggleCapture {}),
             Self::List => Input::ListCaptures(ListCapturesRequest {}),
             Self::Retry(session) => Input::Retry(RetryCapture::new(session)),
         }
@@ -127,7 +130,11 @@ mod tests {
     }
 
     #[test]
-    fn list_and_retry_commands_build_typed_capture_operations() {
+    fn toggle_list_and_retry_commands_build_typed_capture_operations() {
+        let toggle = ListenerCommand::from_arguments(&["listener".to_owned(), "toggle".to_owned()])
+            .expect("parse toggle command");
+        assert!(matches!(toggle.into_input(), Input::Toggle(_)));
+
         let list = ListenerCommand::from_arguments(&["listener".to_owned(), "list".to_owned()])
             .expect("parse list command");
         assert!(matches!(list.into_input(), Input::ListCaptures(_)));

@@ -11,7 +11,7 @@ use std::{
 
 use serde::Serialize;
 
-use crate::{Configuration, Error, RecordingSampleFormat, Result};
+use crate::{Configuration, Error, LatencyInstrumentation, RecordingSampleFormat, Result};
 
 const STATUS_SOCKET_MODE: u32 = 0o660;
 const STATUS_IDLE_DELAY: Duration = Duration::from_millis(900);
@@ -19,6 +19,7 @@ const STATUS_IDLE_DELAY: Duration = Duration::from_millis(900);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListenerStatusState {
     Idle,
+    Starting,
     Recording,
     Transcribing,
     Cancelled,
@@ -30,6 +31,7 @@ impl ListenerStatusState {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Idle => "idle",
+            Self::Starting => "starting",
             Self::Recording => "recording",
             Self::Transcribing => "transcribing",
             Self::Cancelled => "cancelled",
@@ -96,6 +98,10 @@ impl ListenerStatusEvent {
         Self::new(ListenerStatusState::Idle, MicrophoneLevel::silent())
     }
 
+    pub fn starting() -> Self {
+        Self::new(ListenerStatusState::Starting, MicrophoneLevel::silent())
+    }
+
     pub fn recording(level: MicrophoneLevel) -> Self {
         Self::new(ListenerStatusState::Recording, level)
     }
@@ -155,12 +161,14 @@ impl<'a> ListenerStatusEventFrame<'a> {
 #[derive(Clone)]
 pub struct StatusPublisher {
     sink: StatusPublisherSink,
+    latency_instrumentation: LatencyInstrumentation,
 }
 
 impl StatusPublisher {
     pub fn silent() -> Self {
         Self {
             sink: StatusPublisherSink::Silent,
+            latency_instrumentation: LatencyInstrumentation::disabled(),
         }
     }
 
@@ -169,18 +177,25 @@ impl StatusPublisher {
         (
             Self {
                 sink: StatusPublisherSink::Recorder(Arc::clone(&events)),
+                latency_instrumentation: LatencyInstrumentation::disabled(),
             },
             StatusEventRecorder::new(events),
         )
     }
 
-    fn stream(sender: mpsc::Sender<StatusStreamMessage>) -> Self {
+    fn stream(
+        sender: mpsc::Sender<StatusStreamMessage>,
+        latency_instrumentation: LatencyInstrumentation,
+    ) -> Self {
         Self {
             sink: StatusPublisherSink::Stream(sender),
+            latency_instrumentation,
         }
     }
 
     pub fn publish(&self, event: ListenerStatusEvent) {
+        self.latency_instrumentation
+            .record_state_publication(event.state());
         match &self.sink {
             StatusPublisherSink::Silent => {}
             StatusPublisherSink::Stream(sender) => {
@@ -196,6 +211,10 @@ impl StatusPublisher {
 
     pub fn publish_idle(&self) {
         self.publish(ListenerStatusEvent::idle());
+    }
+
+    pub fn publish_starting(&self) {
+        self.publish(ListenerStatusEvent::starting());
     }
 
     pub fn publish_recording_level(&self, level: MicrophoneLevel) {
@@ -252,7 +271,21 @@ impl StatusStreamServer {
         Self::new(configuration.status_socket_path())
     }
 
+    pub fn from_configuration_with_latency(
+        configuration: &Configuration,
+        latency_instrumentation: LatencyInstrumentation,
+    ) -> (Self, StatusPublisher) {
+        Self::new_with_latency(configuration.status_socket_path(), latency_instrumentation)
+    }
+
     pub fn new(path: impl Into<PathBuf>) -> (Self, StatusPublisher) {
+        Self::new_with_latency(path, LatencyInstrumentation::disabled())
+    }
+
+    pub fn new_with_latency(
+        path: impl Into<PathBuf>,
+        latency_instrumentation: LatencyInstrumentation,
+    ) -> (Self, StatusPublisher) {
         let (sender, receiver) = mpsc::channel();
         (
             Self {
@@ -260,7 +293,7 @@ impl StatusStreamServer {
                 receiver,
                 idle_delay: STATUS_IDLE_DELAY,
             },
-            StatusPublisher::stream(sender),
+            StatusPublisher::stream(sender, latency_instrumentation),
         )
     }
 
@@ -271,9 +304,10 @@ impl StatusStreamServer {
             self.binding.path(),
             fs::Permissions::from_mode(self.binding.mode()),
         )?;
-        listener.set_nonblocking(true)?;
+        let shared_state = Arc::new(Mutex::new(StatusStreamSharedState::new()));
+        StatusStreamAcceptor::new(listener, Arc::clone(&shared_state)).spawn();
         Ok(thread::spawn(move || {
-            StatusStreamLoop::new(listener, self.receiver, self.idle_delay).run();
+            StatusStreamLoop::new(self.receiver, shared_state, self.idle_delay).run();
         }))
     }
 }
@@ -326,26 +360,79 @@ impl StatusSocketBinding {
     }
 }
 
-struct StatusStreamLoop {
-    listener: UnixListener,
-    receiver: mpsc::Receiver<StatusStreamMessage>,
+struct StatusStreamSharedState {
     current: ListenerStatusEvent,
     clients: Vec<UnixStream>,
+}
+
+impl StatusStreamSharedState {
+    fn new() -> Self {
+        Self {
+            current: ListenerStatusEvent::idle(),
+            clients: Vec::new(),
+        }
+    }
+}
+
+struct StatusStreamAcceptor {
+    listener: UnixListener,
+    shared_state: Arc<Mutex<StatusStreamSharedState>>,
+}
+
+impl StatusStreamAcceptor {
+    fn new(listener: UnixListener, shared_state: Arc<Mutex<StatusStreamSharedState>>) -> Self {
+        Self {
+            listener,
+            shared_state,
+        }
+    }
+
+    fn spawn(self) {
+        thread::spawn(move || self.accept_until_closed());
+    }
+
+    fn accept_until_closed(self) {
+        for stream in self.listener.incoming() {
+            let Ok(stream) = stream else {
+                break;
+            };
+            self.admit(stream);
+        }
+    }
+
+    fn admit(&self, mut stream: UnixStream) {
+        if stream.set_nonblocking(true).is_err() {
+            return;
+        }
+        let Ok(mut shared_state) = self.shared_state.lock() else {
+            return;
+        };
+        let line = match shared_state.current.json_line() {
+            Ok(line) => StatusStreamBroadcastLine::new(line),
+            Err(_) => return,
+        };
+        if line.write_to(&mut stream).is_ok() {
+            shared_state.clients.push(stream);
+        }
+    }
+}
+
+struct StatusStreamLoop {
+    receiver: mpsc::Receiver<StatusStreamMessage>,
+    shared_state: Arc<Mutex<StatusStreamSharedState>>,
     idle_delay: Duration,
     idle_deadline: Option<Instant>,
 }
 
 impl StatusStreamLoop {
     fn new(
-        listener: UnixListener,
         receiver: mpsc::Receiver<StatusStreamMessage>,
+        shared_state: Arc<Mutex<StatusStreamSharedState>>,
         idle_delay: Duration,
     ) -> Self {
         Self {
-            listener,
             receiver,
-            current: ListenerStatusEvent::idle(),
-            clients: Vec::new(),
+            shared_state,
             idle_delay,
             idle_deadline: None,
         }
@@ -353,39 +440,34 @@ impl StatusStreamLoop {
 
     fn run(&mut self) {
         loop {
-            self.accept_waiting_clients();
-            self.receive_waiting_messages();
-            self.publish_idle_if_due();
-            thread::sleep(self.loop_delay());
+            if !self.receive_next_message() {
+                return;
+            }
         }
     }
 
-    fn accept_waiting_clients(&mut self) {
-        loop {
-            match self.listener.accept() {
-                Ok((mut stream, _)) => {
-                    if stream.set_nonblocking(true).is_ok()
-                        && self
-                            .write_event_to_stream(&mut stream, &self.current)
-                            .is_ok()
-                    {
-                        self.clients.push(stream);
-                    }
+    fn receive_next_message(&mut self) -> bool {
+        let message = match self.idle_deadline {
+            Some(deadline) => match self
+                .receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(message) => Some(message),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.publish_idle_if_due();
+                    None
                 }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+            },
+            None => match self.receiver.recv() {
+                Ok(message) => Some(message),
+                Err(_) => return false,
+            },
+        };
+        if let Some(StatusStreamMessage::Publish(event)) = message {
+            self.broadcast(event);
         }
-    }
-
-    fn receive_waiting_messages(&mut self) {
-        loop {
-            match self.receiver.try_recv() {
-                Ok(StatusStreamMessage::Publish(event)) => self.broadcast(event),
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
+        true
     }
 
     fn broadcast(&mut self, event: ListenerStatusEvent) {
@@ -394,13 +476,16 @@ impl StatusStreamLoop {
         } else {
             None
         };
-        self.current = event;
-        let line = match self.current.json_line() {
-            Ok(line) => line,
+        let Ok(mut shared_state) = self.shared_state.lock() else {
+            return;
+        };
+        shared_state.current = event;
+        let line = match shared_state.current.json_line() {
+            Ok(line) => StatusStreamBroadcastLine::new(line),
             Err(_) => return,
         };
-        let line = StatusStreamBroadcastLine::new(line);
-        self.clients
+        shared_state
+            .clients
             .retain_mut(|stream| line.write_to(stream).is_ok());
     }
 
@@ -412,22 +497,6 @@ impl StatusStreamLoop {
             self.idle_deadline = None;
             self.broadcast(ListenerStatusEvent::idle());
         }
-    }
-
-    fn loop_delay(&self) -> Duration {
-        self.idle_deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or(Duration::from_millis(25))
-            .min(Duration::from_millis(25))
-    }
-
-    fn write_event_to_stream(
-        &self,
-        stream: &mut UnixStream,
-        event: &ListenerStatusEvent,
-    ) -> Result<()> {
-        StatusStreamBroadcastLine::new(event.json_line()?).write_to(stream)?;
-        Ok(())
     }
 }
 

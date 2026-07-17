@@ -471,7 +471,7 @@ fn repeated_successful_captures_retain_one_canonical_opus_artifact_each() {
 }
 
 #[test]
-fn fresh_runtime_start_migrates_existing_terminal_listenerlog_before_allocating_next_artifact() {
+fn start_skips_existing_artifacts_without_running_maintenance() {
     let fixture = RuntimeFixture::new();
     let existing_path = fixture.write_recording_log(1, &[20, 21, 22, 23]);
     let canonical_path = fixture.directory.path().join("captures/capture-1.webm");
@@ -482,14 +482,13 @@ fn fresh_runtime_start_migrates_existing_terminal_listenerlog_before_allocating_
         other => panic!("expected started reply, got {other:?}"),
     };
     assert_eq!(session.value(), 2);
-    assert!(runtime.orphaned_recordings().as_slice().is_empty());
     assert!(
-        !existing_path.exists(),
-        "restart migration must not leave a duplicate legacy recording log"
+        existing_path.exists(),
+        "interactive start must not synchronously migrate an earlier recording"
     );
     assert!(
-        canonical_path.exists(),
-        "restart migration creates canonical Opus"
+        !canonical_path.exists(),
+        "only the one-shot daemon-start maintenance may create the canonical artifact"
     );
 
     let status_reply = runtime.handle_input(Input::Status(StatusRequest {}));
@@ -547,7 +546,7 @@ fn start_retries_when_artifact_appears_after_allocation() {
 }
 
 #[test]
-fn idle_status_migrates_crash_survived_listenerlog_idempotently_to_one_canonical_opus() {
+fn idle_status_is_in_memory_and_leaves_maintenance_for_daemon_startup() {
     let fixture = RuntimeFixture::new();
     let existing_path = fixture.write_recording_log(1, &[30, 31, 32, 33]);
     OpenOptions::new()
@@ -556,36 +555,30 @@ fn idle_status_migrates_crash_survived_listenerlog_idempotently_to_one_canonical
         .expect("open orphan log for torn tail")
         .write_all(b"torn listener tail")
         .expect("append torn tail");
+    let original_length = fs::metadata(&existing_path).expect("orphan metadata").len();
     let canonical_path = fixture.directory.path().join("captures/capture-1.webm");
     let mut runtime = fixture.runtime();
 
-    match runtime.handle_input(Input::Status(StatusRequest {})) {
-        Output::StatusReported(report) => assert_eq!(report.status(), &CaptureStatus::Idle),
-        other => panic!("expected idle status reply, got {other:?}"),
+    for _ in 0..2 {
+        match runtime.handle_input(Input::Status(StatusRequest {})) {
+            Output::StatusReported(report) => assert_eq!(report.status(), &CaptureStatus::Idle),
+            other => panic!("expected idle status reply, got {other:?}"),
+        }
     }
     assert!(
-        !existing_path.exists(),
-        "torn legacy source is replaced only after recovery"
+        existing_path.exists(),
+        "status must not open, recover, migrate, or delete capture logs"
     );
-    assert!(
-        canonical_path.exists(),
-        "idle recovery writes canonical WebM/Opus"
-    );
-    assert!(runtime.orphaned_recordings().as_slice().is_empty());
-    let canonical_length = fs::metadata(&canonical_path)
-        .expect("canonical metadata")
-        .len();
-
-    match runtime.handle_input(Input::Status(StatusRequest {})) {
-        Output::StatusReported(report) => assert_eq!(report.status(), &CaptureStatus::Idle),
-        other => panic!("expected second idle status reply, got {other:?}"),
-    }
     assert_eq!(
-        fs::metadata(&canonical_path)
-            .expect("canonical metadata after repeated idle maintenance")
+        fs::metadata(&existing_path)
+            .expect("orphan metadata after status")
             .len(),
-        canonical_length,
-        "repeated restart maintenance must not produce a duplicate canonical recording"
+        original_length,
+        "status must leave a torn tail untouched for background maintenance"
+    );
+    assert!(
+        !canonical_path.exists(),
+        "status must not invoke the encoder or create a canonical artifact"
     );
 }
 
@@ -844,6 +837,49 @@ fn stop_actor_unavailable_returns_transcription_backend_unavailable_reply() {
             .iter()
             .any(|event| event.state() == listener::ListenerStatusState::Error),
         "expected error status event after actor unavailable failure, got {events:?}"
+    );
+}
+
+#[test]
+fn atomic_toggle_starts_then_stops_the_daemon_owned_active_capture() {
+    let fixture = RuntimeFixture::new();
+    let mut runtime = fixture.runtime();
+
+    let first = runtime.handle_input(Input::Toggle(signal_listener::ToggleCapture {}));
+    let session = match first {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected toggle to start capture, got {other:?}"),
+    };
+
+    let second = runtime.handle_input(Input::Toggle(signal_listener::ToggleCapture {}));
+    match second {
+        Output::Stopped(stopped) => assert_eq!(stopped.stopped_session.payload(), &session),
+        other => panic!("expected toggle to stop the same capture, got {other:?}"),
+    }
+}
+
+#[test]
+fn starting_state_precedes_recording_and_never_claims_audio_before_a_capture_commit() {
+    let fixture = RuntimeFixture::new();
+    let mut runtime = fixture.runtime();
+
+    match runtime.handle_input(Input::Start(StartCapture {})) {
+        Output::Started(_) => {}
+        other => panic!("expected started reply, got {other:?}"),
+    }
+
+    let events = fixture.status_events();
+    let starting = events
+        .iter()
+        .position(|event| event.state() == listener::ListenerStatusState::Starting)
+        .expect("start must publish starting immediately");
+    let recording = events
+        .iter()
+        .position(|event| event.state() == listener::ListenerStatusState::Recording)
+        .expect("capture writer must publish recording after an audio commit");
+    assert!(
+        starting < recording,
+        "starting must precede recording so the UI never claims audio is ready early"
     );
 }
 

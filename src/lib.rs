@@ -15,6 +15,8 @@ pub mod daemon;
 pub mod delivery;
 pub mod error;
 pub mod history;
+pub mod latency;
+pub mod maintenance;
 #[cfg(feature = "nota-text")]
 pub mod meta;
 pub mod recall;
@@ -25,9 +27,9 @@ pub mod transcription;
 pub mod transport;
 
 pub use capture::{
-    ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureRetentionAge,
-    CaptureRetentionByteLimit, CaptureRetentionPolicy, CaptureStore, ProcessAudioCaptureBackend,
-    RecoveredCaptureRecordings, TerminalCaptureState,
+    ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureMaintenanceSnapshot,
+    CaptureRetentionAge, CaptureRetentionByteLimit, CaptureRetentionPolicy, CaptureStore,
+    ProcessAudioCaptureBackend, RecoveredCaptureRecordings, TerminalCaptureState,
 };
 pub use client::ListenerClient;
 #[cfg(feature = "nota-text")]
@@ -44,6 +46,8 @@ pub use history::{
     HistoryByteLimit, HistoryLimit, HistoryRetentionAge, HistoryRetentionPolicy, HistoryTimestamp,
     TranscriptHistoryEntry, TranscriptHistoryStore,
 };
+pub use latency::LatencyInstrumentation;
+pub use maintenance::CaptureMaintenance;
 #[cfg(feature = "nota-text")]
 pub use meta::MetaCommandLine;
 pub use recall::{RecallOutcome, RecallSelector, TranscriptRecall};

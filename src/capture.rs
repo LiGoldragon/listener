@@ -12,8 +12,8 @@ use signal_listener::{
 };
 
 use crate::{
-    CompactAudioArtifact, Configuration, Error, LiveOpusWebmEncoder, OpusWebmEncoder,
-    RecordingAudioFormat, RecordingLog, RecordingLogHeader, RecordingLogWriter,
+    CompactAudioArtifact, Configuration, Error, LatencyInstrumentation, LiveOpusWebmEncoder,
+    OpusWebmEncoder, RecordingAudioFormat, RecordingLog, RecordingLogHeader, RecordingLogWriter,
     RecoveredRecordingLog, Result, StatusPublisher, artifact_privacy::OwnerPrivateDirectory,
 };
 
@@ -159,6 +159,7 @@ pub struct AudioCaptureStart {
     artifact: DurableAudioArtifact,
     input_source: InputSource,
     status_publisher: StatusPublisher,
+    latency_instrumentation: LatencyInstrumentation,
 }
 
 impl AudioCaptureStart {
@@ -173,7 +174,16 @@ impl AudioCaptureStart {
             artifact,
             input_source,
             status_publisher,
+            latency_instrumentation: LatencyInstrumentation::disabled(),
         }
+    }
+
+    pub fn with_latency_instrumentation(
+        mut self,
+        latency_instrumentation: LatencyInstrumentation,
+    ) -> Self {
+        self.latency_instrumentation = latency_instrumentation;
+        self
     }
 
     pub fn session(&self) -> &CaptureSession {
@@ -194,6 +204,10 @@ impl AudioCaptureStart {
 
     pub fn status_publisher(&self) -> StatusPublisher {
         self.status_publisher.clone()
+    }
+
+    pub fn latency_instrumentation(&self) -> LatencyInstrumentation {
+        self.latency_instrumentation.clone()
     }
 }
 
@@ -281,6 +295,24 @@ pub struct CaptureStore {
     directory: PathBuf,
 }
 
+/// The capture sessions present when one background maintenance pass begins.
+/// Sessions created after this snapshot are active runtime work and are never
+/// touched by that pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureMaintenanceSnapshot {
+    sessions: Vec<CaptureSession>,
+}
+
+impl CaptureMaintenanceSnapshot {
+    fn new(sessions: Vec<CaptureSession>) -> Self {
+        Self { sessions }
+    }
+
+    pub fn sessions(&self) -> &[CaptureSession] {
+        self.sessions.as_slice()
+    }
+}
+
 impl CaptureStore {
     pub fn from_configuration(configuration: &Configuration) -> Self {
         Self::new(configuration.capture_store_directory())
@@ -299,6 +331,27 @@ impl CaptureStore {
     pub fn prepare(&self) -> Result<()> {
         OwnerPrivateDirectory::new(&self.directory).ensure()?;
         Ok(())
+    }
+
+    /// Snapshot only the pre-existing sessions for the daemon's one-shot
+    /// background maintenance pass. This reads directory entries but never
+    /// opens capture payloads on an interactive request path.
+    pub fn maintenance_snapshot(&self) -> Result<CaptureMaintenanceSnapshot> {
+        self.prepare()?;
+        Ok(CaptureMaintenanceSnapshot::new(self.known_sessions()?))
+    }
+
+    /// Perform the bounded daemon-start maintenance for a previously captured
+    /// snapshot. New sessions are intentionally excluded so maintenance cannot
+    /// race a just-started capture.
+    pub fn maintain_snapshot(&self, snapshot: &CaptureMaintenanceSnapshot) -> Result<()> {
+        self.migrate_capture_sessions(snapshot.sessions())?;
+        self.recover_capture_sessions(snapshot.sessions())?;
+        self.enforce_retention_for_sessions(
+            CaptureRetentionPolicy::from_environment()?,
+            snapshot.sessions(),
+            SystemTime::now(),
+        )
     }
 
     /// Record the terminal completion time once. Later outcome changes preserve
@@ -333,11 +386,8 @@ impl CaptureStore {
     /// and the normal three-day terminal reaper.
     pub fn migrate_terminal_captures(&self) -> Result<()> {
         self.prepare()?;
-        for session in self.known_sessions()? {
-            self.migrate_terminal_capture(&session)?;
-        }
-        self.cleanup_abandoned_intermediates()?;
-        Ok(())
+        let sessions = self.known_sessions()?;
+        self.migrate_capture_sessions(&sessions)
     }
 
     pub fn recover_recording_logs(&self) -> Result<RecoveredCaptureRecordings> {
@@ -362,32 +412,7 @@ impl CaptureStore {
         retention: CaptureRetentionPolicy,
         evaluated_at: SystemTime,
     ) -> Result<()> {
-        let mut retained = self.retained_captures()?;
-        if let Some(maximum_age) = retention.maximum_age() {
-            let mut still_retained = Vec::new();
-            for capture in retained {
-                if maximum_age.expires(capture.latest_modification, evaluated_at) {
-                    self.remove_terminal_capture_artifacts(&capture.session)?;
-                } else {
-                    still_retained.push(capture);
-                }
-            }
-            retained = still_retained;
-        }
-        if let Some(maximum_bytes) = retention.maximum_bytes() {
-            retained.sort_by_key(|capture| capture.session.value());
-            let mut retained_bytes = retained
-                .iter()
-                .fold(0_u64, |total, capture| total.saturating_add(capture.bytes));
-            for capture in retained {
-                if retained_bytes <= maximum_bytes.bytes() {
-                    break;
-                }
-                self.remove_terminal_capture_artifacts(&capture.session)?;
-                retained_bytes = retained_bytes.saturating_sub(capture.bytes);
-            }
-        }
-        Ok(())
+        self.enforce_retention_for_sessions(retention, &self.known_sessions()?, evaluated_at)
     }
 
     pub fn enforce_environment_retention(&self) -> Result<()> {
@@ -669,6 +694,58 @@ impl CaptureStore {
         Ok(())
     }
 
+    fn migrate_capture_sessions(&self, sessions: &[CaptureSession]) -> Result<()> {
+        for session in sessions {
+            self.migrate_terminal_capture(session)?;
+        }
+        self.cleanup_abandoned_intermediates_for(sessions)
+    }
+
+    fn recover_capture_sessions(&self, sessions: &[CaptureSession]) -> Result<()> {
+        for session in sessions {
+            let recording_log = self.artifact_for_session(session);
+            let path = Path::new(recording_log.path().as_str());
+            if path.is_file() {
+                let _ = RecordingLog::new(path).recover()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn enforce_retention_for_sessions(
+        &self,
+        retention: CaptureRetentionPolicy,
+        sessions: &[CaptureSession],
+        evaluated_at: SystemTime,
+    ) -> Result<()> {
+        let mut retained = self.retained_captures_for(sessions)?;
+        if let Some(maximum_age) = retention.maximum_age() {
+            let mut still_retained = Vec::new();
+            for capture in retained {
+                if maximum_age.expires(capture.latest_modification, evaluated_at) {
+                    self.remove_terminal_capture_artifacts(&capture.session)?;
+                } else {
+                    still_retained.push(capture);
+                }
+            }
+            retained = still_retained;
+        }
+        if let Some(maximum_bytes) = retention.maximum_bytes() {
+            retained.sort_by_key(|capture| capture.session.value());
+            let mut retained_bytes = retained
+                .iter()
+                .fold(0_u64, |total, capture| total.saturating_add(capture.bytes));
+            for capture in retained {
+                if retained_bytes <= maximum_bytes.bytes() {
+                    break;
+                }
+                self.remove_terminal_capture_artifacts(&capture.session)?;
+                retained_bytes = retained_bytes.saturating_sub(capture.bytes);
+            }
+        }
+        Ok(())
+    }
+
     fn remove_recovery_material(&self, session: &CaptureSession) -> Result<()> {
         self.remove_if_exists(Path::new(
             self.artifact_for_session(session).path().as_str(),
@@ -683,12 +760,12 @@ impl CaptureStore {
         Ok(())
     }
 
-    fn cleanup_abandoned_intermediates(&self) -> Result<()> {
-        for session in self.known_sessions()? {
-            for path in self.intermediate_artifact_paths(&session) {
+    fn cleanup_abandoned_intermediates_for(&self, sessions: &[CaptureSession]) -> Result<()> {
+        for session in sessions {
+            for path in self.intermediate_artifact_paths(session) {
                 self.remove_if_exists(&path)?;
             }
-            self.remove_unusable_compact_artifact(&session)?;
+            self.remove_unusable_compact_artifact(session)?;
         }
         Ok(())
     }
@@ -712,9 +789,9 @@ impl CaptureStore {
         }
     }
 
-    fn retained_captures(&self) -> Result<Vec<RetainedCapture>> {
+    fn retained_captures_for(&self, sessions: &[CaptureSession]) -> Result<Vec<RetainedCapture>> {
         let mut retained = Vec::new();
-        for session in self.known_sessions()? {
+        for session in sessions {
             let Some(terminal) = self.terminal_capture_record(&session)? else {
                 continue;
             };
@@ -732,7 +809,7 @@ impl CaptureStore {
             }
             if exists {
                 retained.push(RetainedCapture::new(
-                    session,
+                    session.clone(),
                     bytes,
                     terminal.completed_at(),
                 ));
@@ -1012,12 +1089,6 @@ impl AudioCaptureCommand {
             self.audio_format,
         )?;
         let recording_log = RecordingLogWriter::create(&artifact_path, header)?;
-        let compact_path = artifact_path.with_extension("webm");
-        let live_encoder = LiveOpusWebmEncoder::start(
-            OpusWebmEncoder::from_environment(),
-            self.audio_format,
-            CompactAudioArtifact::new(&compact_path),
-        )?;
         let mut child = Command::new(&self.program)
             .args(&self.arguments)
             .stdout(Stdio::piped())
@@ -1026,6 +1097,25 @@ impl AudioCaptureCommand {
             .map_err(|error| Error::AudioBackendUnavailable {
                 message: format!("failed to start {}: {error}", self.program),
             })?;
+        request
+            .latency_instrumentation()
+            .record_capture_process_started();
+
+        let compact_path = artifact_path.with_extension("webm");
+        let live_encoder = match LiveOpusWebmEncoder::start(
+            OpusWebmEncoder::from_environment(),
+            self.audio_format,
+            CompactAudioArtifact::new(&compact_path),
+        ) {
+            Ok(encoder) => encoder,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_file(&artifact_path);
+                return Err(error);
+            }
+        };
+        request.latency_instrumentation().record_encoder_started();
 
         let stdout = child
             .stdout

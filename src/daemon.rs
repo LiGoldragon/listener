@@ -10,8 +10,8 @@ use std::{
 };
 
 use crate::{
-    Configuration, ContractFrameCodec, ContractFrameStream, Error, ListenerRuntime, Result,
-    StatusStreamServer,
+    CaptureMaintenance, Configuration, ContractFrameCodec, ContractFrameStream, Error,
+    LatencyInstrumentation, ListenerRuntime, Result, StatusStreamServer,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,14 +36,21 @@ impl ListenerDaemon {
 
     pub fn run(&self) -> Result<()> {
         let configuration = Configuration::from_environment();
-        let (status_server, status_publisher) =
-            StatusStreamServer::from_configuration(&configuration);
+        let latency_instrumentation = LatencyInstrumentation::from_environment();
+        let (status_server, status_publisher) = StatusStreamServer::from_configuration_with_latency(
+            &configuration,
+            latency_instrumentation.clone(),
+        );
         let _status_thread = status_server.spawn()?;
-        let runtime = ListenerRuntime::from_configuration_with_status(
+        let runtime = ListenerRuntime::from_configuration_with_status_and_latency(
             configuration.clone(),
             status_publisher,
+            latency_instrumentation.clone(),
         )?;
-        ListenerSocketServer::new(configuration, runtime).serve()
+        let maintenance = CaptureMaintenance::from_configuration(&configuration)?;
+        let _maintenance_thread = maintenance.spawn();
+        ListenerSocketServer::new_with_latency(configuration, runtime, latency_instrumentation)
+            .serve()
     }
 
     pub fn run_to_exit_code() -> ExitCode {
@@ -62,14 +69,24 @@ pub struct ListenerSocketServer {
     configuration: Configuration,
     runtime: ListenerRuntime,
     codec: ContractFrameCodec,
+    latency_instrumentation: LatencyInstrumentation,
 }
 
 impl ListenerSocketServer {
     pub fn new(configuration: Configuration, runtime: ListenerRuntime) -> Self {
+        Self::new_with_latency(configuration, runtime, LatencyInstrumentation::disabled())
+    }
+
+    pub fn new_with_latency(
+        configuration: Configuration,
+        runtime: ListenerRuntime,
+        latency_instrumentation: LatencyInstrumentation,
+    ) -> Self {
         Self {
             configuration,
             runtime,
             codec: ContractFrameCodec::listener_default(),
+            latency_instrumentation,
         }
     }
 
@@ -92,6 +109,7 @@ impl ListenerSocketServer {
     pub fn handle_connection(&mut self, stream: UnixStream) -> Result<()> {
         let mut stream = ContractFrameStream::new(stream, self.codec);
         let request = stream.receive_request()?;
+        self.latency_instrumentation.record_request_received();
         let output = self.runtime.handle_input(request.input().clone());
         stream.send_reply(request, output)
     }

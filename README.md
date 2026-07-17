@@ -6,16 +6,20 @@ client for `listener-daemon`; it never reads or mutates captures directly.
 ## Commands
 
 ```sh
-listener start
+listener toggle
 listener status
+listener start
 listener stop <session>
 listener cancel <session>
 listener list
 listener retry <session>
 ```
 
-`start` returns a session number. Pass that number to `stop` or `cancel`.
-`status` reports the active session without exposing transcript text.
+`toggle` atomically starts an idle daemon or stops its active capture; it is the
+hotkey-facing command because it never races a separate `status` read. `start`
+returns a session number. Pass that number to `stop` or `cancel`. `status`
+reports the in-memory active session without exposing transcript text or running
+recovery, migration, or retention work.
 
 `list` returns one typed record per known capture. Its state is:
 
@@ -62,8 +66,9 @@ is the sole canonical retained audio format: it provides a broadly interoperable
 container around Opus and is also the transcription input.
 
 A private `capture-<session>.terminal` record is capture-store metadata, not
-audio. It records terminal outcome and the terminal completion clock. Idle
-maintenance, never an active capture, recovers a crash-survived `.listenerlog`,
+audio. It records terminal outcome and the terminal completion clock. A single
+snapshot-bounded background maintenance pass at daemon startup, never an active
+capture or an interactive request, recovers a crash-survived `.listenerlog`,
 re-encodes every decodable legacy `capture-<session>.*` audio container through
 a temporary WebM/Opus file, verifies it before deleting the source, and removes
 any duplicate legacy source once a canonical artifact exists. A corrupt or
@@ -96,10 +101,9 @@ Run the daemon through the installed service; the ordinary CLI talks to its
 working Unix socket. The normal user-visible workflow is:
 
 ```sh
-listener start
+listener toggle
 # dictate
-listener status
-listener stop <session>
+listener toggle
 listener-recall
 ```
 
@@ -119,6 +123,7 @@ Environment configuration:
 - `LISTENER_HISTORY_MAXIMUM_BYTES`: hard cap for the retained JSONL projection (default: provisional 16 MiB).
 - `LISTENER_CAPTURE_RETENTION_DAYS`: optional hard age cap for failed or cancelled capture media. Unset by default; owner policy is required before media deletion.
 - `LISTENER_CAPTURE_RETENTION_MAXIMUM_BYTES`: optional hard byte cap for failed or cancelled capture media; oldest sessions are removed first. Unset by default.
+- `LISTENER_LATENCY_TRACE`: optional owner-private, transition-only trace path. When set, it records request receipt, capture/encoder startup, and state publication timestamps; unset production operation writes no trace.
 - `LISTENER_CLIPBOARD_PROGRAM`: clipboard command (default `wl-copy`).
 - `LISTENER_TRANSCRIPTION_CUSTOMIZATION_ARCHIVE`: optional vocabulary archive.
 
