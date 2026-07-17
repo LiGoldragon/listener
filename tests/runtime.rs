@@ -511,6 +511,37 @@ fn start_skips_existing_artifacts_without_running_maintenance() {
 }
 
 #[test]
+fn start_skips_existing_compact_artifact_before_writing_recovery_log() {
+    let fixture = RuntimeFixture::new();
+    let retained_compact = fixture.directory.path().join("captures/capture-1.webm");
+    fs::create_dir_all(retained_compact.parent().expect("capture parent"))
+        .expect("create capture parent");
+    fs::write(&retained_compact, b"retained compact artifact").expect("write retained compact");
+    let mut runtime = fixture.runtime();
+
+    let session = match runtime.handle_input(Input::Start(StartCapture {})) {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected started reply, got {other:?}"),
+    };
+
+    assert_eq!(
+        session.value(),
+        2,
+        "a compact-only retained artifact must reserve its session before start"
+    );
+    assert!(
+        retained_compact.exists(),
+        "allocation must not alter an existing compact artifact"
+    );
+    assert!(
+        !fixture.capture_path(1).exists(),
+        "allocation must not create a recovery log beside another capture family"
+    );
+
+    runtime.handle_input(Input::stop(session));
+}
+
+#[test]
 fn start_retries_when_artifact_appears_after_allocation() {
     let fixture = RuntimeFixture::new();
     let mut runtime =

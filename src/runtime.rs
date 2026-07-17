@@ -371,6 +371,14 @@ impl ListenerRuntime {
         &self.orphaned_recordings
     }
 
+    /// Advance the first capture allocation past the daemon-start snapshot.
+    /// This is a constant-time handoff that prevents a new recovery log from
+    /// sharing any retained capture artifact's session name.
+    pub fn advance_session_sequence(&mut self, next_session_value: u64) {
+        self.session_sequence
+            .advance_to_at_least(next_session_value);
+    }
+
     fn take_active_capture(
         &mut self,
         requested_session: CaptureSession,
@@ -394,6 +402,9 @@ impl ListenerRuntime {
     fn start_next_available_capture(&mut self) -> Result<Output> {
         loop {
             let session = self.session_sequence.next_session()?;
+            if self.capture_store.session_is_occupied(&session)? {
+                continue;
+            }
             let artifact = self.capture_store.artifact_for_session(&session);
             match self.capture_backend.start(
                 AudioCaptureStart::new(

@@ -301,15 +301,23 @@ pub struct CaptureStore {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CaptureMaintenanceSnapshot {
     sessions: Vec<CaptureSession>,
+    next_session_value: u64,
 }
 
 impl CaptureMaintenanceSnapshot {
-    fn new(sessions: Vec<CaptureSession>) -> Self {
-        Self { sessions }
+    fn new(sessions: Vec<CaptureSession>, next_session_value: u64) -> Self {
+        Self {
+            sessions,
+            next_session_value,
+        }
     }
 
     pub fn sessions(&self) -> &[CaptureSession] {
         self.sessions.as_slice()
+    }
+
+    pub fn next_session_value(&self) -> u64 {
+        self.next_session_value
     }
 }
 
@@ -338,15 +346,31 @@ impl CaptureStore {
     /// opens capture payloads on an interactive request path.
     pub fn maintenance_snapshot(&self) -> Result<CaptureMaintenanceSnapshot> {
         self.prepare()?;
-        Ok(CaptureMaintenanceSnapshot::new(self.known_sessions()?))
+        let sessions = self.known_sessions()?;
+        let next_session_value =
+            match sessions.last() {
+                Some(session) => session.value().checked_add(1).ok_or(
+                    Error::CaptureSessionSequenceExhausted {
+                        last_session: session.value(),
+                    },
+                )?,
+                None => 1,
+            };
+        Ok(CaptureMaintenanceSnapshot::new(
+            sessions,
+            next_session_value,
+        ))
     }
 
     /// Perform the bounded daemon-start maintenance for a previously captured
     /// snapshot. New sessions are intentionally excluded so maintenance cannot
-    /// race a just-started capture.
+    /// race a just-started capture. An unterminalized recording log is crash
+    /// recovery evidence, not a completed capture: it may be recovered, but it
+    /// is neither encoded nor deleted by maintenance.
     pub fn maintain_snapshot(&self, snapshot: &CaptureMaintenanceSnapshot) -> Result<()> {
-        self.migrate_capture_sessions(snapshot.sessions())?;
         self.recover_capture_sessions(snapshot.sessions())?;
+        let terminal_sessions = self.terminal_sessions(snapshot.sessions())?;
+        self.migrate_capture_sessions(&terminal_sessions)?;
         self.enforce_retention_for_sessions(
             CaptureRetentionPolicy::from_environment()?,
             snapshot.sessions(),
@@ -387,7 +411,8 @@ impl CaptureStore {
     pub fn migrate_terminal_captures(&self) -> Result<()> {
         self.prepare()?;
         let sessions = self.known_sessions()?;
-        self.migrate_capture_sessions(&sessions)
+        let terminal_sessions = self.terminal_sessions(&sessions)?;
+        self.migrate_capture_sessions(&terminal_sessions)
     }
 
     pub fn recover_recording_logs(&self) -> Result<RecoveredCaptureRecordings> {
@@ -507,6 +532,26 @@ impl CaptureStore {
         Ok(sessions)
     }
 
+    /// Reports whether any known capture artifact family already reserves this
+    /// session identifier. Allocation checks this immediately before capture
+    /// creation, so compact, terminal, partial, and crash-recovery artifacts
+    /// cannot share a session with a newly opened recording log.
+    pub fn session_is_occupied(&self, session: &CaptureSession) -> Result<bool> {
+        let entries = match fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if CaptureArtifactPathCandidate::new(&path).any_session_value() == Some(session.value())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Returns the compact artifact after the live encoder has atomically
     /// finalized it. The recovery log remains authoritative until this
     /// validation succeeds.
@@ -588,7 +633,6 @@ impl CaptureStore {
                     return Ok(());
                 }
                 Err(_) => {
-                    self.remove_if_exists(&recording_log)?;
                     self.mark_transcription_failed(session)?;
                     return Ok(());
                 }
@@ -701,6 +745,16 @@ impl CaptureStore {
         self.cleanup_abandoned_intermediates_for(sessions)
     }
 
+    fn terminal_sessions(&self, sessions: &[CaptureSession]) -> Result<Vec<CaptureSession>> {
+        let mut terminal_sessions = Vec::new();
+        for session in sessions {
+            if self.terminal_capture_record(session)?.is_some() {
+                terminal_sessions.push(session.clone());
+            }
+        }
+        Ok(terminal_sessions)
+    }
+
     fn recover_capture_sessions(&self, sessions: &[CaptureSession]) -> Result<()> {
         for session in sessions {
             let recording_log = self.artifact_for_session(session);
@@ -792,12 +846,12 @@ impl CaptureStore {
     fn retained_captures_for(&self, sessions: &[CaptureSession]) -> Result<Vec<RetainedCapture>> {
         let mut retained = Vec::new();
         for session in sessions {
-            let Some(terminal) = self.terminal_capture_record(&session)? else {
+            let Some(terminal) = self.terminal_capture_record(session)? else {
                 continue;
             };
             let mut bytes = 0_u64;
             let mut exists = false;
-            for path in self.retained_artifact_paths(&session)? {
+            for path in self.retained_artifact_paths(session)? {
                 match fs::metadata(path) {
                     Ok(metadata) => {
                         exists = true;

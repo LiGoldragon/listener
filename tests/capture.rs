@@ -85,6 +85,77 @@ fn compact_retry_artifact_advances_next_capture_session() {
 }
 
 #[test]
+fn maintenance_snapshot_reserves_every_capture_artifact_family() {
+    let fixture = CaptureWriterFixture::new();
+    let store = CaptureStore::new(fixture.directory.path().join("captures"));
+    store.prepare().expect("prepare capture store");
+    let families = [
+        "capture-7.listenerlog",
+        "capture-12.webm",
+        "capture-31.webm.part",
+        "capture-44.webm.encoding",
+        "capture-58.encoding.s16le",
+        "capture-73.raw.s16le",
+        "capture-89.terminal",
+        "capture-106.terminal.tmp",
+    ];
+    for family in families {
+        fs::write(store.directory().join(family), b"artifact")
+            .expect("write retained capture artifact");
+    }
+
+    let snapshot = store.maintenance_snapshot().expect("snapshot artifacts");
+    let sessions: Vec<u64> = snapshot
+        .sessions()
+        .iter()
+        .map(CaptureSession::value)
+        .collect();
+    assert_eq!(sessions, [7, 12, 31, 44, 58, 73, 89, 106]);
+    assert_eq!(
+        snapshot.next_session_value(),
+        107,
+        "the first new capture must follow every retained artifact family"
+    );
+}
+
+#[test]
+fn maintenance_recovers_but_never_migrates_unterminalized_recording_logs() {
+    let fixture = CaptureWriterFixture::new();
+    let store = CaptureStore::new(fixture.directory.path().join("captures"));
+    store.prepare().expect("prepare capture store");
+    let session = CaptureSession::new(91);
+    let recording_log_path = store.artifact_for_session(&session);
+    let mut writer =
+        RecordingLogWriter::create(recording_log_path.path().as_str(), fixture.header())
+            .expect("create unterminalized recording log");
+    writer
+        .append_record(&[0, 1, 2, 3])
+        .expect("append durable audio record");
+    writer.finish().expect("finish durable log");
+
+    let snapshot = store.maintenance_snapshot().expect("snapshot artifacts");
+    store
+        .maintain_snapshot(&snapshot)
+        .expect("maintain unterminalized recording log");
+
+    assert!(
+        Path::new(recording_log_path.path().as_str()).exists(),
+        "maintenance must retain an unterminalized durable recovery log"
+    );
+    assert!(
+        !store.compact_audio_path_for_session(&session).exists(),
+        "maintenance must not encode an unterminalized recording log"
+    );
+    assert_eq!(
+        store
+            .terminal_capture_state(&session)
+            .expect("read terminal state"),
+        None,
+        "maintenance must not manufacture terminal metadata for an unfinalized capture"
+    );
+}
+
+#[test]
 fn terminal_capture_media_reclaims_oldest_session_when_byte_bound_is_exceeded() {
     let fixture = CaptureWriterFixture::new();
     let store = CaptureStore::new(fixture.directory.path().join("captures"));
@@ -238,6 +309,36 @@ fn failed_legacy_audio_migration_preserves_source_until_terminal_reaping() {
     assert!(
         !legacy_path.exists(),
         "expired terminal legacy audio remains within the authorized reaper scope"
+    );
+}
+
+#[test]
+fn failed_terminal_log_migration_preserves_recovery_source() {
+    let fixture = CaptureWriterFixture::new();
+    let store = CaptureStore::new(fixture.directory.path().join("captures"));
+    store.prepare().expect("prepare capture store");
+    let session = CaptureSession::new(4);
+    let recording_log_path = store.artifact_for_session(&session);
+    fs::write(recording_log_path.path().as_str(), b"invalid recording log")
+        .expect("write terminal recovery source");
+    store
+        .mark_terminal_capture(&session, TerminalCaptureState::Ready)
+        .expect("mark terminal capture");
+
+    store
+        .migrate_terminal_captures()
+        .expect("attempt terminal log migration");
+
+    assert!(
+        Path::new(recording_log_path.path().as_str()).exists(),
+        "a failed migration must retain the source recording log for inspection and retry"
+    );
+    assert_eq!(
+        store
+            .terminal_capture_state(&session)
+            .expect("read terminal state"),
+        Some(TerminalCaptureState::Failed),
+        "the failed conversion remains observable without deleting its source"
     );
 }
 
@@ -535,6 +636,9 @@ fn idle_migration_reencodes_decodable_legacy_container_before_deleting_source() 
         .status()
         .expect("start ffmpeg for legacy WAV fixture");
     assert!(status.success(), "create decodable legacy WAV fixture");
+    store
+        .mark_terminal_capture(&session, TerminalCaptureState::Ready)
+        .expect("mark legacy capture terminal before migration");
 
     store
         .migrate_terminal_captures()

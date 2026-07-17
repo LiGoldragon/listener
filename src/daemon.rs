@@ -42,12 +42,13 @@ impl ListenerDaemon {
             latency_instrumentation.clone(),
         );
         let _status_thread = status_server.spawn()?;
-        let runtime = ListenerRuntime::from_configuration_with_status_and_latency(
+        let mut runtime = ListenerRuntime::from_configuration_with_status_and_latency(
             configuration.clone(),
             status_publisher,
             latency_instrumentation.clone(),
         )?;
         let maintenance = CaptureMaintenance::from_configuration(&configuration)?;
+        runtime.advance_session_sequence(maintenance.snapshot().next_session_value());
         let _maintenance_thread = maintenance.spawn();
         ListenerSocketServer::new_with_latency(configuration, runtime, latency_instrumentation)
             .serve()
