@@ -3,8 +3,9 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{Arc, Condvar, Mutex},
+    thread,
+    time::{Duration, Instant},
 };
 
 use listener::daemon::ListenerSocketServer;
@@ -18,11 +19,12 @@ use listener::{
 };
 use signal_frame::{ExchangeIdentifier, ExchangeLane, LaneSequence, Reply, SessionEpoch, SubReply};
 use signal_listener::{
-    ActiveCapture, CaptureSession, CaptureStatus, DeliveryOutcome, DurableAudioArtifact, Frame,
-    FrameBody, Input, InputSource, ListCapturesRequest, ListenerDaemonConfiguration,
-    MetaSocketMode, MetaSocketPath, OperationKind, Output, OutputTarget, OutputTargets,
-    RetryCapture, SocketMode, StartCapture, StatusRequest, TranscriptText, TranscriptionMode,
-    UnimplementedReason, WirePath, WorkingSocketMode, WorkingSocketPath,
+    ActiveCapture, CaptureCancellationRequested, CaptureSession, CaptureStatus, DeliveryOutcome,
+    DurableAudioArtifact, Frame, FrameBody, Input, InputSource, ListCapturesRequest,
+    ListenerDaemonConfiguration, MetaSocketMode, MetaSocketPath, OperationKind, Output,
+    OutputTarget, OutputTargets, RetryCapture, SocketMode, StartCapture, StatusRequest,
+    TranscriptText, TranscriptionMode, UnimplementedReason, WirePath, WorkingSocketMode,
+    WorkingSocketPath,
 };
 use tempfile::TempDir;
 
@@ -170,8 +172,13 @@ impl RuntimeFixture {
 
 struct FileAudioCaptureBackend;
 
-impl AudioCaptureBackend for FileAudioCaptureBackend {
-    fn start(&self, request: AudioCaptureStart) -> listener::Result<Box<dyn ActiveAudioCapture>> {
+impl FileAudioCaptureBackend {
+    fn start_with_shutdown_gates(
+        &self,
+        request: AudioCaptureStart,
+        stop_gate: Option<BlockingGate>,
+        cancellation_gate: Option<BlockingGate>,
+    ) -> listener::Result<Box<dyn ActiveAudioCapture>> {
         let artifact_path = request.artifact_path();
         fs::create_dir_all(artifact_path.parent().expect("artifact parent"))?;
         let header = RecordingLogHeader::from_capture_start(
@@ -187,16 +194,81 @@ impl AudioCaptureBackend for FileAudioCaptureBackend {
                 RecordingAudioFormat::signed_sixteen_bit_little_endian_mono_16khz().sample_format(),
             ),
         );
-        Ok(Box::new(FileAudioCapture::new(
+        Ok(Box::new(FileAudioCapture::new_with_shutdown_gates(
             request.artifact().clone(),
             writer,
             request.status_publisher(),
+            stop_gate,
+            cancellation_gate,
         )))
+    }
+}
+
+impl AudioCaptureBackend for FileAudioCaptureBackend {
+    fn start(&self, request: AudioCaptureStart) -> listener::Result<Box<dyn ActiveAudioCapture>> {
+        self.start_with_shutdown_gates(request, None, None)
+    }
+}
+
+struct BlockingStartupAudioCaptureBackend {
+    startup_gate: BlockingGate,
+}
+
+impl BlockingStartupAudioCaptureBackend {
+    fn new(startup_gate: BlockingGate) -> Self {
+        Self { startup_gate }
+    }
+}
+
+impl AudioCaptureBackend for BlockingStartupAudioCaptureBackend {
+    fn start(&self, request: AudioCaptureStart) -> listener::Result<Box<dyn ActiveAudioCapture>> {
+        self.startup_gate.enter_and_wait();
+        FileAudioCaptureBackend.start(request)
+    }
+}
+
+struct BlockingCancellationAudioCaptureBackend {
+    cancellation_gate: BlockingGate,
+}
+
+impl BlockingCancellationAudioCaptureBackend {
+    fn new(cancellation_gate: BlockingGate) -> Self {
+        Self { cancellation_gate }
+    }
+}
+
+impl AudioCaptureBackend for BlockingCancellationAudioCaptureBackend {
+    fn start(&self, request: AudioCaptureStart) -> listener::Result<Box<dyn ActiveAudioCapture>> {
+        FileAudioCaptureBackend.start_with_shutdown_gates(
+            request,
+            None,
+            Some(self.cancellation_gate.clone()),
+        )
     }
 }
 
 const ACTIVE_AUDIO_BYTES: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7];
 const STOPPED_AUDIO_BYTES: &[u8] = &[8, 9, 10, 11];
+
+struct BlockingFinalizationAudioCaptureBackend {
+    finalization_gate: BlockingGate,
+}
+
+impl BlockingFinalizationAudioCaptureBackend {
+    fn new(finalization_gate: BlockingGate) -> Self {
+        Self { finalization_gate }
+    }
+}
+
+impl AudioCaptureBackend for BlockingFinalizationAudioCaptureBackend {
+    fn start(&self, request: AudioCaptureStart) -> listener::Result<Box<dyn ActiveAudioCapture>> {
+        FileAudioCaptureBackend.start_with_shutdown_gates(
+            request,
+            Some(self.finalization_gate.clone()),
+            None,
+        )
+    }
+}
 
 struct RacingCollisionAudioCaptureBackend {
     collided: Arc<Mutex<bool>>,
@@ -237,19 +309,41 @@ struct FileAudioCapture {
     artifact: DurableAudioArtifact,
     writer: RecordingLogWriter,
     status_publisher: StatusPublisher,
+    stop_gate: Option<BlockingGate>,
+    cancellation_gate: Option<BlockingGate>,
 }
 
 impl FileAudioCapture {
-    fn new(
+    fn new_with_shutdown_gates(
         artifact: DurableAudioArtifact,
         writer: RecordingLogWriter,
         status_publisher: StatusPublisher,
+        stop_gate: Option<BlockingGate>,
+        cancellation_gate: Option<BlockingGate>,
     ) -> Self {
         Self {
             artifact,
             writer,
             status_publisher,
+            stop_gate,
+            cancellation_gate,
         }
+    }
+
+    fn finish(
+        artifact: DurableAudioArtifact,
+        mut writer: RecordingLogWriter,
+        status_publisher: StatusPublisher,
+    ) -> listener::Result<DurableAudioArtifact> {
+        writer.append_record(STOPPED_AUDIO_BYTES)?;
+        status_publisher.publish_recording_level(
+            listener::MicrophoneLevel::from_recording_payload(
+                STOPPED_AUDIO_BYTES,
+                RecordingAudioFormat::signed_sixteen_bit_little_endian_mono_16khz().sample_format(),
+            ),
+        );
+        writer.finish()?;
+        Ok(artifact)
     }
 }
 
@@ -261,18 +355,29 @@ impl ActiveAudioCapture for FileAudioCapture {
     fn stop(self: Box<Self>) -> listener::Result<DurableAudioArtifact> {
         let FileAudioCapture {
             artifact,
-            mut writer,
+            writer,
             status_publisher,
+            stop_gate,
+            cancellation_gate: _,
         } = *self;
-        writer.append_record(STOPPED_AUDIO_BYTES)?;
-        status_publisher.publish_recording_level(
-            listener::MicrophoneLevel::from_recording_payload(
-                STOPPED_AUDIO_BYTES,
-                RecordingAudioFormat::signed_sixteen_bit_little_endian_mono_16khz().sample_format(),
-            ),
-        );
-        writer.finish()?;
-        Ok(artifact)
+        if let Some(stop_gate) = stop_gate {
+            stop_gate.enter_and_wait();
+        }
+        FileAudioCapture::finish(artifact, writer, status_publisher)
+    }
+
+    fn cancel(self: Box<Self>) -> listener::Result<DurableAudioArtifact> {
+        let FileAudioCapture {
+            artifact,
+            writer,
+            status_publisher,
+            stop_gate: _,
+            cancellation_gate,
+        } = *self;
+        if let Some(cancellation_gate) = cancellation_gate {
+            cancellation_gate.enter_and_wait();
+        }
+        FileAudioCapture::finish(artifact, writer, status_publisher)
     }
 }
 
@@ -304,6 +409,166 @@ impl BatchTranscriber for FixedBatchTranscriber {
             .expect("transcription inputs")
             .push(request.input().clone());
         Ok(TranscriptText::new(self.text.clone()))
+    }
+}
+
+struct BlockingBatchTranscriber {
+    gate: BlockingGate,
+    inputs: Arc<Mutex<Vec<BatchTranscriptionInput>>>,
+    status_publisher: StatusPublisher,
+}
+
+impl BlockingBatchTranscriber {
+    fn new(
+        gate: BlockingGate,
+        inputs: Arc<Mutex<Vec<BatchTranscriptionInput>>>,
+        status_publisher: StatusPublisher,
+    ) -> Self {
+        Self {
+            gate,
+            inputs,
+            status_publisher,
+        }
+    }
+}
+
+impl BatchTranscriber for BlockingBatchTranscriber {
+    fn transcribe(&self, request: BatchTranscriptionRequest) -> listener::Result<TranscriptText> {
+        self.status_publisher.publish_transcribing();
+        self.inputs
+            .lock()
+            .expect("transcription inputs")
+            .push(request.input().clone());
+        self.gate.enter_and_wait();
+        Ok(TranscriptText::new("blocked transcription"))
+    }
+}
+
+#[derive(Clone)]
+struct BlockingGate {
+    state: Arc<(Mutex<BlockingGateState>, Condvar)>,
+}
+
+struct BlockingGateState {
+    entered: bool,
+    released: bool,
+}
+
+impl BlockingGate {
+    fn new() -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(BlockingGateState {
+                    entered: false,
+                    released: false,
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    fn enter_and_wait(&self) {
+        let (state, condition) = &*self.state;
+        let mut state = state.lock().expect("blocking gate state");
+        state.entered = true;
+        condition.notify_all();
+        while !state.released {
+            state = condition.wait(state).expect("blocking gate wait");
+        }
+    }
+
+    fn wait_until_entered(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (state, condition) = &*self.state;
+        let mut state = state.lock().expect("blocking gate state");
+        while !state.entered {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("blocking gate did not enter before timeout");
+            let (next, timeout) = condition
+                .wait_timeout(state, remaining)
+                .expect("blocking gate timed wait");
+            state = next;
+            assert!(
+                !timeout.timed_out(),
+                "blocking gate did not enter before timeout"
+            );
+        }
+    }
+
+    fn release(&self) {
+        let (state, condition) = &*self.state;
+        state.lock().expect("blocking gate state").released = true;
+        condition.notify_all();
+    }
+}
+
+struct CancellationProbe;
+
+impl CancellationProbe {
+    fn assert_requested(server: &ListenerSocketServer, input: Input, session: &CaptureSession) {
+        match server
+            .handle_input(input)
+            .expect("request cancellation through actor")
+        {
+            Output::CancellationRequested(CaptureCancellationRequested {
+                cancellation_requested_session,
+                ..
+            }) => assert_eq!(cancellation_requested_session.payload(), session),
+            other => panic!("expected cancellation acknowledgement, got {other:?}"),
+        }
+    }
+
+    fn active_session(server: &ListenerSocketServer) -> CaptureSession {
+        match server
+            .handle_input(Input::Status(StatusRequest {}))
+            .expect("read active lifecycle status through actor")
+        {
+            Output::StatusReported(report) => match report.status() {
+                CaptureStatus::Capturing(ActiveCapture {
+                    active_capture_session,
+                    ..
+                }) => active_capture_session.payload().clone(),
+                other => panic!("expected active lifecycle status, got {other:?}"),
+            },
+            other => panic!("expected status reply, got {other:?}"),
+        }
+    }
+
+    fn assert_pending_for_session(server: &ListenerSocketServer, session: &CaptureSession) {
+        assert_eq!(Self::active_session(server), *session);
+    }
+
+    fn wait_until_idle(server: &ListenerSocketServer) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match server
+                .handle_input(Input::Status(StatusRequest {}))
+                .expect("read cancellation completion status through actor")
+            {
+                Output::StatusReported(report) if report.status() == &CaptureStatus::Idle => return,
+                Output::StatusReported(report) if Instant::now() < deadline => {
+                    let _ = report;
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Output::StatusReported(report) => {
+                    panic!("expected idle after cancellation, got {report:?}")
+                }
+                other => panic!("expected status reply, got {other:?}"),
+            }
+        }
+    }
+
+    fn assert_immediate<F>(request: F)
+    where
+        F: FnOnce(),
+    {
+        let started = Instant::now();
+        request();
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "cancellation acknowledgement must not wait for blocked work"
+        );
     }
 }
 
@@ -872,7 +1137,185 @@ fn stop_actor_unavailable_returns_transcription_backend_unavailable_reply() {
 }
 
 #[test]
-fn atomic_toggle_starts_then_stops_the_daemon_owned_active_capture() {
+fn actor_toggle_and_cancel_acknowledge_startup_cancellation_without_blocking() {
+    let fixture = RuntimeFixture::new();
+    let gate = BlockingGate::new();
+    let runtime = fixture.runtime_with_capture_backend(Box::new(
+        BlockingStartupAudioCaptureBackend::new(gate.clone()),
+    ));
+    let server = Arc::new(ListenerSocketServer::new(fixture.configuration(), runtime));
+    let first_toggle_server = Arc::clone(&server);
+    let first_toggle = thread::spawn(move || {
+        first_toggle_server
+            .handle_input(Input::Toggle(signal_listener::ToggleCapture {}))
+            .expect("start through actor")
+    });
+    gate.wait_until_entered();
+
+    let session = CancellationProbe::active_session(&server);
+    CancellationProbe::assert_immediate(|| {
+        CancellationProbe::assert_requested(&server, Input::cancel(session.clone()), &session)
+    });
+    CancellationProbe::assert_requested(
+        &server,
+        Input::Toggle(signal_listener::ToggleCapture {}),
+        &session,
+    );
+    CancellationProbe::assert_pending_for_session(&server, &session);
+
+    gate.release();
+    match first_toggle.join().expect("start thread joins") {
+        Output::Started(_) => {}
+        other => panic!("expected first toggle to report its started transition, got {other:?}"),
+    }
+    CancellationProbe::wait_until_idle(&server);
+    assert!(fixture.capture_path(session.value()).exists());
+    assert!(fixture.transcription_inputs().is_empty());
+    assert!(fixture.delivered_texts().is_empty());
+}
+
+#[test]
+fn actor_toggle_and_cancel_repeat_recording_cancellation_without_starting_another_capture() {
+    let fixture = RuntimeFixture::new();
+    let gate = BlockingGate::new();
+    let runtime = fixture.runtime_with_capture_backend(Box::new(
+        BlockingCancellationAudioCaptureBackend::new(gate.clone()),
+    ));
+    let server = ListenerSocketServer::new(fixture.configuration(), runtime);
+    let session = match server
+        .handle_input(Input::Toggle(signal_listener::ToggleCapture {}))
+        .expect("start through actor")
+    {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected started reply, got {other:?}"),
+    };
+
+    CancellationProbe::assert_immediate(|| {
+        CancellationProbe::assert_requested(&server, Input::cancel(session.clone()), &session)
+    });
+    CancellationProbe::assert_requested(
+        &server,
+        Input::Toggle(signal_listener::ToggleCapture {}),
+        &session,
+    );
+    CancellationProbe::assert_requested(&server, Input::cancel(session.clone()), &session);
+    CancellationProbe::assert_pending_for_session(&server, &session);
+    gate.release();
+
+    CancellationProbe::wait_until_idle(&server);
+    assert!(fixture.capture_path(session.value()).exists());
+    assert!(fixture.transcription_inputs().is_empty());
+    assert!(fixture.delivered_texts().is_empty());
+}
+
+#[test]
+fn actor_toggle_and_cancel_repeat_finalizing_cancellation_without_transcribing() {
+    let fixture = RuntimeFixture::new();
+    let gate = BlockingGate::new();
+    let runtime = fixture.runtime_with_capture_backend(Box::new(
+        BlockingFinalizationAudioCaptureBackend::new(gate.clone()),
+    ));
+    let server = Arc::new(ListenerSocketServer::new(fixture.configuration(), runtime));
+    let session = match server
+        .handle_input(Input::Start(StartCapture {}))
+        .expect("start through actor")
+    {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected started reply, got {other:?}"),
+    };
+
+    let stopping_server = Arc::clone(&server);
+    let stopping_session = session.clone();
+    let stop_thread = thread::spawn(move || {
+        stopping_server
+            .handle_input(Input::stop(stopping_session))
+            .expect("stop through actor")
+    });
+    gate.wait_until_entered();
+
+    CancellationProbe::assert_immediate(|| {
+        CancellationProbe::assert_requested(
+            &server,
+            Input::Toggle(signal_listener::ToggleCapture {}),
+            &session,
+        )
+    });
+    CancellationProbe::assert_requested(&server, Input::cancel(session.clone()), &session);
+    CancellationProbe::assert_pending_for_session(&server, &session);
+    gate.release();
+
+    match stop_thread.join().expect("stop thread joins") {
+        Output::Cancelled(cancelled) => assert_eq!(cancelled.cancelled_session.payload(), &session),
+        other => panic!("expected cancellation to supersede stop completion, got {other:?}"),
+    }
+    CancellationProbe::wait_until_idle(&server);
+    assert!(fixture.capture_path(session.value()).exists());
+    assert!(fixture.transcription_inputs().is_empty());
+    assert!(fixture.delivered_texts().is_empty());
+    assert!(fixture.recorded_history().is_empty());
+}
+
+#[test]
+fn actor_toggle_and_cancel_repeat_transcribing_cancellation_without_delivery_or_history() {
+    let fixture = RuntimeFixture::new();
+    let gate = BlockingGate::new();
+    let runtime = fixture.runtime_with_transcriber(Box::new(BlockingBatchTranscriber::new(
+        gate.clone(),
+        Arc::clone(&fixture.transcription_inputs),
+        fixture.status_publisher.clone(),
+    )));
+    let server = Arc::new(ListenerSocketServer::new(fixture.configuration(), runtime));
+    let session = match server
+        .handle_input(Input::Start(StartCapture {}))
+        .expect("start through actor")
+    {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected started reply, got {other:?}"),
+    };
+
+    let stopping_server = Arc::clone(&server);
+    let stopping_session = session.clone();
+    let stop_thread = thread::spawn(move || {
+        stopping_server
+            .handle_input(Input::stop(stopping_session))
+            .expect("stop through actor")
+    });
+    gate.wait_until_entered();
+
+    CancellationProbe::assert_immediate(|| {
+        CancellationProbe::assert_requested(
+            &server,
+            Input::Toggle(signal_listener::ToggleCapture {}),
+            &session,
+        )
+    });
+    CancellationProbe::assert_requested(&server, Input::cancel(session.clone()), &session);
+    CancellationProbe::assert_pending_for_session(&server, &session);
+    gate.release();
+
+    match stop_thread.join().expect("stop thread joins") {
+        Output::Cancelled(cancelled) => assert_eq!(cancelled.cancelled_session.payload(), &session),
+        other => panic!("expected cancellation to supersede stop completion, got {other:?}"),
+    }
+    CancellationProbe::wait_until_idle(&server);
+    assert_eq!(fixture.transcription_inputs().len(), 1);
+    assert!(fixture.delivered_texts().is_empty());
+    assert!(fixture.recorded_history().is_empty());
+    let events = fixture.status_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state() == listener::ListenerStatusState::Cancelling)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state() == listener::ListenerStatusState::Cancelled)
+    );
+}
+
+#[test]
+fn atomic_toggle_starts_then_cancels_the_daemon_owned_active_capture() {
     let fixture = RuntimeFixture::new();
     let mut runtime = fixture.runtime();
 
@@ -884,8 +1327,10 @@ fn atomic_toggle_starts_then_stops_the_daemon_owned_active_capture() {
 
     let second = runtime.handle_input(Input::Toggle(signal_listener::ToggleCapture {}));
     match second {
-        Output::Stopped(stopped) => assert_eq!(stopped.stopped_session.payload(), &session),
-        other => panic!("expected toggle to stop the same capture, got {other:?}"),
+        Output::Cancelled(cancelled) => {
+            assert_eq!(cancelled.cancelled_session.payload(), &session)
+        }
+        other => panic!("expected toggle to cancel the same capture, got {other:?}"),
     }
 }
 
@@ -1072,7 +1517,7 @@ fn output_target_dispatch_returns_one_outcome_per_configured_target() {
 fn socket_server_answers_public_status_frame_with_matching_exchange() {
     let fixture = RuntimeFixture::new();
     let (mut client_stream, server_stream) = UnixStream::pair().expect("socket pair");
-    let mut server = ListenerSocketServer::new(fixture.configuration(), fixture.runtime());
+    let server = ListenerSocketServer::new(fixture.configuration(), fixture.runtime());
     let exchange = ExchangeIdentifier::new(
         SessionEpoch::new(5),
         ExchangeLane::Connector,
@@ -1121,14 +1566,58 @@ fn socket_server_answers_public_status_frame_with_matching_exchange() {
 }
 
 #[test]
-fn socket_server_answers_public_conflict_frame_with_matching_exchange() {
+fn socket_server_accepts_atomic_toggle_frame_with_matching_exchange() {
     let fixture = RuntimeFixture::new();
     let (mut client_stream, server_stream) = UnixStream::pair().expect("socket pair");
-    let mut server = ListenerSocketServer::new(fixture.configuration(), fixture.runtime());
+    let server = ListenerSocketServer::new(fixture.configuration(), fixture.runtime());
     let exchange = ExchangeIdentifier::new(
         SessionEpoch::new(5),
         ExchangeLane::Connector,
         LaneSequence::new(14),
+    );
+
+    let request = Input::Toggle(signal_listener::ToggleCapture {})
+        .into_frame(exchange)
+        .encode_length_prefixed()
+        .expect("public toggle request frame encodes");
+    client_stream
+        .write_all(&request)
+        .expect("write public toggle request frame");
+    server
+        .handle_connection(server_stream)
+        .expect("server toggle reply");
+    let response = read_length_prefixed_frame_bytes(&mut client_stream);
+    let frame =
+        Frame::decode_length_prefixed(&response).expect("public toggle reply frame decodes");
+
+    match frame.into_body() {
+        FrameBody::Reply {
+            exchange: reply_exchange,
+            reply,
+        } => {
+            assert_eq!(reply_exchange, exchange);
+            match reply {
+                Reply::Accepted { per_operation, .. } => match per_operation.into_head_and_tail().0
+                {
+                    SubReply::Ok(Output::Started(_)) => {}
+                    other => panic!("expected started toggle reply, got {other:?}"),
+                },
+                other => panic!("expected accepted reply, got {other:?}"),
+            }
+        }
+        other => panic!("expected public reply frame, got {other:?}"),
+    }
+}
+
+#[test]
+fn socket_server_answers_public_conflict_frame_with_matching_exchange() {
+    let fixture = RuntimeFixture::new();
+    let (mut client_stream, server_stream) = UnixStream::pair().expect("socket pair");
+    let server = ListenerSocketServer::new(fixture.configuration(), fixture.runtime());
+    let exchange = ExchangeIdentifier::new(
+        SessionEpoch::new(5),
+        ExchangeLane::Connector,
+        LaneSequence::new(15),
     );
 
     let request = Input::stop(CaptureSession::new(1))

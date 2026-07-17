@@ -194,6 +194,12 @@ Ordinary lifecycle conflicts stay on the public reply surface as typed
 `signal-listener` outcomes: start while recording reports the active session,
 stop or cancel while idle reports no active capture, and stop or cancel with a
 different session reports both active and requested sessions. `Toggle` selects
-start or stop atomically in this same daemon state transition, so hotkeys never
-read status to choose a follow-up operation. These are not lowered to
-`RequestUnimplemented`.
+start or immediate cancellation atomically in the daemon-owned lifecycle slot,
+so hotkeys never read status to choose a follow-up operation. Cancellation
+acknowledges immediately from startup, recording, finalization, transcription,
+and an already-cancelling phase; repeated requests identify the same session.
+Graceful `Stop` remains a distinct explicit operation that finalizes,
+transcribes, and delivers. The status stream publishes `cancelling` before the
+terminal `cancelled` event, while the compatible public status reply retains
+the active session until the cancellation worker completes. These outcomes are
+not lowered to `RequestUnimplemented`.

@@ -139,11 +139,11 @@ impl Default for CaptureRetentionPolicy {
     }
 }
 
-pub trait AudioCaptureBackend {
+pub trait AudioCaptureBackend: Send + Sync {
     fn start(&self, request: AudioCaptureStart) -> Result<Box<dyn ActiveAudioCapture>>;
 }
 
-pub trait ActiveAudioCapture {
+pub trait ActiveAudioCapture: Send {
     fn artifact(&self) -> &DurableAudioArtifact;
 
     fn stop(self: Box<Self>) -> Result<DurableAudioArtifact>;

@@ -608,7 +608,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "listener"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "crc32fast",
  "fs2",
@@ -1231,8 +1231,8 @@ dependencies = [
 
 [[package]]
 name = "signal-listener"
-version = "0.6.0"
-source = "git+https://github.com/LiGoldragon/signal-listener.git?branch=main#d87485fb8d76b436ac843733027ec416b08352ea"
+version = "0.7.0"
+source = "git+https://github.com/LiGoldragon/signal-listener.git?branch=main#99c3a6811b6a622641d52f884490725630caef91"
 dependencies = [
  "nota 0.8.0 (git+https://github.com/LiGoldragon/nota.git?branch=main)",
  "rkyv",

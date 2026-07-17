@@ -1,6 +1,7 @@
 use std::{
     io::Write,
     process::{Command, Stdio},
+    sync::Arc,
 };
 
 use signal_listener::{
@@ -8,7 +9,7 @@ use signal_listener::{
     OutputTarget, OutputTargets, TranscriptText,
 };
 
-pub trait TranscriptDelivery {
+pub trait TranscriptDelivery: Send + Sync {
     fn deliver(&self, request: TranscriptDeliveryRequest) -> DeliveryOutcome;
 }
 
@@ -35,8 +36,9 @@ impl TranscriptDeliveryRequest {
     }
 }
 
+#[derive(Clone)]
 pub struct OutputTargetDispatcher {
-    system_clipboard: Box<dyn TranscriptDelivery>,
+    system_clipboard: Arc<dyn TranscriptDelivery>,
 }
 
 impl OutputTargetDispatcher {
@@ -45,7 +47,9 @@ impl OutputTargetDispatcher {
     }
 
     pub fn new(system_clipboard: Box<dyn TranscriptDelivery>) -> Self {
-        Self { system_clipboard }
+        Self {
+            system_clipboard: Arc::from(system_clipboard),
+        }
     }
 
     pub fn deliver(

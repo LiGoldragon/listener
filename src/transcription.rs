@@ -28,7 +28,7 @@ const TRANSCRIPTION_ACTOR_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
 const TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_MAGIC: [u8; 8] = *b"LSTNVOC\0";
 const TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_VERSION: u32 = 1;
 
-pub trait BatchTranscriber: Send {
+pub trait BatchTranscriber: Send + Sync {
     fn transcribe(&self, request: BatchTranscriptionRequest) -> Result<TranscriptText>;
 }
 

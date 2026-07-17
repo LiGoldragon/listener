@@ -1,12 +1,19 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use signal_listener::{
-    ActiveCapture, ActiveCaptureSession, CancelCapture, CancelledSession, CaptureAlreadyActive,
-    CaptureArtifactBytes, CaptureArtifactDurationMilliseconds, CaptureArtifactState,
-    CaptureArtifactStateValue, CaptureCancelled, CaptureListReport, CaptureRetried, CaptureSession,
-    CaptureSessionMismatch, CaptureStarted, CaptureStatus, CaptureStopped, CaptureSummaries,
-    CaptureSummary, DeliveryOutcome, DeliveryOutcomes, Input, ListCapturesRequest, NoActiveCapture,
-    OperationKind, Output, Reason, RequestUnimplemented, RequestedCaptureSession, RetriedSession,
-    RetryCapture, StartCapture, StartedSession, StatusRequest, StopCapture, StoppedSession,
-    ToggleCapture, TranscriptText, UnimplementedOperationKind, UnimplementedReason,
+    ActiveCapture, ActiveCaptureSession, CancelCapture, CancellationRequestedSession,
+    CancelledSession, CaptureAlreadyActive, CaptureArtifactBytes,
+    CaptureArtifactDurationMilliseconds, CaptureArtifactState, CaptureArtifactStateValue,
+    CaptureCancellationRequested, CaptureCancelled, CaptureListReport, CaptureRetried,
+    CaptureSession, CaptureSessionMismatch, CaptureStarted, CaptureStatus, CaptureStopped,
+    CaptureSummaries, CaptureSummary, DeliveryOutcome, DeliveryOutcomes, Input,
+    ListCapturesRequest, NoActiveCapture, OperationKind, Output, OutputTargets, Reason,
+    RequestUnimplemented, RequestedCaptureSession, RetriedSession, RetryCapture, StartCapture,
+    StartedSession, StatusRequest, StopCapture, StoppedSession, ToggleCapture, TranscriptText,
+    UnimplementedOperationKind, UnimplementedReason,
 };
 
 use crate::{
@@ -22,8 +29,8 @@ use crate::{
 pub struct ListenerRuntime {
     configuration: Configuration,
     capture_store: CaptureStore,
-    capture_backend: Box<dyn AudioCaptureBackend>,
-    transcriber: Box<dyn BatchTranscriber>,
+    capture_backend: Arc<dyn AudioCaptureBackend>,
+    transcriber: Arc<dyn BatchTranscriber>,
     output_target_dispatcher: OutputTargetDispatcher,
     history_store: TranscriptHistoryStore,
     status_publisher: StatusPublisher,
@@ -99,8 +106,8 @@ impl ListenerRuntime {
         Self {
             configuration,
             capture_store,
-            capture_backend,
-            transcriber,
+            capture_backend: Arc::from(capture_backend),
+            transcriber: Arc::from(transcriber),
             output_target_dispatcher,
             history_store,
             status_publisher,
@@ -132,15 +139,19 @@ impl ListenerRuntime {
     }
 
     pub fn start(&mut self, _request: StartCapture) -> Result<Output> {
-        if let Some(active_capture) = &self.active_capture {
-            return Err(Error::CaptureAlreadyActive {
-                session: active_capture.session().value(),
-            });
+        loop {
+            let start = self.begin_capture_start()?;
+            match start.start() {
+                Ok(capture) => return Ok(self.install_started_capture(start, capture)),
+                Err(error) if error.is_recording_log_already_exists() => {
+                    self.advance_past_existing_capture_artifacts()?;
+                }
+                Err(error) => {
+                    self.status_publisher.publish_error();
+                    return Err(error);
+                }
+            }
         }
-
-        self.status_publisher.publish_starting();
-        self.capture_store.prepare()?;
-        self.start_next_available_capture()
     }
 
     pub fn stop(&mut self, request: StopCapture) -> Result<Output> {
@@ -199,7 +210,7 @@ impl ListenerRuntime {
     }
 
     /// Atomically chooses the next capture transition from daemon-owned state.
-    /// Callers never need a status-to-start/stop read-modify-write sequence.
+    /// An active capture is cancelled rather than finalized for transcription.
     pub fn toggle(&mut self, _request: ToggleCapture) -> Result<Output> {
         match self
             .active_capture
@@ -207,7 +218,7 @@ impl ListenerRuntime {
             .map(RuntimeActiveCapture::session)
             .cloned()
         {
-            Some(session) => self.stop(StopCapture::new(session)),
+            Some(session) => self.cancel(CancelCapture::new(session)),
             None => self.start(StartCapture {}),
         }
     }
@@ -399,43 +410,430 @@ impl ListenerRuntime {
         Ok(active_capture)
     }
 
-    fn start_next_available_capture(&mut self) -> Result<Output> {
+    pub fn begin_capture_start(&mut self) -> Result<RuntimeCaptureStartWork> {
+        if let Some(active_capture) = &self.active_capture {
+            return Err(Error::CaptureAlreadyActive {
+                session: active_capture.session().value(),
+            });
+        }
+
+        self.status_publisher.publish_starting();
+        self.capture_store.prepare()?;
         loop {
             let session = self.session_sequence.next_session()?;
-            if self.capture_store.session_is_occupied(&session)? {
-                continue;
-            }
-            let artifact = self.capture_store.artifact_for_session(&session);
-            match self.capture_backend.start(
-                AudioCaptureStart::new(
-                    session.clone(),
-                    artifact.clone(),
+            if !self.capture_store.session_is_occupied(&session)? {
+                let artifact = self.capture_store.artifact_for_session(&session);
+                return Ok(RuntimeCaptureStartWork::new(
+                    session,
+                    artifact,
                     self.configuration.input_source(),
+                    Arc::clone(&self.capture_backend),
                     self.status_publisher.clone(),
-                )
-                .with_latency_instrumentation(self.latency_instrumentation.clone()),
-            ) {
-                Ok(capture) => {
-                    self.active_capture = Some(RuntimeActiveCapture::new(
-                        session.clone(),
-                        artifact,
-                        capture,
-                    ));
-                    return Ok(Output::Started(CaptureStarted::new(StartedSession::new(
-                        session,
-                    ))));
-                }
-                Err(error) if error.is_recording_log_already_exists() => {
-                    let next_session_value = self
-                        .capture_store
-                        .next_session_value_after_existing_artifacts()?;
-                    self.session_sequence
-                        .advance_to_at_least(next_session_value);
-                }
+                    self.latency_instrumentation.clone(),
+                ));
+            }
+        }
+    }
+
+    pub fn install_started_capture(
+        &mut self,
+        start: RuntimeCaptureStartWork,
+        capture: Box<dyn ActiveAudioCapture>,
+    ) -> Output {
+        let session = start.session().clone();
+        self.active_capture = Some(RuntimeActiveCapture::new(
+            session.clone(),
+            start.artifact().clone(),
+            capture,
+        ));
+        Output::Started(CaptureStarted::new(StartedSession::new(session)))
+    }
+
+    pub fn begin_capture_cancellation(
+        &mut self,
+        requested_session: CaptureSession,
+    ) -> Result<RuntimeCaptureCancellationWork> {
+        let active_capture = self.take_active_capture(requested_session)?;
+        Ok(RuntimeCaptureCancellationWork::new(
+            active_capture,
+            self.capture_store.clone(),
+            self.status_publisher.clone(),
+        ))
+    }
+
+    pub fn begin_capture_finalization(
+        &mut self,
+        requested_session: CaptureSession,
+    ) -> Result<RuntimeCaptureFinalizationWork> {
+        let active_capture = self.take_active_capture(requested_session)?;
+        Ok(RuntimeCaptureFinalizationWork::new(
+            active_capture,
+            self.capture_store.clone(),
+            Arc::clone(&self.transcriber),
+            self.output_target_dispatcher.clone(),
+            self.history_store.clone(),
+            self.configuration.output_targets().clone(),
+            self.status_publisher.clone(),
+        ))
+    }
+
+    pub fn publish_cancelling(&self) {
+        self.status_publisher.publish_cancelling();
+    }
+
+    fn advance_past_existing_capture_artifacts(&mut self) -> Result<()> {
+        let next_session_value = self
+            .capture_store
+            .next_session_value_after_existing_artifacts()?;
+        self.session_sequence
+            .advance_to_at_least(next_session_value);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct CaptureCancellationSignal {
+    requested: Arc<AtomicBool>,
+}
+
+impl CaptureCancellationSignal {
+    pub fn new() -> Self {
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
+
+impl Default for CaptureCancellationSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct RuntimeCaptureStartWork {
+    session: CaptureSession,
+    artifact: signal_listener::DurableAudioArtifact,
+    input_source: signal_listener::InputSource,
+    capture_backend: Arc<dyn AudioCaptureBackend>,
+    status_publisher: StatusPublisher,
+    latency_instrumentation: LatencyInstrumentation,
+}
+
+impl RuntimeCaptureStartWork {
+    fn new(
+        session: CaptureSession,
+        artifact: signal_listener::DurableAudioArtifact,
+        input_source: signal_listener::InputSource,
+        capture_backend: Arc<dyn AudioCaptureBackend>,
+        status_publisher: StatusPublisher,
+        latency_instrumentation: LatencyInstrumentation,
+    ) -> Self {
+        Self {
+            session,
+            artifact,
+            input_source,
+            capture_backend,
+            status_publisher,
+            latency_instrumentation,
+        }
+    }
+
+    pub fn session(&self) -> &CaptureSession {
+        &self.session
+    }
+
+    pub fn artifact(&self) -> &signal_listener::DurableAudioArtifact {
+        &self.artifact
+    }
+
+    pub fn clone_for_worker(&self) -> Self {
+        Self {
+            session: self.session.clone(),
+            artifact: self.artifact.clone(),
+            input_source: self.input_source,
+            capture_backend: Arc::clone(&self.capture_backend),
+            status_publisher: self.status_publisher.clone(),
+            latency_instrumentation: self.latency_instrumentation.clone(),
+        }
+    }
+
+    pub fn start(&self) -> Result<Box<dyn ActiveAudioCapture>> {
+        self.capture_backend.start(
+            AudioCaptureStart::new(
+                self.session.clone(),
+                self.artifact.clone(),
+                self.input_source,
+                self.status_publisher.clone(),
+            )
+            .with_latency_instrumentation(self.latency_instrumentation.clone()),
+        )
+    }
+}
+
+pub struct RuntimeCaptureCancellationWork {
+    active_capture: RuntimeActiveCapture,
+    completion: RuntimeCancellationCompletion,
+}
+
+impl RuntimeCaptureCancellationWork {
+    fn new(
+        active_capture: RuntimeActiveCapture,
+        capture_store: CaptureStore,
+        status_publisher: StatusPublisher,
+    ) -> Self {
+        Self {
+            active_capture,
+            completion: RuntimeCancellationCompletion::new(capture_store, status_publisher),
+        }
+    }
+
+    pub fn session(&self) -> &CaptureSession {
+        self.active_capture.session()
+    }
+
+    pub fn artifact(&self) -> &signal_listener::DurableAudioArtifact {
+        self.active_capture.artifact()
+    }
+
+    pub fn requested_reply(&self) -> Output {
+        self.completion
+            .requested_reply(self.session().clone(), self.artifact().clone())
+    }
+
+    pub fn execute(self) -> Output {
+        match self.active_capture.cancel() {
+            Ok(stopped_capture) => self.completion.complete(stopped_capture),
+            Err(error) => {
+                self.completion.status_publisher.publish_error();
+                error.into_cancel_reply()
+            }
+        }
+    }
+}
+
+pub struct RuntimeCaptureFinalizationWork {
+    active_capture: RuntimeActiveCapture,
+    capture_store: CaptureStore,
+    transcriber: Arc<dyn BatchTranscriber>,
+    output_target_dispatcher: OutputTargetDispatcher,
+    history_store: TranscriptHistoryStore,
+    output_targets: OutputTargets,
+    completion: RuntimeCancellationCompletion,
+}
+
+impl RuntimeCaptureFinalizationWork {
+    fn new(
+        active_capture: RuntimeActiveCapture,
+        capture_store: CaptureStore,
+        transcriber: Arc<dyn BatchTranscriber>,
+        output_target_dispatcher: OutputTargetDispatcher,
+        history_store: TranscriptHistoryStore,
+        output_targets: OutputTargets,
+        status_publisher: StatusPublisher,
+    ) -> Self {
+        Self {
+            active_capture,
+            capture_store: capture_store.clone(),
+            transcriber,
+            output_target_dispatcher,
+            history_store,
+            output_targets,
+            completion: RuntimeCancellationCompletion::new(capture_store, status_publisher),
+        }
+    }
+
+    pub fn session(&self) -> &CaptureSession {
+        self.active_capture.session()
+    }
+
+    pub fn artifact(&self) -> &signal_listener::DurableAudioArtifact {
+        self.active_capture.artifact()
+    }
+
+    pub fn execute(self, cancellation: CaptureCancellationSignal) -> Output {
+        let RuntimeCaptureFinalizationWork {
+            active_capture,
+            capture_store,
+            transcriber,
+            output_target_dispatcher,
+            history_store,
+            output_targets,
+            completion,
+        } = self;
+        let stopped_capture = match active_capture.stop() {
+            Ok(stopped_capture) => stopped_capture,
+            Err(error) => {
+                completion.status_publisher.publish_error();
+                return error.into_stop_reply();
+            }
+        };
+        if cancellation.is_requested() {
+            return completion.complete(stopped_capture);
+        }
+        if let Err(error) = capture_store.mark_terminal_capture(
+            stopped_capture.session(),
+            crate::TerminalCaptureState::Ready,
+        ) {
+            completion.status_publisher.publish_error();
+            return error.into_stop_reply();
+        }
+        let compact_artifact =
+            match Self::compact_artifact_after_stop(&capture_store, &stopped_capture) {
+                Ok(artifact) => artifact,
                 Err(error) => {
-                    self.status_publisher.publish_error();
-                    return Err(error);
+                    capture_store
+                        .mark_transcription_failed(stopped_capture.session())
+                        .ok();
+                    completion.status_publisher.publish_error();
+                    return error.into_stop_reply();
                 }
+            };
+        if cancellation.is_requested() {
+            return completion.cancelled(stopped_capture.session().clone(), compact_artifact);
+        }
+        let transcript_text = match Self::transcribe(
+            &capture_store,
+            &transcriber,
+            stopped_capture.session(),
+            compact_artifact.clone(),
+        ) {
+            Ok(transcript_text) => transcript_text,
+            Err(error) => {
+                capture_store
+                    .mark_transcription_failed(stopped_capture.session())
+                    .ok();
+                completion.status_publisher.publish_error();
+                return error.into_stop_reply();
+            }
+        };
+        if cancellation.is_requested() {
+            return completion.cancelled(stopped_capture.session().clone(), compact_artifact);
+        }
+        if Self::record_history(&history_store, stopped_capture.session(), &transcript_text)
+            && let Err(error) = capture_store.mark_terminal_capture(
+                stopped_capture.session(),
+                crate::TerminalCaptureState::Completed,
+            )
+        {
+            completion.status_publisher.publish_error();
+            return error.into_stop_reply();
+        }
+        if cancellation.is_requested() {
+            return completion.cancelled(stopped_capture.session().clone(), compact_artifact);
+        }
+        let delivery_outcomes = output_target_dispatcher.deliver(&output_targets, &transcript_text);
+        RuntimeDeliveryStatus::from_outcomes(&delivery_outcomes)
+            .publish(&completion.status_publisher);
+        Output::Stopped(CaptureStopped {
+            stopped_session: StoppedSession::new(stopped_capture.session().clone()),
+            durable_audio_artifact: compact_artifact,
+            transcript_text,
+            delivery_outcomes,
+        })
+    }
+
+    fn compact_artifact_after_stop(
+        capture_store: &CaptureStore,
+        stopped_capture: &StoppedCapture,
+    ) -> Result<signal_listener::DurableAudioArtifact> {
+        if stopped_capture
+            .artifact()
+            .path()
+            .as_str()
+            .ends_with(".webm")
+        {
+            capture_store.finalize_live_compact_for_session(stopped_capture.session())
+        } else {
+            capture_store.compact_audio_for_session(stopped_capture.session())
+        }
+    }
+
+    fn transcribe(
+        capture_store: &CaptureStore,
+        transcriber: &Arc<dyn BatchTranscriber>,
+        session: &CaptureSession,
+        compact_artifact: signal_listener::DurableAudioArtifact,
+    ) -> Result<TranscriptText> {
+        let input = BatchTranscriptionInput::webm_opus(std::path::PathBuf::from(
+            compact_artifact.path().as_str(),
+        ));
+        let transcript = transcriber.transcribe(BatchTranscriptionRequest::new_with_input(
+            compact_artifact,
+            input,
+        ))?;
+        capture_store.clear_transcription_failure(session)?;
+        Ok(transcript)
+    }
+
+    fn record_history(
+        history_store: &TranscriptHistoryStore,
+        session: &CaptureSession,
+        transcript_text: &TranscriptText,
+    ) -> bool {
+        TranscriptHistoryEntry::recorded_now(session.clone(), transcript_text.clone())
+            .and_then(|entry| history_store.append(&entry))
+            .is_ok()
+    }
+}
+
+struct RuntimeCancellationCompletion {
+    capture_store: CaptureStore,
+    status_publisher: StatusPublisher,
+}
+
+impl RuntimeCancellationCompletion {
+    fn new(capture_store: CaptureStore, status_publisher: StatusPublisher) -> Self {
+        Self {
+            capture_store,
+            status_publisher,
+        }
+    }
+
+    fn requested_reply(
+        &self,
+        session: CaptureSession,
+        artifact: signal_listener::DurableAudioArtifact,
+    ) -> Output {
+        Output::CancellationRequested(CaptureCancellationRequested {
+            cancellation_requested_session: CancellationRequestedSession::new(session),
+            durable_audio_artifact: artifact,
+        })
+    }
+
+    fn complete(&self, stopped_capture: StoppedCapture) -> Output {
+        self.cancelled(
+            stopped_capture.session().clone(),
+            stopped_capture.artifact().clone(),
+        )
+    }
+
+    fn cancelled(
+        &self,
+        session: CaptureSession,
+        artifact: signal_listener::DurableAudioArtifact,
+    ) -> Output {
+        match self
+            .capture_store
+            .mark_terminal_capture(&session, crate::TerminalCaptureState::Cancelled)
+        {
+            Ok(()) => {
+                self.status_publisher.publish_cancelled();
+                Output::Cancelled(CaptureCancelled {
+                    cancelled_session: CancelledSession::new(session),
+                    durable_audio_artifact: artifact,
+                })
+            }
+            Err(error) => {
+                self.status_publisher.publish_error();
+                error.into_cancel_reply()
             }
         }
     }

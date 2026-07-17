@@ -22,6 +22,7 @@ pub enum ListenerStatusState {
     Starting,
     Recording,
     Transcribing,
+    Cancelling,
     Cancelled,
     Copied,
     Error,
@@ -34,6 +35,7 @@ impl ListenerStatusState {
             Self::Starting => "starting",
             Self::Recording => "recording",
             Self::Transcribing => "transcribing",
+            Self::Cancelling => "cancelling",
             Self::Cancelled => "cancelled",
             Self::Copied => "copied",
             Self::Error => "error",
@@ -108,6 +110,10 @@ impl ListenerStatusEvent {
 
     pub fn transcribing() -> Self {
         Self::new(ListenerStatusState::Transcribing, MicrophoneLevel::silent())
+    }
+
+    pub fn cancelling() -> Self {
+        Self::new(ListenerStatusState::Cancelling, MicrophoneLevel::silent())
     }
 
     pub fn cancelled() -> Self {
@@ -223,6 +229,10 @@ impl StatusPublisher {
 
     pub fn publish_transcribing(&self) {
         self.publish(ListenerStatusEvent::transcribing());
+    }
+
+    pub fn publish_cancelling(&self) {
+        self.publish(ListenerStatusEvent::cancelling());
     }
 
     pub fn publish_cancelled(&self) {
