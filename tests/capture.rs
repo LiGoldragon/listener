@@ -539,6 +539,36 @@ fn interrupted_live_partial_is_discarded_and_recovered_from_durable_log() {
 }
 
 #[test]
+fn maintenance_does_not_redecode_nonempty_canonical_artifacts() {
+    let fixture = CaptureWriterFixture::new();
+    let store = CaptureStore::new(fixture.directory.path().join("captures"));
+    store.prepare().expect("prepare capture store");
+    let session = CaptureSession::new(90);
+    let canonical = store.compact_audio_path_for_session(&session);
+    fs::write(&canonical, b"atomically published compact artifact")
+        .expect("write published compact artifact");
+    store
+        .mark_terminal_capture(&session, TerminalCaptureState::Ready)
+        .expect("mark canonical capture terminal");
+
+    store
+        .migrate_terminal_captures()
+        .expect("maintain published compact artifact");
+
+    assert!(
+        canonical.exists(),
+        "maintenance must trust the nonempty atomically published canonical artifact"
+    );
+    assert_eq!(
+        store
+            .terminal_capture_state(&session)
+            .expect("read terminal state"),
+        Some(TerminalCaptureState::Ready),
+        "metadata-only maintenance must not convert a retained canonical artifact into failure"
+    );
+}
+
+#[test]
 fn recovery_discards_unusable_terminal_compact_artifact_without_a_recovery_log() {
     let fixture = CaptureWriterFixture::new();
     let store = CaptureStore::new(fixture.directory.path().join("captures"));

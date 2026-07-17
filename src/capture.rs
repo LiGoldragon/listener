@@ -609,7 +609,12 @@ impl CaptureStore {
     fn migrate_terminal_capture(&self, session: &CaptureSession) -> Result<()> {
         let canonical = self.compact_audio_path_for_session(session);
         if canonical.exists() {
-            match OpusWebmEncoder::from_environment().validate_webm(&canonical) {
+            // Canonical output is atomically renamed only after its producing
+            // stop or migration path has fully decoded and validated Opus.
+            // Startup maintenance must stay metadata-bounded, so it trusts a
+            // nonempty already-published canonical artifact rather than
+            // decoding every retained recording again.
+            match CompactAudioArtifact::new(&canonical).validate() {
                 Ok(()) => {
                     self.remove_recovery_material(session)?;
                     for legacy in self.legacy_container_paths(session)? {
@@ -618,10 +623,11 @@ impl CaptureStore {
                     self.ensure_terminal_capture(session, TerminalCaptureState::Ready)?;
                     return Ok(());
                 }
-                Err(_) => {
+                Err(Error::CompactAudioInvalid { .. }) => {
                     self.remove_if_exists(&canonical)?;
                     self.mark_terminal_capture(session, TerminalCaptureState::Failed)?;
                 }
+                Err(error) => return Err(error),
             }
         }
 

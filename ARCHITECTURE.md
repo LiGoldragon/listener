@@ -122,9 +122,11 @@ the first incomplete or corrupt tail to the last valid record boundary.
 Recovery is idempotent. At daemon startup, Listener snapshots existing capture
 sessions and performs one background maintenance pass over only that snapshot:
 it recovers every crash-survived log, but migrates, cleans intermediates, and
-applies retention only to sessions with terminal metadata. An unterminalized
-`.listenerlog` remains durable recovery evidence and is never encoded or
-reaped by that pass. `status` never scans storage; capture allocation skips any
+applies retention only to sessions with terminal metadata. Previously atomically
+published nonempty WebM artifacts are checked by metadata only during this pass;
+the full Opus decode validation happens before their atomic publication, keeping
+startup maintenance light. An unterminalized `.listenerlog` remains durable
+recovery evidence and is never encoded or reaped by that pass. `status` never scans storage; capture allocation skips any
 existing `capture-<session>` artifact family before creating a recovery log,
 including compact, terminal, partial, and unfinalized artifacts. Cancel stops the active capture using the same capture shutdown path
 and returns the retained `.listenerlog` artifact without recovering/exporting
