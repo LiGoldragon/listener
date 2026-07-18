@@ -5,23 +5,30 @@ client for `listener-daemon`; it never reads or mutates captures directly.
 
 ## Commands
 
+Every ordinary invocation takes exactly one inline `signal-listener::Input`
+NOTA object. These are the canonical forms emitted and parsed by the schema:
+
 ```sh
-listener toggle
-listener status
-listener start
-listener stop <session>
-listener cancel <session>
-listener list
-listener retry <session>
+listener 'Toggle.{}'
+listener 'Status.{}'
+listener 'Start.{}'
+listener 'Stop.7'
+listener 'Cancel.7'
+listener 'ListCaptures.{}'
+listener 'Retry.7'
 ```
 
-`toggle` atomically starts an idle daemon or stops its active capture; it is the
-hotkey-facing command because it never races a separate `status` read. `start`
-returns a session number. Pass that number to `stop` or `cancel`. `status`
-reports the in-memory active session without exposing transcript text or running
-recovery, migration, or retention work.
+`Toggle.{}` atomically starts an idle daemon or immediately requests cancellation
+of its active capture; it is the hotkey-facing request because it never races a
+separate status read. `Cancel.<session>` is the explicit immediate-cancellation
+request and retains the capture artifact without transcription or delivery.
+`Stop.<session>` remains the distinct graceful-stop request: it finalizes,
+transcribes, and delivers. `Status.{}` reports the in-memory active session
+without exposing transcript text or running recovery, migration, or retention
+work. Positional subcommands such as `listener toggle` and `listener stop 7`
+are not supported.
 
-`list` returns one typed record per known capture. Its state is:
+`ListCaptures.{}` returns one typed record per known capture. Its state is:
 
 - `Recovering`: a crash-recovery `.listenerlog` is still present;
 - `Retryable`: a compact WebM/Opus artifact is ready to transcribe;
@@ -31,16 +38,16 @@ recovery, migration, or retention work.
   Listener history; it remains available until its three-day terminal retention
   horizon expires.
 
-Terminal captures remain in `list` while their canonical audio is retained.
+Terminal captures remain in `ListCaptures.{}` while their canonical audio is retained.
 Retry a failed capture after inspecting it:
 
 ```sh
-listener list
-listener retry 87
-listener list
+listener 'ListCaptures.{}'
+listener 'Retry.87'
+listener 'ListCaptures.{}'
 ```
 
-`retry` uses the retained compact artifact (or first recovers and compacts a
+`Retry.<session>` uses the retained compact artifact (or first recovers and compacts a
 legacy `.listenerlog`), calls the configured OpenAI transcription backend, then
 sends the transcript to configured outputs and appends it to history. A failed
 retry leaves its compact artifact in place and marks it `Failed`; it is not
@@ -58,7 +65,7 @@ Opus `voip` application. This worker never blocks the capture writer; a failed
 encoder leaves the durable log intact for recovery.
 
 The `.part` file is an unfinished container, not a retry artifact and is not
-shown by `listener list`. On normal `stop`, Listener closes the encoder input,
+shown by `ListCaptures.{}`. On normal `Stop.<session>`, Listener closes the encoder input,
 waits only for the active container to flush and finalizes it atomically as
 `capture-<session>.webm`. It validates that the container decodes as Opus before
 removing the active `.listenerlog` and any raw PCM export. This WebM extension
@@ -101,15 +108,15 @@ Run the daemon through the installed service; the ordinary CLI talks to its
 working Unix socket. The normal user-visible workflow is:
 
 ```sh
-listener toggle
+listener 'Toggle.{}'
 # dictate
-listener toggle
+listener 'Toggle.{}'
 listener-recall
 ```
 
-`cancel <session>` stops active recording and retains its recoverable log; it
+`Cancel.<session>` stops active recording and retains its recoverable log; it
 does not upload or deliver text. It can later be recovered with
-`listener retry <session>`.
+`Retry.<session>`.
 
 Environment configuration:
 
