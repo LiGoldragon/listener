@@ -18,10 +18,10 @@ listener 'ListCaptures.{}'
 listener 'Retry.7'
 ```
 
-`Toggle.{}` atomically starts an idle daemon or immediately requests cancellation
-of its active capture; it is the hotkey-facing request because it never races a
-separate status read. `Cancel.<session>` is the explicit immediate-cancellation
-request and retains the capture artifact without transcription or delivery.
+`Toggle.{}` atomically starts an idle daemon or gracefully completes its active
+recording; it is the hotkey-facing request because it never races a separate
+status read. `Cancel.<session>` is the explicit immediate-cancellation request
+and retains the capture artifact without transcription or delivery.
 `Stop.<session>` remains the distinct graceful-stop request: it finalizes,
 transcribes, and delivers. `Status.{}` reports the in-memory active session
 without exposing transcript text or running recovery, migration, or retention

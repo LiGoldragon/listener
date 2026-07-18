@@ -1315,7 +1315,7 @@ fn actor_toggle_and_cancel_repeat_transcribing_cancellation_without_delivery_or_
 }
 
 #[test]
-fn atomic_toggle_starts_then_cancels_the_daemon_owned_active_capture() {
+fn toggle_starts_then_gracefully_completes_the_active_capture() {
     let fixture = RuntimeFixture::new();
     let mut runtime = fixture.runtime();
 
@@ -1327,11 +1327,49 @@ fn atomic_toggle_starts_then_cancels_the_daemon_owned_active_capture() {
 
     let second = runtime.handle_input(Input::Toggle(signal_listener::ToggleCapture {}));
     match second {
-        Output::Cancelled(cancelled) => {
-            assert_eq!(cancelled.cancelled_session.payload(), &session)
-        }
-        other => panic!("expected toggle to cancel the same capture, got {other:?}"),
+        Output::Stopped(stopped) => assert_eq!(stopped.stopped_session.payload(), &session),
+        other => panic!("expected toggle to gracefully complete the same capture, got {other:?}"),
     }
+    assert_eq!(fixture.transcription_inputs().len(), 1);
+    assert_eq!(
+        fixture.delivered_texts(),
+        vec!["transcribed text".to_owned()]
+    );
+    assert_eq!(
+        fixture.recorded_history(),
+        vec!["transcribed text".to_owned()]
+    );
+}
+
+#[test]
+fn actor_toggle_completes_recording_with_one_transcription_and_delivery() {
+    let fixture = RuntimeFixture::new();
+    let server = ListenerSocketServer::new(fixture.configuration(), fixture.runtime());
+
+    let session = match server
+        .handle_input(Input::Toggle(signal_listener::ToggleCapture {}))
+        .expect("start through actor")
+    {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected first toggle to start capture, got {other:?}"),
+    };
+
+    match server
+        .handle_input(Input::Toggle(signal_listener::ToggleCapture {}))
+        .expect("complete through actor")
+    {
+        Output::Stopped(stopped) => assert_eq!(stopped.stopped_session.payload(), &session),
+        other => panic!("expected second toggle to gracefully complete capture, got {other:?}"),
+    }
+    assert_eq!(fixture.transcription_inputs().len(), 1);
+    assert_eq!(
+        fixture.delivered_texts(),
+        vec!["transcribed text".to_owned()]
+    );
+    assert_eq!(
+        fixture.recorded_history(),
+        vec!["transcribed text".to_owned()]
+    );
 }
 
 #[test]

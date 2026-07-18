@@ -263,10 +263,12 @@ impl ListenerOperationActor {
     }
 
     fn toggle(&mut self, reply_sender: mpsc::SyncSender<Output>) {
-        if matches!(self.operation, ListenerOperationState::Idle) {
-            self.begin_start(reply_sender);
-        } else {
-            self.request_cancellation(reply_sender);
+        match &self.operation {
+            ListenerOperationState::Idle => self.begin_start(reply_sender),
+            ListenerOperationState::Capturing { session, .. } => {
+                self.stop(session.clone(), reply_sender)
+            }
+            _ => self.request_cancellation(reply_sender),
         }
     }
 

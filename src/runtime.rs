@@ -210,7 +210,8 @@ impl ListenerRuntime {
     }
 
     /// Atomically chooses the next capture transition from daemon-owned state.
-    /// An active capture is cancelled rather than finalized for transcription.
+    /// An active capture is finalized, transcribed, and delivered through the
+    /// same graceful path as an explicit stop.
     pub fn toggle(&mut self, _request: ToggleCapture) -> Result<Output> {
         match self
             .active_capture
@@ -218,7 +219,7 @@ impl ListenerRuntime {
             .map(RuntimeActiveCapture::session)
             .cloned()
         {
-            Some(session) => self.cancel(CancelCapture::new(session)),
+            Some(session) => self.stop(StopCapture::new(session)),
             None => self.start(StartCapture {}),
         }
     }

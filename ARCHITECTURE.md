@@ -70,7 +70,7 @@ store directly, or bypass the daemon path.
 - `src/daemon.rs` owns the blocking Unix-socket daemon loop.
 - `src/runtime.rs` lowers `signal-listener` operations into runtime state and
   effects. Status is a direct projection of that state; `Toggle` atomically
-  selects start or stop from the daemon-owned active slot.
+  selects start or graceful completion from the daemon-owned active slot.
 - `src/capture.rs`, `src/transcription.rs`, and `src/delivery.rs` hold the
   explicit effect seams.
 - `src/status.rs` owns the local newline-JSON status stream and microphone
@@ -194,8 +194,8 @@ Ordinary lifecycle conflicts stay on the public reply surface as typed
 `signal-listener` outcomes: start while recording reports the active session,
 stop or cancel while idle reports no active capture, and stop or cancel with a
 different session reports both active and requested sessions. `Toggle` selects
-start or immediate cancellation atomically in the daemon-owned lifecycle slot,
-so hotkeys never read status to choose a follow-up operation. Cancellation
+start or graceful completion atomically in the daemon-owned lifecycle slot, so
+hotkeys never read status to choose a follow-up operation. Explicit `Cancel`
 acknowledges immediately from startup, recording, finalization, transcription,
 and an already-cancelling phase; repeated requests identify the same session.
 Graceful `Stop` remains a distinct explicit operation that finalizes,
