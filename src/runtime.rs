@@ -1,6 +1,7 @@
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 
 use signal_listener::{
@@ -135,6 +136,14 @@ impl ListenerRuntime {
             Input::Toggle(request) => self
                 .toggle(request)
                 .unwrap_or_else(Error::into_toggle_reply),
+            Input::AcquireMaintenance(_) => Error::NotImplemented {
+                surface: "listener maintenance lease actor",
+            }
+            .into_unimplemented_reply(OperationKind::AcquireMaintenance),
+            Input::ReleaseMaintenance(_) => Error::NotImplemented {
+                surface: "listener maintenance lease actor",
+            }
+            .into_unimplemented_reply(OperationKind::ReleaseMaintenance),
         }
     }
 
@@ -478,6 +487,10 @@ impl ListenerRuntime {
         ))
     }
 
+    pub fn publish_finalizing(&self) {
+        self.status_publisher.publish_finalizing();
+    }
+
     pub fn publish_cancelling(&self) {
         self.status_publisher.publish_cancelling();
     }
@@ -620,6 +633,12 @@ impl RuntimeCaptureCancellationWork {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureFinalizationPhase {
+    Finalizing,
+    Transcribing,
+}
+
 pub struct RuntimeCaptureFinalizationWork {
     active_capture: RuntimeActiveCapture,
     capture_store: CaptureStore,
@@ -659,7 +678,11 @@ impl RuntimeCaptureFinalizationWork {
         self.active_capture.artifact()
     }
 
-    pub fn execute(self, cancellation: CaptureCancellationSignal) -> Output {
+    pub fn execute(
+        self,
+        cancellation: CaptureCancellationSignal,
+        phase_sender: mpsc::Sender<CaptureFinalizationPhase>,
+    ) -> Output {
         let RuntimeCaptureFinalizationWork {
             active_capture,
             capture_store,
@@ -700,6 +723,7 @@ impl RuntimeCaptureFinalizationWork {
         if cancellation.is_requested() {
             return completion.cancelled(stopped_capture.session().clone(), compact_artifact);
         }
+        let _ = phase_sender.send(CaptureFinalizationPhase::Transcribing);
         let transcript_text = match Self::transcribe(
             &capture_store,
             &transcriber,
@@ -865,7 +889,7 @@ impl RuntimeDeliveryStatus {
 
     fn publish(&self, status_publisher: &StatusPublisher) {
         match self {
-            Self::Delivered => status_publisher.publish_copied(),
+            Self::Delivered => status_publisher.publish_delivered(),
             Self::Failed => status_publisher.publish_error(),
             Self::NoTargets => status_publisher.publish_idle(),
         }

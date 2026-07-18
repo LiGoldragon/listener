@@ -67,7 +67,8 @@ store directly, or bypass the daemon path.
 - `src/configuration.rs` wraps the shared daemon configuration contract and
   proves binary archive round trips.
 - `src/command.rs` is the thin ordinary CLI client.
-- `src/daemon.rs` owns the blocking Unix-socket daemon loop.
+- `src/daemon.rs` owns the serialized listener lifecycle actor, concurrent
+  socket readers, and connection-bound maintenance leases.
 - `src/runtime.rs` lowers `signal-listener` operations into runtime state and
   effects. Status is a direct projection of that state; `Toggle` atomically
   selects start or graceful completion from the daemon-owned active slot.
@@ -182,7 +183,7 @@ command requests low-latency delivery, starts before FFmpeg setup, and the
 capture writer samples live levels in roughly 50 ms PCM windows instead of
 waiting for the `.listenerlog` maximum record payload. The socket acceptor
 blocks for clients and the broadcaster blocks for events or the terminal-idle
-deadline; the former 25 ms polling wakeup is absent. Copied, cancelled, and
+deadline; the former 25 ms polling wakeup is absent. Delivered, cancelled, and
 error events are terminal UI events and the stream returns to idle after a
 short delay. Status clients are written nonblocking so a slow reader is dropped
 instead of blocking publication to other clients. When
@@ -193,13 +194,16 @@ operation performs no instrumentation I/O.
 Ordinary lifecycle conflicts stay on the public reply surface as typed
 `signal-listener` outcomes: start while recording reports the active session,
 stop or cancel while idle reports no active capture, and stop or cancel with a
-different session reports both active and requested sessions. `Toggle` selects
-start or graceful completion atomically in the daemon-owned lifecycle slot, so
-hotkeys never read status to choose a follow-up operation. Explicit `Cancel`
-acknowledges immediately from startup, recording, finalization, transcription,
-and an already-cancelling phase; repeated requests identify the same session.
-Graceful `Stop` remains a distinct explicit operation that finalizes,
-transcribes, and delivers. The status stream publishes `cancelling` before the
-terminal `cancelled` event, while the compatible public status reply retains
-the active session until the cancellation worker completes. These outcomes are
-not lowered to `RequestUnimplemented`.
+different session reports both active and requested sessions. `Stop` and a
+recording `Toggle` transition once to finalizing and promptly reply
+`CompletionRequested`; the finalizer then compacts, transcribes, and delivers
+without holding the socket actor. A second graceful request for that session
+repeats the truthful acknowledgement instead of starting another finalizer.
+`Toggle` never turns into discard: it reports the in-progress graceful state
+while startup/finalization proceeds. Explicit `Cancel` alone suppresses work;
+it acknowledges immediately from startup, recording, finalization,
+transcription, and an already-cancelling phase. Status exposes capturing,
+finalizing, transcribing, delivered, and error transitions without transcript
+text. The maintenance queue gates new starts from its FIFO front, grants only
+when this actor is idle, and drops its owner on connection EOF or daemon exit.
+These outcomes are not lowered to `RequestUnimplemented`.

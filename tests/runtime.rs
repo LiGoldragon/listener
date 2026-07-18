@@ -12,10 +12,11 @@ use listener::daemon::ListenerSocketServer;
 use listener::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, BatchTranscriber,
     BatchTranscriptionInput, BatchTranscriptionInputFormat, BatchTranscriptionRequest,
-    Configuration, HistoryLimit, ListenerRuntime, OutputTargetDispatcher, RecordingAudioFormat,
-    RecordingInputSource, RecordingLog, RecordingLogHeader, RecordingLogWriter, RecordingStartTime,
-    StatusEventRecorder, StatusPublisher, StatusStreamServer, TranscriptDelivery,
-    TranscriptDeliveryRequest, TranscriptHistoryStore,
+    Configuration, HistoryLimit, ListenerMaintenanceClient, ListenerRuntime,
+    OutputTargetDispatcher, RecordingAudioFormat, RecordingInputSource, RecordingLog,
+    RecordingLogHeader, RecordingLogWriter, RecordingStartTime, StatusEventRecorder,
+    StatusPublisher, StatusStreamServer, TranscriptDelivery, TranscriptDeliveryRequest,
+    TranscriptHistoryStore,
 };
 use signal_frame::{ExchangeIdentifier, ExchangeLane, LaneSequence, Reply, SessionEpoch, SubReply};
 use signal_listener::{
@@ -525,10 +526,11 @@ impl CancellationProbe {
             .expect("read active lifecycle status through actor")
         {
             Output::StatusReported(report) => match report.status() {
-                CaptureStatus::Capturing(ActiveCapture {
-                    active_capture_session,
-                    ..
-                }) => active_capture_session.payload().clone(),
+                CaptureStatus::Capturing(active)
+                | CaptureStatus::Finalizing(active)
+                | CaptureStatus::Transcribing(active) => {
+                    active.active_capture_session.payload().clone()
+                }
                 other => panic!("expected active lifecycle status, got {other:?}"),
             },
             other => panic!("expected status reply, got {other:?}"),
@@ -537,6 +539,32 @@ impl CancellationProbe {
 
     fn assert_pending_for_session(server: &ListenerSocketServer, session: &CaptureSession) {
         assert_eq!(Self::active_session(server), *session);
+    }
+
+    fn assert_completion_requested(
+        server: &ListenerSocketServer,
+        input: Input,
+        session: &CaptureSession,
+    ) {
+        match server
+            .handle_input(input)
+            .expect("request graceful completion through actor")
+        {
+            Output::CompletionRequested(requested) => {
+                assert_eq!(requested.completion_requested_session.payload(), session)
+            }
+            other => panic!("expected completion acknowledgement, got {other:?}"),
+        }
+    }
+
+    fn assert_toggle_preserves_active(server: &ListenerSocketServer, session: &CaptureSession) {
+        match server
+            .handle_input(Input::Toggle(signal_listener::ToggleCapture {}))
+            .expect("toggle through actor")
+        {
+            Output::AlreadyActive(active) => assert_eq!(active.payload().payload(), session),
+            other => panic!("expected active capture to remain intact, got {other:?}"),
+        }
     }
 
     fn wait_until_idle(server: &ListenerSocketServer) {
@@ -553,6 +581,29 @@ impl CancellationProbe {
                 }
                 Output::StatusReported(report) => {
                     panic!("expected idle after cancellation, got {report:?}")
+                }
+                other => panic!("expected status reply, got {other:?}"),
+            }
+        }
+    }
+
+    fn wait_until_delivered(server: &ListenerSocketServer, session: &CaptureSession) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match server
+                .handle_input(Input::Status(StatusRequest {}))
+                .expect("read completion status through actor")
+            {
+                Output::StatusReported(report)
+                    if report.status() == &CaptureStatus::Delivered(session.clone()) =>
+                {
+                    return;
+                }
+                Output::StatusReported(_) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Output::StatusReported(report) => {
+                    panic!("expected delivered completion status, got {report:?}")
                 }
                 other => panic!("expected status reply, got {other:?}"),
             }
@@ -1043,8 +1094,8 @@ fn cancel_stops_capture_retains_artifact_and_skips_transcription_and_delivery() 
     assert!(
         !events
             .iter()
-            .any(|event| event.state() == listener::ListenerStatusState::Copied),
-        "cancel must not publish copied status, got {events:?}"
+            .any(|event| event.state() == listener::ListenerStatusState::Delivered),
+        "cancel must not publish delivered status, got {events:?}"
     );
     for event in events {
         let line = event.json_line().expect("status event json");
@@ -1086,8 +1137,8 @@ fn status_events_cover_recording_transcribing_copied_without_transcript_text() {
     assert!(
         events
             .iter()
-            .any(|event| event.state() == listener::ListenerStatusState::Copied),
-        "expected copied status event, got {events:?}"
+            .any(|event| event.state() == listener::ListenerStatusState::Delivered),
+        "expected delivered status event, got {events:?}"
     );
     assert!(
         events
@@ -1156,11 +1207,7 @@ fn actor_toggle_and_cancel_acknowledge_startup_cancellation_without_blocking() {
     CancellationProbe::assert_immediate(|| {
         CancellationProbe::assert_requested(&server, Input::cancel(session.clone()), &session)
     });
-    CancellationProbe::assert_requested(
-        &server,
-        Input::Toggle(signal_listener::ToggleCapture {}),
-        &session,
-    );
+    CancellationProbe::assert_toggle_preserves_active(&server, &session);
     CancellationProbe::assert_pending_for_session(&server, &session);
 
     gate.release();
@@ -1234,7 +1281,7 @@ fn actor_toggle_and_cancel_repeat_finalizing_cancellation_without_transcribing()
     gate.wait_until_entered();
 
     CancellationProbe::assert_immediate(|| {
-        CancellationProbe::assert_requested(
+        CancellationProbe::assert_completion_requested(
             &server,
             Input::Toggle(signal_listener::ToggleCapture {}),
             &session,
@@ -1245,8 +1292,10 @@ fn actor_toggle_and_cancel_repeat_finalizing_cancellation_without_transcribing()
     gate.release();
 
     match stop_thread.join().expect("stop thread joins") {
-        Output::Cancelled(cancelled) => assert_eq!(cancelled.cancelled_session.payload(), &session),
-        other => panic!("expected cancellation to supersede stop completion, got {other:?}"),
+        Output::CompletionRequested(requested) => {
+            assert_eq!(requested.completion_requested_session.payload(), &session)
+        }
+        other => panic!("expected prompt completion acknowledgement, got {other:?}"),
     }
     CancellationProbe::wait_until_idle(&server);
     assert!(fixture.capture_path(session.value()).exists());
@@ -1283,7 +1332,7 @@ fn actor_toggle_and_cancel_repeat_transcribing_cancellation_without_delivery_or_
     gate.wait_until_entered();
 
     CancellationProbe::assert_immediate(|| {
-        CancellationProbe::assert_requested(
+        CancellationProbe::assert_completion_requested(
             &server,
             Input::Toggle(signal_listener::ToggleCapture {}),
             &session,
@@ -1294,8 +1343,10 @@ fn actor_toggle_and_cancel_repeat_transcribing_cancellation_without_delivery_or_
     gate.release();
 
     match stop_thread.join().expect("stop thread joins") {
-        Output::Cancelled(cancelled) => assert_eq!(cancelled.cancelled_session.payload(), &session),
-        other => panic!("expected cancellation to supersede stop completion, got {other:?}"),
+        Output::CompletionRequested(requested) => {
+            assert_eq!(requested.completion_requested_session.payload(), &session)
+        }
+        other => panic!("expected prompt completion acknowledgement, got {other:?}"),
     }
     CancellationProbe::wait_until_idle(&server);
     assert_eq!(fixture.transcription_inputs().len(), 1);
@@ -1354,13 +1405,31 @@ fn actor_toggle_completes_recording_with_one_transcription_and_delivery() {
         other => panic!("expected first toggle to start capture, got {other:?}"),
     };
 
-    match server
-        .handle_input(Input::Toggle(signal_listener::ToggleCapture {}))
-        .expect("complete through actor")
-    {
-        Output::Stopped(stopped) => assert_eq!(stopped.stopped_session.payload(), &session),
-        other => panic!("expected second toggle to gracefully complete capture, got {other:?}"),
-    }
+    CancellationProbe::assert_completion_requested(
+        &server,
+        Input::Toggle(signal_listener::ToggleCapture {}),
+        &session,
+    );
+    CancellationProbe::wait_until_delivered(&server, &session);
+    let events = fixture.status_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state() == listener::ListenerStatusState::Finalizing),
+        "expected finalizing state, got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state() == listener::ListenerStatusState::Transcribing),
+        "expected transcribing state, got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state() == listener::ListenerStatusState::Delivered),
+        "expected delivered state, got {events:?}"
+    );
     assert_eq!(fixture.transcription_inputs().len(), 1);
     assert_eq!(
         fixture.delivered_texts(),
@@ -1370,6 +1439,89 @@ fn actor_toggle_completes_recording_with_one_transcription_and_delivery() {
         fixture.recorded_history(),
         vec!["transcribed text".to_owned()]
     );
+}
+
+#[test]
+fn connection_bound_maintenance_lease_gates_starts_until_explicit_release() {
+    let fixture = RuntimeFixture::new();
+    let server = Arc::new(ListenerSocketServer::new(
+        fixture.configuration(),
+        fixture.runtime(),
+    ));
+    let session = match server
+        .handle_input(Input::Start(StartCapture {}))
+        .expect("start capture")
+    {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected started capture, got {other:?}"),
+    };
+
+    let (client_stream, daemon_stream) = UnixStream::pair().expect("maintenance socket pair");
+    let persistent_server = Arc::clone(&server);
+    let persistent_connection = thread::spawn(move || {
+        persistent_server
+            .handle_persistent_connection(daemon_stream)
+            .expect("persistent connection")
+    });
+    let acquire = thread::spawn(move || {
+        let mut client = ListenerMaintenanceClient::from_stream(client_stream);
+        let epoch = client.acquire().expect("grant after active capture stops");
+        (client, epoch)
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match server
+            .handle_input(Input::Start(StartCapture {}))
+            .expect("check start gate")
+        {
+            Output::MaintenanceLeaseActive(_) => break,
+            Output::AlreadyActive(_) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            other => panic!("expected queued lease to gate starts, got {other:?}"),
+        }
+    }
+
+    match server
+        .handle_input(Input::stop(session.clone()))
+        .expect("stop capture")
+    {
+        Output::CompletionRequested(requested) => {
+            assert_eq!(requested.completion_requested_session.payload(), &session)
+        }
+        other => panic!("expected prompt completion acknowledgement, got {other:?}"),
+    }
+    let (mut client, epoch) = acquire.join().expect("maintenance acquire joins");
+    assert!(epoch.payload().payload() > &0);
+    CancellationProbe::wait_until_delivered(&server, &session);
+    assert!(matches!(
+        server
+            .handle_input(Input::Start(StartCapture {}))
+            .expect("check held lease"),
+        Output::MaintenanceLeaseActive(_)
+    ));
+
+    client.release().expect("explicit lease release");
+    drop(client);
+    persistent_connection
+        .join()
+        .expect("persistent connection joins");
+    let restarted = match server
+        .handle_input(Input::Start(StartCapture {}))
+        .expect("start after release")
+    {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected start after release, got {other:?}"),
+    };
+    match server
+        .handle_input(Input::cancel(restarted))
+        .expect("cancel cleanup")
+    {
+        Output::CancellationRequested(_) => {}
+        other => panic!("expected cleanup cancellation acknowledgement, got {other:?}"),
+    }
+    CancellationProbe::wait_until_idle(&server);
 }
 
 #[test]

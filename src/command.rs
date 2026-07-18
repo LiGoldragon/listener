@@ -69,7 +69,10 @@ impl CommandLine {
 mod tests {
     use super::*;
     use nota::NotaEncode;
-    use signal_listener::{CancelCapture, CaptureSession, StopCapture, ToggleCapture};
+    use signal_listener::{
+        AcquireMaintenanceLease, CancelCapture, CaptureSession, ReleaseMaintenanceLease,
+        StopCapture, ToggleCapture,
+    };
 
     struct CommandLineFixture;
 
@@ -97,6 +100,20 @@ mod tests {
         let stop = CommandLineFixture::input("Stop.7");
         assert_eq!(stop, Input::Stop(StopCapture::new(CaptureSession::new(7))));
         assert_eq!(stop.to_nota(), "Stop.7");
+
+        let acquire = CommandLineFixture::input("AcquireMaintenance.{}");
+        assert_eq!(
+            acquire,
+            Input::AcquireMaintenance(AcquireMaintenanceLease {})
+        );
+        assert_eq!(acquire.to_nota(), "AcquireMaintenance.{}");
+
+        let release = CommandLineFixture::input("ReleaseMaintenance.{}");
+        assert_eq!(
+            release,
+            Input::ReleaseMaintenance(ReleaseMaintenanceLease {})
+        );
+        assert_eq!(release.to_nota(), "ReleaseMaintenance.{}");
     }
 
     #[test]

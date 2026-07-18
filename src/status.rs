@@ -21,10 +21,11 @@ pub enum ListenerStatusState {
     Idle,
     Starting,
     Recording,
+    Finalizing,
     Transcribing,
     Cancelling,
     Cancelled,
-    Copied,
+    Delivered,
     Error,
 }
 
@@ -34,16 +35,17 @@ impl ListenerStatusState {
             Self::Idle => "idle",
             Self::Starting => "starting",
             Self::Recording => "recording",
+            Self::Finalizing => "finalizing",
             Self::Transcribing => "transcribing",
             Self::Cancelling => "cancelling",
             Self::Cancelled => "cancelled",
-            Self::Copied => "copied",
+            Self::Delivered => "delivered",
             Self::Error => "error",
         }
     }
 
     fn returns_to_idle(&self) -> bool {
-        matches!(self, Self::Cancelled | Self::Copied | Self::Error)
+        matches!(self, Self::Cancelled | Self::Delivered | Self::Error)
     }
 }
 
@@ -108,6 +110,10 @@ impl ListenerStatusEvent {
         Self::new(ListenerStatusState::Recording, level)
     }
 
+    pub fn finalizing() -> Self {
+        Self::new(ListenerStatusState::Finalizing, MicrophoneLevel::silent())
+    }
+
     pub fn transcribing() -> Self {
         Self::new(ListenerStatusState::Transcribing, MicrophoneLevel::silent())
     }
@@ -120,8 +126,8 @@ impl ListenerStatusEvent {
         Self::new(ListenerStatusState::Cancelled, MicrophoneLevel::silent())
     }
 
-    pub fn copied() -> Self {
-        Self::new(ListenerStatusState::Copied, MicrophoneLevel::silent())
+    pub fn delivered() -> Self {
+        Self::new(ListenerStatusState::Delivered, MicrophoneLevel::silent())
     }
 
     pub fn error() -> Self {
@@ -227,6 +233,10 @@ impl StatusPublisher {
         self.publish(ListenerStatusEvent::recording(level));
     }
 
+    pub fn publish_finalizing(&self) {
+        self.publish(ListenerStatusEvent::finalizing());
+    }
+
     pub fn publish_transcribing(&self) {
         self.publish(ListenerStatusEvent::transcribing());
     }
@@ -239,8 +249,8 @@ impl StatusPublisher {
         self.publish(ListenerStatusEvent::cancelled());
     }
 
-    pub fn publish_copied(&self) {
-        self.publish(ListenerStatusEvent::copied());
+    pub fn publish_delivered(&self) {
+        self.publish(ListenerStatusEvent::delivered());
     }
 
     pub fn publish_error(&self) {

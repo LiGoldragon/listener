@@ -218,7 +218,15 @@ impl ContractFrameStream {
     }
 
     pub fn send_reply(&mut self, request: ListenerContractRequest, output: Output) -> Result<()> {
-        let frame = output.into_reply_frame(request.exchange());
+        self.send_reply_for_exchange(request.exchange(), output)
+    }
+
+    pub fn send_reply_for_exchange(
+        &mut self,
+        exchange: ExchangeIdentifier,
+        output: Output,
+    ) -> Result<()> {
+        let frame = output.into_reply_frame(exchange);
         self.send_frame(&frame)
     }
 

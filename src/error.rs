@@ -50,6 +50,9 @@ pub enum Error {
         actual: signal_frame::ExchangeIdentifier,
     },
 
+    #[error("unexpected maintenance lease reply: {reply:?}")]
+    UnexpectedMaintenanceLeaseReply { reply: signal_listener::Output },
+
     #[error("invalid command: {message}")]
     InvalidCommand { message: String },
 

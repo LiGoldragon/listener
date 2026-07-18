@@ -31,7 +31,7 @@ pub use capture::{
     CaptureRetentionAge, CaptureRetentionByteLimit, CaptureRetentionPolicy, CaptureStore,
     ProcessAudioCaptureBackend, RecoveredCaptureRecordings, TerminalCaptureState,
 };
-pub use client::ListenerClient;
+pub use client::{ListenerClient, ListenerMaintenanceClient};
 #[cfg(feature = "nota-text")]
 pub use command::CommandLine;
 pub use compact_audio::{CompactAudioArtifact, LiveOpusWebmEncoder, OpusWebmEncoder};
