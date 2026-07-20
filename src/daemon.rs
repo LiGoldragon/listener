@@ -506,16 +506,26 @@ impl ListenerOperationActor {
                 cancellation,
                 phase,
             } => {
-                cancellation.request();
-                self.runtime.publish_cancelling();
-                let output = Self::cancellation_requested(session.clone(), artifact.clone());
-                self.operation = ListenerOperationState::Finalizing {
-                    session,
-                    artifact,
-                    cancellation,
-                    phase,
-                };
-                self.reply(reply, output);
+                if cancellation.request() {
+                    self.runtime.publish_cancelling();
+                    let output = Self::cancellation_requested(session.clone(), artifact.clone());
+                    self.operation = ListenerOperationState::Finalizing {
+                        session,
+                        artifact,
+                        cancellation,
+                        phase,
+                    };
+                    self.reply(reply, output);
+                } else {
+                    let output = Self::completion_requested(session.clone(), artifact.clone());
+                    self.operation = ListenerOperationState::Finalizing {
+                        session,
+                        artifact,
+                        cancellation,
+                        phase,
+                    };
+                    self.reply(reply, output);
+                }
             }
             ListenerOperationState::Cancelling { session, artifact } => {
                 let output = Self::cancellation_requested(session.clone(), artifact.clone());

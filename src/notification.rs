@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use signal_listener::TranscriptText;
 use zbus::zvariant::OwnedValue;
@@ -9,6 +9,7 @@ const EXPIRE_TIMEOUT_MILLISECONDS: i32 = 2500;
 const NOTIFICATION_DESTINATION: &str = "org.freedesktop.Notifications";
 const NOTIFICATION_PATH: &str = "/org/freedesktop/Notifications";
 const NOTIFICATION_INTERFACE: &str = "org.freedesktop.Notifications";
+const NOTIFICATION_METHOD: &str = "Notify";
 
 pub trait SuccessNotifier: Send + Sync {
     fn notify(&self, transcript_text: &TranscriptText);
@@ -50,12 +51,16 @@ impl ClipboardSuccessNotification {
     }
 }
 
-#[derive(Default)]
-pub struct FreedesktopSuccessNotifier;
+/// The only production boundary for desktop notification delivery.
+pub trait FreedesktopNotificationTransport: Send + Sync {
+    fn notify(&self, notification: ClipboardSuccessNotification);
+}
 
-impl SuccessNotifier for FreedesktopSuccessNotifier {
-    fn notify(&self, transcript_text: &TranscriptText) {
-        let notification = ClipboardSuccessNotification::from_transcript(transcript_text);
+#[derive(Default)]
+pub struct FreedesktopDbusNotificationTransport;
+
+impl FreedesktopNotificationTransport for FreedesktopDbusNotificationTransport {
+    fn notify(&self, notification: ClipboardSuccessNotification) {
         let Ok(connection) = zbus::blocking::Connection::session() else {
             return;
         };
@@ -64,7 +69,7 @@ impl SuccessNotifier for FreedesktopSuccessNotifier {
             Some(NOTIFICATION_DESTINATION),
             NOTIFICATION_PATH,
             Some(NOTIFICATION_INTERFACE),
-            "Notify",
+            NOTIFICATION_METHOD,
             &(
                 notification.application_name(),
                 0_u32,
@@ -79,6 +84,31 @@ impl SuccessNotifier for FreedesktopSuccessNotifier {
     }
 }
 
+pub struct FreedesktopSuccessNotifier {
+    transport: Arc<dyn FreedesktopNotificationTransport>,
+}
+
+impl FreedesktopSuccessNotifier {
+    pub fn new(transport: Arc<dyn FreedesktopNotificationTransport>) -> Self {
+        Self { transport }
+    }
+}
+
+impl Default for FreedesktopSuccessNotifier {
+    fn default() -> Self {
+        Self::new(Arc::new(FreedesktopDbusNotificationTransport))
+    }
+}
+
+impl SuccessNotifier for FreedesktopSuccessNotifier {
+    fn notify(&self, transcript_text: &TranscriptText) {
+        self.transport
+            .notify(ClipboardSuccessNotification::from_transcript(
+                transcript_text,
+            ));
+    }
+}
+
 #[derive(Default)]
 pub struct SilentSuccessNotifier;
 
@@ -88,9 +118,14 @@ impl SuccessNotifier for SilentSuccessNotifier {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use signal_listener::TranscriptText;
 
-    use super::ClipboardSuccessNotification;
+    use super::{
+        ClipboardSuccessNotification, FreedesktopNotificationTransport, FreedesktopSuccessNotifier,
+        SuccessNotifier,
+    };
 
     fn generated_transcript(word_count: usize) -> TranscriptText {
         TranscriptText::new(
@@ -128,5 +163,40 @@ mod tests {
         );
 
         assert!(notification.body() == expected);
+    }
+
+    #[derive(Default)]
+    struct RecordingTransport {
+        notifications: Mutex<Vec<ClipboardSuccessNotification>>,
+    }
+
+    impl RecordingTransport {
+        fn received_expected_direct_notification(&self, transcript: &TranscriptText) -> bool {
+            self.notifications
+                .lock()
+                .expect("recording notification transport")
+                .as_slice()
+                == [ClipboardSuccessNotification::from_transcript(transcript)]
+        }
+    }
+
+    impl FreedesktopNotificationTransport for RecordingTransport {
+        fn notify(&self, notification: ClipboardSuccessNotification) {
+            self.notifications
+                .lock()
+                .expect("recording notification transport")
+                .push(notification);
+        }
+    }
+
+    #[test]
+    fn notifier_passes_generated_fixture_directly_to_the_dbus_transport() {
+        let transcript = generated_transcript(13);
+        let transport = std::sync::Arc::new(RecordingTransport::default());
+        let notifier = FreedesktopSuccessNotifier::new(transport.clone());
+
+        notifier.notify(&transcript);
+
+        assert!(transport.received_expected_direct_notification(&transcript));
     }
 }

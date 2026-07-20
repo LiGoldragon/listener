@@ -15,11 +15,11 @@ use listener::daemon::ListenerSocketServer;
 use listener::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, BatchTranscriber,
     BatchTranscriptionInput, BatchTranscriptionInputFormat, BatchTranscriptionRequest,
-    Configuration, HistoryLimit, ListenerMaintenanceClient, ListenerRuntime,
-    OutputTargetDispatcher, RecordingAudioFormat, RecordingInputSource, RecordingLog,
-    RecordingLogHeader, RecordingLogWriter, RecordingStartTime, StatusEventRecorder,
-    StatusPublisher, StatusStreamServer, SuccessNotifier, TranscriptDelivery,
-    TranscriptDeliveryRequest, TranscriptHistoryStore,
+    Configuration, DeliveryOwnershipAdmission, HistoryLimit, ListenerMaintenanceClient,
+    ListenerRuntime, OutputTargetDispatcher, RecordingAudioFormat, RecordingInputSource,
+    RecordingLog, RecordingLogHeader, RecordingLogWriter, RecordingStartTime,
+    RuntimeFinalizationFeedback, StatusEventRecorder, StatusPublisher, StatusStreamServer,
+    SuccessNotifier, TranscriptDelivery, TranscriptDeliveryRequest, TranscriptHistoryStore,
 };
 use signal_frame::{ExchangeIdentifier, ExchangeLane, LaneSequence, Reply, SessionEpoch, SubReply};
 use signal_listener::{
@@ -136,6 +136,38 @@ impl RuntimeFixture {
             self.history_store(),
             success_notifier,
             self.status_publisher.clone(),
+        )
+    }
+
+    fn runtime_with_delivery_ownership_admission(
+        &self,
+        transcriber: Box<dyn BatchTranscriber>,
+        success_notifier: Arc<dyn SuccessNotifier>,
+        admission: Arc<dyn DeliveryOwnershipAdmission>,
+    ) -> ListenerRuntime {
+        self.runtime_with_finalization_feedback_and_delivery(
+            transcriber,
+            success_notifier,
+            admission,
+            Box::new(RecordingDelivery::new(Arc::clone(&self.deliveries))),
+        )
+    }
+
+    fn runtime_with_finalization_feedback_and_delivery(
+        &self,
+        transcriber: Box<dyn BatchTranscriber>,
+        success_notifier: Arc<dyn SuccessNotifier>,
+        admission: Arc<dyn DeliveryOwnershipAdmission>,
+        delivery: Box<dyn TranscriptDelivery>,
+    ) -> ListenerRuntime {
+        ListenerRuntime::with_dependencies_and_finalization_feedback(
+            self.configuration(),
+            Box::new(FileAudioCaptureBackend),
+            transcriber,
+            OutputTargetDispatcher::new(delivery),
+            self.history_store(),
+            self.status_publisher.clone(),
+            RuntimeFinalizationFeedback::new(success_notifier, admission),
         )
     }
 
@@ -447,6 +479,13 @@ impl ActiveAudioCapture for FileAudioCapture {
     }
 }
 
+fn generated_fixture_transcript(word_count: usize) -> String {
+    (0..word_count)
+        .map(|index| format!("fixture{index}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 struct FixedBatchTranscriber {
     text: String,
     inputs: Arc<Mutex<Vec<BatchTranscriptionInput>>>,
@@ -566,6 +605,50 @@ impl BlockingGate {
         let (state, condition) = &*self.state;
         state.lock().expect("blocking gate state").released = true;
         condition.notify_all();
+    }
+}
+
+struct BlockingDeliveryOwnershipAdmission {
+    gate: BlockingGate,
+}
+
+impl BlockingDeliveryOwnershipAdmission {
+    fn new(gate: BlockingGate) -> Self {
+        Self { gate }
+    }
+}
+
+impl DeliveryOwnershipAdmission for BlockingDeliveryOwnershipAdmission {
+    fn await_delivery_ownership(&self) {
+        self.gate.enter_and_wait();
+    }
+}
+
+struct ImmediateDeliveryOwnershipAdmission;
+
+impl DeliveryOwnershipAdmission for ImmediateDeliveryOwnershipAdmission {
+    fn await_delivery_ownership(&self) {}
+}
+
+struct BlockingSuccessfulDelivery {
+    gate: BlockingGate,
+    deliveries: Arc<Mutex<Vec<String>>>,
+}
+
+impl BlockingSuccessfulDelivery {
+    fn new(gate: BlockingGate, deliveries: Arc<Mutex<Vec<String>>>) -> Self {
+        Self { gate, deliveries }
+    }
+}
+
+impl TranscriptDelivery for BlockingSuccessfulDelivery {
+    fn deliver(&self, request: TranscriptDeliveryRequest) -> DeliveryOutcome {
+        self.gate.enter_and_wait();
+        self.deliveries
+            .lock()
+            .expect("deliveries")
+            .push(request.transcript_text().as_str().to_owned());
+        DeliveryOutcome::delivered(request.target())
     }
 }
 
@@ -1463,6 +1546,120 @@ fn actor_toggle_and_cancel_repeat_transcribing_cancellation_without_delivery_or_
             .iter()
             .any(|event| event.state() == listener::ListenerStatusState::Cancelled)
     );
+}
+
+#[test]
+fn late_cancellation_before_delivery_ownership_skips_all_delivery_feedback() {
+    let fixture = RuntimeFixture::new();
+    let notifications = Arc::new(AtomicUsize::new(0));
+    let ownership_gate = BlockingGate::new();
+    let runtime = fixture.runtime_with_delivery_ownership_admission(
+        Box::new(FixedBatchTranscriber::new(
+            generated_fixture_transcript(13),
+            Arc::clone(&fixture.transcription_inputs),
+            fixture.status_publisher.clone(),
+        )),
+        Arc::new(CountingSuccessNotifier::new(Arc::clone(&notifications))),
+        Arc::new(BlockingDeliveryOwnershipAdmission::new(
+            ownership_gate.clone(),
+        )),
+    );
+    let server = Arc::new(ListenerSocketServer::new(fixture.configuration(), runtime));
+    let session = match server
+        .handle_input(Input::Start(StartCapture {}))
+        .expect("start through actor")
+    {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected start reply, got {other:?}"),
+    };
+
+    let stopping_server = Arc::clone(&server);
+    let stopping_session = session.clone();
+    let stop_thread = thread::spawn(move || {
+        stopping_server
+            .handle_input(Input::stop(stopping_session))
+            .expect("stop through actor")
+    });
+    ownership_gate.wait_until_entered();
+
+    CancellationProbe::assert_requested(&server, Input::cancel(session.clone()), &session);
+    ownership_gate.release();
+
+    match stop_thread.join().expect("stop thread joins") {
+        Output::CompletionRequested(requested) => {
+            assert_eq!(requested.completion_requested_session.payload(), &session)
+        }
+        other => panic!("expected completion acknowledgement, got {other:?}"),
+    }
+    CancellationProbe::wait_until_idle(&server);
+    assert_eq!(fixture.transcription_inputs().len(), 1);
+    assert!(fixture.delivered_texts().is_empty());
+    assert!(fixture.recorded_history().is_empty());
+    assert_eq!(notifications.load(Ordering::SeqCst), 0);
+    let events = fixture.status_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.state() == listener::ListenerStatusState::Cancelled)
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.state() == listener::ListenerStatusState::Delivered)
+    );
+}
+
+#[test]
+fn cancellation_after_delivery_ownership_reports_completion_instead_of_cancellation() {
+    let fixture = RuntimeFixture::new();
+    let notifications = Arc::new(AtomicUsize::new(0));
+    let delivery_gate = BlockingGate::new();
+    let runtime = fixture.runtime_with_finalization_feedback_and_delivery(
+        Box::new(FixedBatchTranscriber::new(
+            generated_fixture_transcript(13),
+            Arc::clone(&fixture.transcription_inputs),
+            fixture.status_publisher.clone(),
+        )),
+        Arc::new(CountingSuccessNotifier::new(Arc::clone(&notifications))),
+        Arc::new(ImmediateDeliveryOwnershipAdmission),
+        Box::new(BlockingSuccessfulDelivery::new(
+            delivery_gate.clone(),
+            Arc::clone(&fixture.deliveries),
+        )),
+    );
+    let server = Arc::new(ListenerSocketServer::new(fixture.configuration(), runtime));
+    let session = match server
+        .handle_input(Input::Start(StartCapture {}))
+        .expect("start through actor")
+    {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected start reply, got {other:?}"),
+    };
+
+    let stopping_server = Arc::clone(&server);
+    let stopping_session = session.clone();
+    let stop_thread = thread::spawn(move || {
+        stopping_server
+            .handle_input(Input::stop(stopping_session))
+            .expect("stop through actor")
+    });
+    delivery_gate.wait_until_entered();
+
+    CancellationProbe::assert_completion_requested(
+        &server,
+        Input::cancel(session.clone()),
+        &session,
+    );
+    delivery_gate.release();
+
+    match stop_thread.join().expect("stop thread joins") {
+        Output::CompletionRequested(requested) => {
+            assert_eq!(requested.completion_requested_session.payload(), &session)
+        }
+        other => panic!("expected completion acknowledgement, got {other:?}"),
+    }
+    CancellationProbe::wait_until_delivered(&server, &session);
+    assert_eq!(notifications.load(Ordering::SeqCst), 1);
 }
 
 #[test]

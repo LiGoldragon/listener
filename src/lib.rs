@@ -52,7 +52,8 @@ pub use maintenance::CaptureMaintenance;
 #[cfg(feature = "nota-text")]
 pub use meta::MetaCommandLine;
 pub use notification::{
-    ClipboardSuccessNotification, FreedesktopSuccessNotifier, SilentSuccessNotifier,
+    ClipboardSuccessNotification, FreedesktopDbusNotificationTransport,
+    FreedesktopNotificationTransport, FreedesktopSuccessNotifier, SilentSuccessNotifier,
     SuccessNotifier,
 };
 pub use recall::{RecallOutcome, RecallSelector, TranscriptRecall};
@@ -61,7 +62,7 @@ pub use recording_log::{
     RecordingLogDurabilityPolicy, RecordingLogHeader, RecordingLogRecordCommit, RecordingLogWriter,
     RecordingSampleFormat, RecordingStartTime, RecoveredRecordingLog,
 };
-pub use runtime::ListenerRuntime;
+pub use runtime::{DeliveryOwnershipAdmission, ListenerRuntime, RuntimeFinalizationFeedback};
 pub use status::{
     ListenerStatusEvent, ListenerStatusState, MicrophoneLevel, StatusEventRecorder,
     StatusPublisher, StatusStreamServer,

@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU8, Ordering},
     mpsc,
 };
 
@@ -38,6 +38,7 @@ pub struct ListenerRuntime {
     success_notifier: Arc<dyn SuccessNotifier>,
     status_publisher: StatusPublisher,
     latency_instrumentation: LatencyInstrumentation,
+    delivery_ownership_admission: Arc<dyn DeliveryOwnershipAdmission>,
     session_sequence: CaptureSessionSequence,
     active_capture: Option<RuntimeActiveCapture>,
     orphaned_recordings: RecoveredCaptureRecordings,
@@ -47,6 +48,7 @@ struct RuntimeDependencies {
     success_notifier: Arc<dyn SuccessNotifier>,
     status_publisher: StatusPublisher,
     latency_instrumentation: LatencyInstrumentation,
+    delivery_ownership_admission: Arc<dyn DeliveryOwnershipAdmission>,
 }
 
 impl ListenerRuntime {
@@ -79,9 +81,10 @@ impl ListenerRuntime {
             OutputTargetDispatcher::from_environment(),
             TranscriptHistoryStore::from_environment()?,
             RuntimeDependencies {
-                success_notifier: Arc::new(FreedesktopSuccessNotifier),
+                success_notifier: Arc::new(FreedesktopSuccessNotifier::default()),
                 status_publisher,
                 latency_instrumentation,
+                delivery_ownership_admission: Arc::new(ImmediateDeliveryOwnershipAdmission),
             },
         ))
     }
@@ -104,6 +107,7 @@ impl ListenerRuntime {
                 success_notifier: Arc::new(SilentSuccessNotifier),
                 status_publisher,
                 latency_instrumentation: LatencyInstrumentation::disabled(),
+                delivery_ownership_admission: Arc::new(ImmediateDeliveryOwnershipAdmission),
             },
         )
     }
@@ -127,6 +131,7 @@ impl ListenerRuntime {
                 success_notifier,
                 status_publisher,
                 latency_instrumentation: LatencyInstrumentation::disabled(),
+                delivery_ownership_admission: Arc::new(ImmediateDeliveryOwnershipAdmission),
             },
         )
     }
@@ -150,6 +155,31 @@ impl ListenerRuntime {
                 success_notifier: Arc::new(SilentSuccessNotifier),
                 status_publisher,
                 latency_instrumentation,
+                delivery_ownership_admission: Arc::new(ImmediateDeliveryOwnershipAdmission),
+            },
+        )
+    }
+
+    pub fn with_dependencies_and_finalization_feedback(
+        configuration: Configuration,
+        capture_backend: Box<dyn AudioCaptureBackend>,
+        transcriber: Box<dyn BatchTranscriber>,
+        output_target_dispatcher: OutputTargetDispatcher,
+        history_store: TranscriptHistoryStore,
+        status_publisher: StatusPublisher,
+        feedback: RuntimeFinalizationFeedback,
+    ) -> Self {
+        Self::with_dependencies_and_notifier_and_latency(
+            configuration,
+            capture_backend,
+            transcriber,
+            output_target_dispatcher,
+            history_store,
+            RuntimeDependencies {
+                success_notifier: feedback.success_notifier,
+                status_publisher,
+                latency_instrumentation: LatencyInstrumentation::disabled(),
+                delivery_ownership_admission: feedback.delivery_ownership_admission,
             },
         )
     }
@@ -166,6 +196,7 @@ impl ListenerRuntime {
             success_notifier,
             status_publisher,
             latency_instrumentation,
+            delivery_ownership_admission,
         } = dependencies;
         let capture_store = CaptureStore::from_configuration(&configuration);
         Self {
@@ -178,6 +209,7 @@ impl ListenerRuntime {
             success_notifier,
             status_publisher,
             latency_instrumentation,
+            delivery_ownership_admission,
             session_sequence: CaptureSessionSequence::new(1),
             active_capture: None,
             orphaned_recordings: RecoveredCaptureRecordings::empty(),
@@ -561,6 +593,7 @@ impl ListenerRuntime {
             RuntimeDeliveryFeedback {
                 success_notifier: Arc::clone(&self.success_notifier),
                 status_publisher: self.status_publisher.clone(),
+                delivery_ownership_admission: Arc::clone(&self.delivery_ownership_admission),
             },
         ))
     }
@@ -585,22 +618,53 @@ impl ListenerRuntime {
 
 #[derive(Clone)]
 pub struct CaptureCancellationSignal {
-    requested: Arc<AtomicBool>,
+    ownership: Arc<AtomicU8>,
 }
 
 impl CaptureCancellationSignal {
+    const CANCELLABLE: u8 = 0;
+    const CANCELLATION_REQUESTED: u8 = 1;
+    const DELIVERY_OWNED: u8 = 2;
+
     pub fn new() -> Self {
         Self {
-            requested: Arc::new(AtomicBool::new(false)),
+            ownership: Arc::new(AtomicU8::new(Self::CANCELLABLE)),
         }
     }
 
-    pub fn request(&self) {
-        self.requested.store(true, Ordering::Release);
+    /// Returns whether cancellation owns finalization. Delivery ownership is
+    /// irrevocable, so a late cancellation must continue awaiting completion.
+    pub fn request(&self) -> bool {
+        match self.ownership.compare_exchange(
+            Self::CANCELLABLE,
+            Self::CANCELLATION_REQUESTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(Self::CANCELLATION_REQUESTED) => true,
+            Err(Self::DELIVERY_OWNED) => false,
+            Err(state) => unreachable!("unknown capture finalization ownership state: {state}"),
+        }
     }
 
     pub fn is_requested(&self) -> bool {
-        self.requested.load(Ordering::Acquire)
+        self.ownership.load(Ordering::Acquire) == Self::CANCELLATION_REQUESTED
+    }
+
+    fn claim_delivery_ownership(&self) -> bool {
+        match self.ownership.compare_exchange(
+            Self::CANCELLABLE,
+            Self::DELIVERY_OWNED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(Self::CANCELLATION_REQUESTED) => false,
+            Err(Self::DELIVERY_OWNED) => {
+                unreachable!("delivery ownership can only be claimed once")
+            }
+            Err(state) => unreachable!("unknown capture finalization ownership state: {state}"),
+        }
     }
 }
 
@@ -608,6 +672,17 @@ impl Default for CaptureCancellationSignal {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The explicit boundary immediately before irreversible delivery effects.
+pub trait DeliveryOwnershipAdmission: Send + Sync {
+    fn await_delivery_ownership(&self);
+}
+
+struct ImmediateDeliveryOwnershipAdmission;
+
+impl DeliveryOwnershipAdmission for ImmediateDeliveryOwnershipAdmission {
+    fn await_delivery_ownership(&self) {}
 }
 
 pub struct RuntimeCaptureStartWork {
@@ -720,6 +795,24 @@ pub enum CaptureFinalizationPhase {
 struct RuntimeDeliveryFeedback {
     success_notifier: Arc<dyn SuccessNotifier>,
     status_publisher: StatusPublisher,
+    delivery_ownership_admission: Arc<dyn DeliveryOwnershipAdmission>,
+}
+
+pub struct RuntimeFinalizationFeedback {
+    success_notifier: Arc<dyn SuccessNotifier>,
+    delivery_ownership_admission: Arc<dyn DeliveryOwnershipAdmission>,
+}
+
+impl RuntimeFinalizationFeedback {
+    pub fn new(
+        success_notifier: Arc<dyn SuccessNotifier>,
+        delivery_ownership_admission: Arc<dyn DeliveryOwnershipAdmission>,
+    ) -> Self {
+        Self {
+            success_notifier,
+            delivery_ownership_admission,
+        }
+    }
 }
 
 pub struct RuntimeCaptureFinalizationWork {
@@ -782,6 +875,11 @@ impl RuntimeCaptureFinalizationWork {
             feedback,
             completion,
         } = self;
+        let RuntimeDeliveryFeedback {
+            success_notifier,
+            status_publisher,
+            delivery_ownership_admission,
+        } = feedback;
         let stopped_capture = match active_capture.stop() {
             Ok(stopped_capture) => stopped_capture,
             Err(error) => {
@@ -829,7 +927,8 @@ impl RuntimeCaptureFinalizationWork {
                 return error.into_stop_reply();
             }
         };
-        if cancellation.is_requested() {
+        delivery_ownership_admission.await_delivery_ownership();
+        if !cancellation.claim_delivery_ownership() {
             return completion.cancelled(stopped_capture.session().clone(), compact_artifact);
         }
         if Self::record_history(&history_store, stopped_capture.session(), &transcript_text)
@@ -841,15 +940,12 @@ impl RuntimeCaptureFinalizationWork {
             completion.status_publisher.publish_error();
             return error.into_stop_reply();
         }
-        if cancellation.is_requested() {
-            return completion.cancelled(stopped_capture.session().clone(), compact_artifact);
-        }
         let delivery_outcomes = output_target_dispatcher.deliver(&output_targets, &transcript_text);
         publish_delivery_feedback(
             &delivery_outcomes,
             &transcript_text,
-            &feedback.success_notifier,
-            &feedback.status_publisher,
+            &success_notifier,
+            &status_publisher,
         );
         Output::Stopped(CaptureStopped {
             stopped_session: StoppedSession::new(stopped_capture.session().clone()),
