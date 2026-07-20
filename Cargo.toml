@@ -50,6 +50,7 @@ serde_json           = "1"
 signal-frame         = { git = "https://github.com/LiGoldragon/signal-frame.git", branch = "main", default-features = false }
 signal-listener      = { git = "https://github.com/LiGoldragon/signal-listener.git", branch = "main", default-features = false }
 thiserror            = "2"
+zbus                 = "4.4"
 
 [dev-dependencies]
 tempfile = "3"

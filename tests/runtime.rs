@@ -3,7 +3,10 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -15,17 +18,17 @@ use listener::{
     Configuration, HistoryLimit, ListenerMaintenanceClient, ListenerRuntime,
     OutputTargetDispatcher, RecordingAudioFormat, RecordingInputSource, RecordingLog,
     RecordingLogHeader, RecordingLogWriter, RecordingStartTime, StatusEventRecorder,
-    StatusPublisher, StatusStreamServer, TranscriptDelivery, TranscriptDeliveryRequest,
-    TranscriptHistoryStore,
+    StatusPublisher, StatusStreamServer, SuccessNotifier, TranscriptDelivery,
+    TranscriptDeliveryRequest, TranscriptHistoryStore,
 };
 use signal_frame::{ExchangeIdentifier, ExchangeLane, LaneSequence, Reply, SessionEpoch, SubReply};
 use signal_listener::{
-    ActiveCapture, CaptureCancellationRequested, CaptureSession, CaptureStatus, DeliveryOutcome,
-    DurableAudioArtifact, Frame, FrameBody, Input, InputSource, ListCapturesRequest,
-    ListenerDaemonConfiguration, MetaSocketMode, MetaSocketPath, OperationKind, Output,
-    OutputTarget, OutputTargets, RetryCapture, SocketMode, StartCapture, StatusRequest,
-    TranscriptText, TranscriptionMode, UnimplementedReason, WirePath, WorkingSocketMode,
-    WorkingSocketPath,
+    ActiveCapture, CaptureCancellationRequested, CaptureSession, CaptureStatus, DeliveryFailure,
+    DeliveryFailureReason, DeliveryOutcome, DurableAudioArtifact, Frame, FrameBody, Input,
+    InputSource, ListCapturesRequest, ListenerDaemonConfiguration, MetaSocketMode, MetaSocketPath,
+    OperationKind, Output, OutputTarget, OutputTargets, RetryCapture, SocketMode, StartCapture,
+    StatusRequest, TranscriptText, TranscriptionMode, UnimplementedReason, WirePath,
+    WorkingSocketMode, WorkingSocketPath,
 };
 use tempfile::TempDir;
 
@@ -71,6 +74,68 @@ impl RuntimeFixture {
         self.runtime_with_capture_backend_and_transcriber(
             Box::new(FileAudioCaptureBackend),
             transcriber,
+        )
+    }
+
+    fn runtime_with_notifier(&self, success_notifier: Arc<dyn SuccessNotifier>) -> ListenerRuntime {
+        self.runtime_with_transcriber_and_notifier(
+            Box::new(FixedBatchTranscriber::new(
+                "transcribed text",
+                Arc::clone(&self.transcription_inputs),
+                self.status_publisher.clone(),
+            )),
+            success_notifier,
+        )
+    }
+
+    fn runtime_with_capture_backend_and_notifier(
+        &self,
+        capture_backend: Box<dyn AudioCaptureBackend>,
+        success_notifier: Arc<dyn SuccessNotifier>,
+    ) -> ListenerRuntime {
+        ListenerRuntime::with_dependencies_and_notifier(
+            self.configuration(),
+            capture_backend,
+            Box::new(FixedBatchTranscriber::new(
+                "transcribed text",
+                Arc::clone(&self.transcription_inputs),
+                self.status_publisher.clone(),
+            )),
+            OutputTargetDispatcher::new(Box::new(RecordingDelivery::new(Arc::clone(
+                &self.deliveries,
+            )))),
+            self.history_store(),
+            success_notifier,
+            self.status_publisher.clone(),
+        )
+    }
+
+    fn runtime_with_transcriber_and_notifier(
+        &self,
+        transcriber: Box<dyn BatchTranscriber>,
+        success_notifier: Arc<dyn SuccessNotifier>,
+    ) -> ListenerRuntime {
+        self.runtime_with_notifier_and_delivery(
+            transcriber,
+            success_notifier,
+            Box::new(RecordingDelivery::new(Arc::clone(&self.deliveries))),
+        )
+    }
+
+    fn runtime_with_notifier_and_delivery(
+        &self,
+        transcriber: Box<dyn BatchTranscriber>,
+        success_notifier: Arc<dyn SuccessNotifier>,
+        delivery: Box<dyn TranscriptDelivery>,
+    ) -> ListenerRuntime {
+        ListenerRuntime::with_dependencies_and_notifier(
+            self.configuration(),
+            Box::new(FileAudioCaptureBackend),
+            transcriber,
+            OutputTargetDispatcher::new(delivery),
+            self.history_store(),
+            success_notifier,
+            self.status_publisher.clone(),
         )
     }
 
@@ -650,6 +715,33 @@ impl TranscriptDelivery for RecordingDelivery {
             .expect("deliveries")
             .push(request.transcript_text().as_str().to_owned());
         DeliveryOutcome::delivered(request.target())
+    }
+}
+
+struct UnavailableDelivery;
+
+impl TranscriptDelivery for UnavailableDelivery {
+    fn deliver(&self, request: TranscriptDeliveryRequest) -> DeliveryOutcome {
+        DeliveryOutcome::Failed(DeliveryFailure {
+            output_target: request.target(),
+            delivery_failure_reason: DeliveryFailureReason::TargetUnavailable,
+        })
+    }
+}
+
+struct CountingSuccessNotifier {
+    notifications: Arc<AtomicUsize>,
+}
+
+impl CountingSuccessNotifier {
+    fn new(notifications: Arc<AtomicUsize>) -> Self {
+        Self { notifications }
+    }
+}
+
+impl SuccessNotifier for CountingSuccessNotifier {
+    fn notify(&self, _transcript_text: &TranscriptText) {
+        self.notifications.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -1258,10 +1350,12 @@ fn actor_toggle_and_cancel_repeat_recording_cancellation_without_starting_anothe
 #[test]
 fn actor_toggle_and_cancel_repeat_finalizing_cancellation_without_transcribing() {
     let fixture = RuntimeFixture::new();
+    let notifications = Arc::new(AtomicUsize::new(0));
     let gate = BlockingGate::new();
-    let runtime = fixture.runtime_with_capture_backend(Box::new(
-        BlockingFinalizationAudioCaptureBackend::new(gate.clone()),
-    ));
+    let runtime = fixture.runtime_with_capture_backend_and_notifier(
+        Box::new(BlockingFinalizationAudioCaptureBackend::new(gate.clone())),
+        Arc::new(CountingSuccessNotifier::new(Arc::clone(&notifications))),
+    );
     let server = Arc::new(ListenerSocketServer::new(fixture.configuration(), runtime));
     let session = match server
         .handle_input(Input::Start(StartCapture {}))
@@ -1302,17 +1396,22 @@ fn actor_toggle_and_cancel_repeat_finalizing_cancellation_without_transcribing()
     assert!(fixture.transcription_inputs().is_empty());
     assert!(fixture.delivered_texts().is_empty());
     assert!(fixture.recorded_history().is_empty());
+    assert_eq!(notifications.load(Ordering::SeqCst), 0);
 }
 
 #[test]
 fn actor_toggle_and_cancel_repeat_transcribing_cancellation_without_delivery_or_history() {
     let fixture = RuntimeFixture::new();
+    let notifications = Arc::new(AtomicUsize::new(0));
     let gate = BlockingGate::new();
-    let runtime = fixture.runtime_with_transcriber(Box::new(BlockingBatchTranscriber::new(
-        gate.clone(),
-        Arc::clone(&fixture.transcription_inputs),
-        fixture.status_publisher.clone(),
-    )));
+    let runtime = fixture.runtime_with_transcriber_and_notifier(
+        Box::new(BlockingBatchTranscriber::new(
+            gate.clone(),
+            Arc::clone(&fixture.transcription_inputs),
+            fixture.status_publisher.clone(),
+        )),
+        Arc::new(CountingSuccessNotifier::new(Arc::clone(&notifications))),
+    );
     let server = Arc::new(ListenerSocketServer::new(fixture.configuration(), runtime));
     let session = match server
         .handle_input(Input::Start(StartCapture {}))
@@ -1352,6 +1451,7 @@ fn actor_toggle_and_cancel_repeat_transcribing_cancellation_without_delivery_or_
     assert_eq!(fixture.transcription_inputs().len(), 1);
     assert!(fixture.delivered_texts().is_empty());
     assert!(fixture.recorded_history().is_empty());
+    assert_eq!(notifications.load(Ordering::SeqCst), 0);
     let events = fixture.status_events();
     assert!(
         events
@@ -1389,6 +1489,63 @@ fn toggle_starts_then_gracefully_completes_the_active_capture() {
     assert_eq!(
         fixture.recorded_history(),
         vec!["transcribed text".to_owned()]
+    );
+}
+
+#[test]
+fn actor_completion_notifies_once_after_clipboard_delivery() {
+    let fixture = RuntimeFixture::new();
+    let notifications = Arc::new(AtomicUsize::new(0));
+    let runtime = fixture.runtime_with_notifier(Arc::new(CountingSuccessNotifier::new(
+        Arc::clone(&notifications),
+    )));
+    let server = ListenerSocketServer::new(fixture.configuration(), runtime);
+
+    let session = match server
+        .handle_input(Input::Start(StartCapture {}))
+        .expect("start through actor")
+    {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected start reply, got {other:?}"),
+    };
+
+    CancellationProbe::assert_completion_requested(&server, Input::stop(session.clone()), &session);
+    CancellationProbe::wait_until_delivered(&server, &session);
+
+    assert!(!fixture.delivered_texts().is_empty());
+    assert_eq!(notifications.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn clipboard_delivery_failure_skips_success_notifier() {
+    let fixture = RuntimeFixture::new();
+    let notifications = Arc::new(AtomicUsize::new(0));
+    let runtime = fixture.runtime_with_notifier_and_delivery(
+        Box::new(FixedBatchTranscriber::new(
+            "generated fixture delivery failure",
+            Arc::clone(&fixture.transcription_inputs),
+            fixture.status_publisher.clone(),
+        )),
+        Arc::new(CountingSuccessNotifier::new(Arc::clone(&notifications))),
+        Box::new(UnavailableDelivery),
+    );
+    let mut runtime = runtime;
+
+    let session = match runtime.handle_input(Input::Start(StartCapture {})) {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected start reply, got {other:?}"),
+    };
+    match runtime.handle_input(Input::stop(session)) {
+        Output::Stopped(_) => {}
+        other => panic!("expected stopped reply, got {other:?}"),
+    }
+
+    assert_eq!(notifications.load(Ordering::SeqCst), 0);
+    assert!(
+        fixture
+            .status_events()
+            .iter()
+            .any(|event| { event.state() == listener::ListenerStatusState::Error })
     );
 }
 

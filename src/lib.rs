@@ -19,6 +19,7 @@ pub mod latency;
 pub mod maintenance;
 #[cfg(feature = "nota-text")]
 pub mod meta;
+pub mod notification;
 pub mod recall;
 pub mod recording_log;
 pub mod runtime;
@@ -50,6 +51,10 @@ pub use latency::LatencyInstrumentation;
 pub use maintenance::CaptureMaintenance;
 #[cfg(feature = "nota-text")]
 pub use meta::MetaCommandLine;
+pub use notification::{
+    ClipboardSuccessNotification, FreedesktopSuccessNotifier, SilentSuccessNotifier,
+    SuccessNotifier,
+};
 pub use recall::{RecallOutcome, RecallSelector, TranscriptRecall};
 pub use recording_log::{
     RawPcmExport, RecordingAudioFormat, RecordingInputSource, RecordingLog, RecordingLogDurability,

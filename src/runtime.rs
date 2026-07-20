@@ -19,8 +19,9 @@ use signal_listener::{
 
 use crate::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureStore, Configuration, Error,
-    LatencyInstrumentation, OpenAiBatchTranscriptionActor, OutputTargetDispatcher,
-    RecoveredCaptureRecordings, Result, TranscriptHistoryEntry, TranscriptHistoryStore,
+    FreedesktopSuccessNotifier, LatencyInstrumentation, OpenAiBatchTranscriptionActor,
+    OutputTargetDispatcher, RecoveredCaptureRecordings, Result, SilentSuccessNotifier,
+    SuccessNotifier, TranscriptHistoryEntry, TranscriptHistoryStore,
 };
 use crate::{
     BatchTranscriber, BatchTranscriptionInput, BatchTranscriptionRequest,
@@ -34,11 +35,18 @@ pub struct ListenerRuntime {
     transcriber: Arc<dyn BatchTranscriber>,
     output_target_dispatcher: OutputTargetDispatcher,
     history_store: TranscriptHistoryStore,
+    success_notifier: Arc<dyn SuccessNotifier>,
     status_publisher: StatusPublisher,
     latency_instrumentation: LatencyInstrumentation,
     session_sequence: CaptureSessionSequence,
     active_capture: Option<RuntimeActiveCapture>,
     orphaned_recordings: RecoveredCaptureRecordings,
+}
+
+struct RuntimeDependencies {
+    success_notifier: Arc<dyn SuccessNotifier>,
+    status_publisher: StatusPublisher,
+    latency_instrumentation: LatencyInstrumentation,
 }
 
 impl ListenerRuntime {
@@ -62,7 +70,7 @@ impl ListenerRuntime {
         status_publisher: StatusPublisher,
         latency_instrumentation: LatencyInstrumentation,
     ) -> Result<Self> {
-        Ok(Self::with_dependencies_and_latency(
+        Ok(Self::with_dependencies_and_notifier_and_latency(
             configuration,
             Box::new(ProcessAudioCaptureBackend::from_environment()),
             Box::new(OpenAiBatchTranscriptionActor::from_environment(
@@ -70,8 +78,11 @@ impl ListenerRuntime {
             )?),
             OutputTargetDispatcher::from_environment(),
             TranscriptHistoryStore::from_environment()?,
-            status_publisher,
-            latency_instrumentation,
+            RuntimeDependencies {
+                success_notifier: Arc::new(FreedesktopSuccessNotifier),
+                status_publisher,
+                latency_instrumentation,
+            },
         ))
     }
 
@@ -83,14 +94,40 @@ impl ListenerRuntime {
         history_store: TranscriptHistoryStore,
         status_publisher: StatusPublisher,
     ) -> Self {
-        Self::with_dependencies_and_latency(
+        Self::with_dependencies_and_notifier_and_latency(
             configuration,
             capture_backend,
             transcriber,
             output_target_dispatcher,
             history_store,
-            status_publisher,
-            LatencyInstrumentation::disabled(),
+            RuntimeDependencies {
+                success_notifier: Arc::new(SilentSuccessNotifier),
+                status_publisher,
+                latency_instrumentation: LatencyInstrumentation::disabled(),
+            },
+        )
+    }
+
+    pub fn with_dependencies_and_notifier(
+        configuration: Configuration,
+        capture_backend: Box<dyn AudioCaptureBackend>,
+        transcriber: Box<dyn BatchTranscriber>,
+        output_target_dispatcher: OutputTargetDispatcher,
+        history_store: TranscriptHistoryStore,
+        success_notifier: Arc<dyn SuccessNotifier>,
+        status_publisher: StatusPublisher,
+    ) -> Self {
+        Self::with_dependencies_and_notifier_and_latency(
+            configuration,
+            capture_backend,
+            transcriber,
+            output_target_dispatcher,
+            history_store,
+            RuntimeDependencies {
+                success_notifier,
+                status_publisher,
+                latency_instrumentation: LatencyInstrumentation::disabled(),
+            },
         )
     }
 
@@ -103,6 +140,33 @@ impl ListenerRuntime {
         status_publisher: StatusPublisher,
         latency_instrumentation: LatencyInstrumentation,
     ) -> Self {
+        Self::with_dependencies_and_notifier_and_latency(
+            configuration,
+            capture_backend,
+            transcriber,
+            output_target_dispatcher,
+            history_store,
+            RuntimeDependencies {
+                success_notifier: Arc::new(SilentSuccessNotifier),
+                status_publisher,
+                latency_instrumentation,
+            },
+        )
+    }
+
+    fn with_dependencies_and_notifier_and_latency(
+        configuration: Configuration,
+        capture_backend: Box<dyn AudioCaptureBackend>,
+        transcriber: Box<dyn BatchTranscriber>,
+        output_target_dispatcher: OutputTargetDispatcher,
+        history_store: TranscriptHistoryStore,
+        dependencies: RuntimeDependencies,
+    ) -> Self {
+        let RuntimeDependencies {
+            success_notifier,
+            status_publisher,
+            latency_instrumentation,
+        } = dependencies;
         let capture_store = CaptureStore::from_configuration(&configuration);
         Self {
             configuration,
@@ -111,6 +175,7 @@ impl ListenerRuntime {
             transcriber: Arc::from(transcriber),
             output_target_dispatcher,
             history_store,
+            success_notifier,
             status_publisher,
             latency_instrumentation,
             session_sequence: CaptureSessionSequence::new(1),
@@ -208,7 +273,12 @@ impl ListenerRuntime {
         let delivery_outcomes = self
             .output_target_dispatcher
             .deliver(self.configuration.output_targets(), &transcript_text);
-        RuntimeDeliveryStatus::from_outcomes(&delivery_outcomes).publish(&self.status_publisher);
+        publish_delivery_feedback(
+            &delivery_outcomes,
+            &transcript_text,
+            &self.success_notifier,
+            &self.status_publisher,
+        );
 
         Ok(Output::Stopped(CaptureStopped {
             stopped_session: StoppedSession::new(stopped_capture.session().clone()),
@@ -297,7 +367,12 @@ impl ListenerRuntime {
         let outcomes = self
             .output_target_dispatcher
             .deliver(self.configuration.output_targets(), &transcript_text);
-        RuntimeDeliveryStatus::from_outcomes(&outcomes).publish(&self.status_publisher);
+        publish_delivery_feedback(
+            &outcomes,
+            &transcript_text,
+            &self.success_notifier,
+            &self.status_publisher,
+        );
         Ok(Output::Retried(CaptureRetried {
             retried_session: RetriedSession::new(session),
             transcript_text,
@@ -483,7 +558,10 @@ impl ListenerRuntime {
             self.output_target_dispatcher.clone(),
             self.history_store.clone(),
             self.configuration.output_targets().clone(),
-            self.status_publisher.clone(),
+            RuntimeDeliveryFeedback {
+                success_notifier: Arc::clone(&self.success_notifier),
+                status_publisher: self.status_publisher.clone(),
+            },
         ))
     }
 
@@ -639,6 +717,11 @@ pub enum CaptureFinalizationPhase {
     Transcribing,
 }
 
+struct RuntimeDeliveryFeedback {
+    success_notifier: Arc<dyn SuccessNotifier>,
+    status_publisher: StatusPublisher,
+}
+
 pub struct RuntimeCaptureFinalizationWork {
     active_capture: RuntimeActiveCapture,
     capture_store: CaptureStore,
@@ -646,6 +729,7 @@ pub struct RuntimeCaptureFinalizationWork {
     output_target_dispatcher: OutputTargetDispatcher,
     history_store: TranscriptHistoryStore,
     output_targets: OutputTargets,
+    feedback: RuntimeDeliveryFeedback,
     completion: RuntimeCancellationCompletion,
 }
 
@@ -657,8 +741,12 @@ impl RuntimeCaptureFinalizationWork {
         output_target_dispatcher: OutputTargetDispatcher,
         history_store: TranscriptHistoryStore,
         output_targets: OutputTargets,
-        status_publisher: StatusPublisher,
+        feedback: RuntimeDeliveryFeedback,
     ) -> Self {
+        let completion = RuntimeCancellationCompletion::new(
+            capture_store.clone(),
+            feedback.status_publisher.clone(),
+        );
         Self {
             active_capture,
             capture_store: capture_store.clone(),
@@ -666,7 +754,8 @@ impl RuntimeCaptureFinalizationWork {
             output_target_dispatcher,
             history_store,
             output_targets,
-            completion: RuntimeCancellationCompletion::new(capture_store, status_publisher),
+            feedback,
+            completion,
         }
     }
 
@@ -690,6 +779,7 @@ impl RuntimeCaptureFinalizationWork {
             output_target_dispatcher,
             history_store,
             output_targets,
+            feedback,
             completion,
         } = self;
         let stopped_capture = match active_capture.stop() {
@@ -755,8 +845,12 @@ impl RuntimeCaptureFinalizationWork {
             return completion.cancelled(stopped_capture.session().clone(), compact_artifact);
         }
         let delivery_outcomes = output_target_dispatcher.deliver(&output_targets, &transcript_text);
-        RuntimeDeliveryStatus::from_outcomes(&delivery_outcomes)
-            .publish(&completion.status_publisher);
+        publish_delivery_feedback(
+            &delivery_outcomes,
+            &transcript_text,
+            &feedback.success_notifier,
+            &feedback.status_publisher,
+        );
         Output::Stopped(CaptureStopped {
             stopped_session: StoppedSession::new(stopped_capture.session().clone()),
             durable_audio_artifact: compact_artifact,
@@ -869,6 +963,19 @@ enum RuntimeDeliveryStatus {
     Delivered,
     Failed,
     NoTargets,
+}
+
+fn publish_delivery_feedback(
+    delivery_outcomes: &DeliveryOutcomes,
+    transcript_text: &TranscriptText,
+    success_notifier: &Arc<dyn SuccessNotifier>,
+    status_publisher: &StatusPublisher,
+) {
+    let status = RuntimeDeliveryStatus::from_outcomes(delivery_outcomes);
+    status.publish(status_publisher);
+    if status == RuntimeDeliveryStatus::Delivered {
+        success_notifier.notify(transcript_text);
+    }
 }
 
 impl RuntimeDeliveryStatus {
