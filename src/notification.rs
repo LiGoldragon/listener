@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use signal_listener::TranscriptText;
-use zbus::zvariant::OwnedValue;
+use zbus::{Message, message::Flags, zvariant::OwnedValue};
 
 const APPLICATION_NAME: &str = "Listener";
 const TITLE: &str = "Listener Clipboard:";
@@ -51,6 +51,30 @@ impl ClipboardSuccessNotification {
     }
 }
 
+struct FreedesktopNotifyRequest {
+    notification: ClipboardSuccessNotification,
+}
+
+impl FreedesktopNotifyRequest {
+    fn message(&self) -> zbus::Result<Message> {
+        let hints = HashMap::from([("transient".to_owned(), OwnedValue::from(true))]);
+        Message::method(NOTIFICATION_PATH, NOTIFICATION_METHOD)?
+            .destination(NOTIFICATION_DESTINATION)?
+            .interface(NOTIFICATION_INTERFACE)?
+            .with_flags(Flags::NoReplyExpected)?
+            .build(&(
+                self.notification.application_name(),
+                0_u32,
+                "",
+                self.notification.title(),
+                self.notification.body(),
+                Vec::<String>::new(),
+                hints,
+                EXPIRE_TIMEOUT_MILLISECONDS,
+            ))
+    }
+}
+
 /// The only production boundary for desktop notification delivery.
 pub trait FreedesktopNotificationTransport: Send + Sync {
     fn notify(&self, notification: ClipboardSuccessNotification);
@@ -61,26 +85,13 @@ pub struct FreedesktopDbusNotificationTransport;
 
 impl FreedesktopNotificationTransport for FreedesktopDbusNotificationTransport {
     fn notify(&self, notification: ClipboardSuccessNotification) {
+        let Ok(message) = (FreedesktopNotifyRequest { notification }).message() else {
+            return;
+        };
         let Ok(connection) = zbus::blocking::Connection::session() else {
             return;
         };
-        let hints = HashMap::from([("transient".to_owned(), OwnedValue::from(true))]);
-        let _ = connection.call_method(
-            Some(NOTIFICATION_DESTINATION),
-            NOTIFICATION_PATH,
-            Some(NOTIFICATION_INTERFACE),
-            NOTIFICATION_METHOD,
-            &(
-                notification.application_name(),
-                0_u32,
-                "",
-                notification.title(),
-                notification.body(),
-                Vec::<String>::new(),
-                hints,
-                EXPIRE_TIMEOUT_MILLISECONDS,
-            ),
-        );
+        let _ = connection.send(&message);
     }
 }
 
@@ -118,14 +129,26 @@ impl SuccessNotifier for SilentSuccessNotifier {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{collections::HashMap, sync::Mutex};
 
     use signal_listener::TranscriptText;
+    use zbus::zvariant::OwnedValue;
 
     use super::{
-        ClipboardSuccessNotification, FreedesktopNotificationTransport, FreedesktopSuccessNotifier,
-        SuccessNotifier,
+        ClipboardSuccessNotification, FreedesktopNotificationTransport, FreedesktopNotifyRequest,
+        FreedesktopSuccessNotifier, SuccessNotifier,
     };
+
+    type NotifyArguments = (
+        String,
+        u32,
+        String,
+        String,
+        String,
+        Vec<String>,
+        HashMap<String, OwnedValue>,
+        i32,
+    );
 
     fn generated_transcript(word_count: usize) -> TranscriptText {
         TranscriptText::new(
@@ -163,6 +186,64 @@ mod tests {
         );
 
         assert!(notification.body() == expected);
+    }
+
+    #[test]
+    fn production_notify_request_has_the_expected_dbus_boundary() {
+        let transcript = generated_transcript(13);
+        let notification = ClipboardSuccessNotification::from_transcript(&transcript);
+        let message = (FreedesktopNotifyRequest {
+            notification: notification.clone(),
+        })
+        .message()
+        .expect("notification request serializes");
+        let header = message.header();
+
+        assert_eq!(message.message_type(), zbus::message::Type::MethodCall);
+        assert_eq!(
+            header.destination().expect("destination").to_string(),
+            "org.freedesktop.Notifications"
+        );
+        assert_eq!(
+            header.path().expect("object path").to_string(),
+            "/org/freedesktop/Notifications"
+        );
+        assert_eq!(
+            header.interface().expect("interface").to_string(),
+            "org.freedesktop.Notifications"
+        );
+        assert_eq!(header.member().expect("method").to_string(), "Notify");
+        assert!(
+            message
+                .primary_header()
+                .flags()
+                .contains(super::Flags::NoReplyExpected)
+        );
+        assert_eq!(
+            message
+                .body()
+                .signature()
+                .expect("body signature")
+                .to_string(),
+            "susssasa{sv}i"
+        );
+
+        let (application_name, replaces_id, app_icon, summary, body, actions, hints, expiry):
+            NotifyArguments = message.body()
+            .deserialize()
+            .expect("notification body deserializes");
+
+        assert_eq!(application_name, notification.application_name());
+        assert_eq!(replaces_id, 0);
+        assert_eq!(app_icon, "");
+        assert_eq!(summary, notification.title());
+        assert_eq!(body, notification.body());
+        assert!(actions.is_empty());
+        assert_eq!(hints.len(), 1);
+        assert!(
+            bool::try_from(hints.get("transient").expect("transient hint")).expect("boolean hint")
+        );
+        assert_eq!(expiry, 2500);
     }
 
     #[derive(Default)]
