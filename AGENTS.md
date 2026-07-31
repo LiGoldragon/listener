@@ -29,3 +29,9 @@ heartbeat/watchdog, alerts, and typing into windows.
 - Keep meta traffic on `meta-signal-listener`.
 - Do not extend the forked Whisrs inside this repo; harvest from it later only
   through explicit library seams.
+
+## Protos estate status
+
+Stack: correct-new destination
+Status: active component, current checkout legacy-wired
+This checkout is not proof of correct-new adoption.
