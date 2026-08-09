@@ -19,9 +19,11 @@ listener 'Retry.7'
 ```
 
 `Toggle.{}` atomically starts an idle daemon or gracefully completes its active
-recording; it is the hotkey-facing request because it never races a separate
-status read. `Cancel.<session>` is the explicit immediate-cancellation request
-and retains the capture artifact without transcription or delivery.
+recording; once completion is acknowledged, the recording slot is immediately
+available even while that session is still finalizing or transcribing. It is
+the hotkey-facing request because it never races a separate status read.
+`Cancel.<session>` is the explicit immediate-cancellation request and retains
+the capture artifact without transcription or delivery.
 `Stop.<session>` remains the distinct graceful-stop request: it finalizes,
 transcribes, and delivers. `Status.{}` reports the in-memory active session
 without exposing transcript text or running recovery, migration, or retention
@@ -111,8 +113,15 @@ working Unix socket. The normal user-visible workflow is:
 listener 'Toggle.{}'
 # dictate
 listener 'Toggle.{}'
+# an older transcription may still be running; start the next idea immediately
+listener 'Toggle.{}'
 listener-recall
 ```
+
+Listener keeps one microphone recording at a time and allows multiple older
+sessions to finalize and transcribe concurrently. Every successful result is
+serialized into the private history store, so `listener-recall` remains the
+stable result selector even when completion order differs from recording order.
 
 `Cancel.<session>` stops active recording and retains its recoverable log; it
 does not upload or deliver text. It can later be recovered with

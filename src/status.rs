@@ -4,7 +4,11 @@ use std::{
     os::unix::fs::PermissionsExt,
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -95,6 +99,7 @@ impl MicrophoneLevel {
 pub struct ListenerStatusEvent {
     state: ListenerStatusState,
     level: MicrophoneLevel,
+    in_flight_transcriptions: usize,
 }
 
 impl ListenerStatusEvent {
@@ -135,7 +140,16 @@ impl ListenerStatusEvent {
     }
 
     pub fn new(state: ListenerStatusState, level: MicrophoneLevel) -> Self {
-        Self { state, level }
+        Self {
+            state,
+            level,
+            in_flight_transcriptions: 0,
+        }
+    }
+
+    pub fn with_in_flight_transcriptions(mut self, in_flight_transcriptions: usize) -> Self {
+        self.in_flight_transcriptions = in_flight_transcriptions;
+        self
     }
 
     pub fn state(&self) -> ListenerStatusState {
@@ -144,6 +158,10 @@ impl ListenerStatusEvent {
 
     pub fn level(&self) -> MicrophoneLevel {
         self.level
+    }
+
+    pub fn in_flight_transcriptions(&self) -> usize {
+        self.in_flight_transcriptions
     }
 
     pub fn json_line(&self) -> Result<String> {
@@ -159,6 +177,7 @@ impl ListenerStatusEvent {
 struct ListenerStatusEventFrame<'a> {
     state: &'a str,
     level: f32,
+    in_flight: usize,
 }
 
 impl<'a> ListenerStatusEventFrame<'a> {
@@ -166,6 +185,7 @@ impl<'a> ListenerStatusEventFrame<'a> {
         Self {
             state: event.state().as_str(),
             level: event.level().value(),
+            in_flight: event.in_flight_transcriptions(),
         }
     }
 }
@@ -174,6 +194,7 @@ impl<'a> ListenerStatusEventFrame<'a> {
 pub struct StatusPublisher {
     sink: StatusPublisherSink,
     latency_instrumentation: LatencyInstrumentation,
+    in_flight_transcriptions: Arc<AtomicUsize>,
 }
 
 impl StatusPublisher {
@@ -181,6 +202,7 @@ impl StatusPublisher {
         Self {
             sink: StatusPublisherSink::Silent,
             latency_instrumentation: LatencyInstrumentation::disabled(),
+            in_flight_transcriptions: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -190,6 +212,7 @@ impl StatusPublisher {
             Self {
                 sink: StatusPublisherSink::Recorder(Arc::clone(&events)),
                 latency_instrumentation: LatencyInstrumentation::disabled(),
+                in_flight_transcriptions: Arc::new(AtomicUsize::new(0)),
             },
             StatusEventRecorder::new(events),
         )
@@ -202,10 +225,13 @@ impl StatusPublisher {
         Self {
             sink: StatusPublisherSink::Stream(sender),
             latency_instrumentation,
+            in_flight_transcriptions: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub fn publish(&self, event: ListenerStatusEvent) {
+        let event = event
+            .with_in_flight_transcriptions(self.in_flight_transcriptions.load(Ordering::Acquire));
         self.latency_instrumentation
             .record_state_publication(event.state());
         match &self.sink {
@@ -255,6 +281,11 @@ impl StatusPublisher {
 
     pub fn publish_error(&self) {
         self.publish(ListenerStatusEvent::error());
+    }
+
+    pub fn set_in_flight_transcriptions(&self, in_flight_transcriptions: usize) {
+        self.in_flight_transcriptions
+            .store(in_flight_transcriptions, Ordering::Release);
     }
 }
 

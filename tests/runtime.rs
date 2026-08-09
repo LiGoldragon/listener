@@ -555,7 +555,7 @@ struct BlockingGate {
 }
 
 struct BlockingGateState {
-    entered: bool,
+    entries: usize,
     released: bool,
 }
 
@@ -564,7 +564,7 @@ impl BlockingGate {
         Self {
             state: Arc::new((
                 Mutex::new(BlockingGateState {
-                    entered: false,
+                    entries: 0,
                     released: false,
                 }),
                 Condvar::new(),
@@ -575,7 +575,7 @@ impl BlockingGate {
     fn enter_and_wait(&self) {
         let (state, condition) = &*self.state;
         let mut state = state.lock().expect("blocking gate state");
-        state.entered = true;
+        state.entries += 1;
         condition.notify_all();
         while !state.released {
             state = condition.wait(state).expect("blocking gate wait");
@@ -583,20 +583,24 @@ impl BlockingGate {
     }
 
     fn wait_until_entered(&self) {
+        self.wait_until_entries(1);
+    }
+
+    fn wait_until_entries(&self, expected_entries: usize) {
         let deadline = Instant::now() + Duration::from_secs(10);
         let (state, condition) = &*self.state;
         let mut state = state.lock().expect("blocking gate state");
-        while !state.entered {
+        while state.entries < expected_entries {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
-                .expect("blocking gate did not enter before timeout");
+                .expect("blocking gate did not reach expected entries before timeout");
             let (next, timeout) = condition
                 .wait_timeout(state, remaining)
                 .expect("blocking gate timed wait");
             state = next;
             assert!(
                 !timeout.timed_out(),
-                "blocking gate did not enter before timeout"
+                "blocking gate did not reach {expected_entries} entries before timeout"
             );
         }
     }
@@ -1257,7 +1261,7 @@ fn cancel_stops_capture_retains_artifact_and_skips_transcription_and_delivery() 
             .iter()
             .filter(|event| event.state() == listener::ListenerStatusState::Cancelled)
             .all(|event| event.json_line().expect("cancelled status json")
-                == "{\"state\":\"cancelled\",\"level\":0.0}\n"),
+                == "{\"state\":\"cancelled\",\"level\":0.0,\"in_flight\":0}\n"),
         "expected UI-safe cancelled status JSON, got {events:?}"
     );
     assert!(
@@ -1431,7 +1435,7 @@ fn actor_toggle_and_cancel_repeat_recording_cancellation_without_starting_anothe
 }
 
 #[test]
-fn actor_toggle_and_cancel_repeat_finalizing_cancellation_without_transcribing() {
+fn actor_starts_next_recording_while_cancelling_an_older_finalization() {
     let fixture = RuntimeFixture::new();
     let notifications = Arc::new(AtomicUsize::new(0));
     let gate = BlockingGate::new();
@@ -1457,15 +1461,20 @@ fn actor_toggle_and_cancel_repeat_finalizing_cancellation_without_transcribing()
     });
     gate.wait_until_entered();
 
-    CancellationProbe::assert_immediate(|| {
-        CancellationProbe::assert_completion_requested(
-            &server,
-            Input::Toggle(signal_listener::ToggleCapture {}),
-            &session,
-        )
-    });
+    let next_session = match server
+        .handle_input(Input::Toggle(signal_listener::ToggleCapture {}))
+        .expect("start next recording during finalization")
+    {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected next recording to start, got {other:?}"),
+    };
     CancellationProbe::assert_requested(&server, Input::cancel(session.clone()), &session);
-    CancellationProbe::assert_pending_for_session(&server, &session);
+    assert_eq!(CancellationProbe::active_session(&server), next_session);
+    CancellationProbe::assert_requested(
+        &server,
+        Input::cancel(next_session.clone()),
+        &next_session,
+    );
     gate.release();
 
     match stop_thread.join().expect("stop thread joins") {
@@ -1483,7 +1492,7 @@ fn actor_toggle_and_cancel_repeat_finalizing_cancellation_without_transcribing()
 }
 
 #[test]
-fn actor_toggle_and_cancel_repeat_transcribing_cancellation_without_delivery_or_history() {
+fn actor_starts_next_recording_while_cancelling_an_older_transcription() {
     let fixture = RuntimeFixture::new();
     let notifications = Arc::new(AtomicUsize::new(0));
     let gate = BlockingGate::new();
@@ -1513,15 +1522,20 @@ fn actor_toggle_and_cancel_repeat_transcribing_cancellation_without_delivery_or_
     });
     gate.wait_until_entered();
 
-    CancellationProbe::assert_immediate(|| {
-        CancellationProbe::assert_completion_requested(
-            &server,
-            Input::Toggle(signal_listener::ToggleCapture {}),
-            &session,
-        )
-    });
+    let next_session = match server
+        .handle_input(Input::Toggle(signal_listener::ToggleCapture {}))
+        .expect("start next recording during transcription")
+    {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected next recording to start, got {other:?}"),
+    };
     CancellationProbe::assert_requested(&server, Input::cancel(session.clone()), &session);
-    CancellationProbe::assert_pending_for_session(&server, &session);
+    assert_eq!(CancellationProbe::active_session(&server), next_session);
+    CancellationProbe::assert_requested(
+        &server,
+        Input::cancel(next_session.clone()),
+        &next_session,
+    );
     gate.release();
 
     match stop_thread.join().expect("stop thread joins") {
@@ -1796,6 +1810,56 @@ fn actor_toggle_completes_recording_with_one_transcription_and_delivery() {
 }
 
 #[test]
+fn actor_records_again_while_two_transcriptions_run_in_parallel_without_losing_history() {
+    let fixture = RuntimeFixture::new();
+    let gate = BlockingGate::new();
+    let runtime = fixture.runtime_with_transcriber(Box::new(BlockingBatchTranscriber::new(
+        gate.clone(),
+        Arc::clone(&fixture.transcription_inputs),
+        fixture.status_publisher.clone(),
+    )));
+    let server = ListenerSocketServer::new(fixture.configuration(), runtime);
+
+    let first = match server
+        .handle_input(Input::Start(StartCapture {}))
+        .expect("start first capture")
+    {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected first capture to start, got {other:?}"),
+    };
+    CancellationProbe::assert_completion_requested(&server, Input::stop(first.clone()), &first);
+    gate.wait_until_entries(1);
+
+    let second = match server
+        .handle_input(Input::Start(StartCapture {}))
+        .expect("start second capture while first transcribes")
+    {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected second capture to start, got {other:?}"),
+    };
+    assert_ne!(first, second);
+    CancellationProbe::assert_completion_requested(&server, Input::stop(second.clone()), &second);
+    gate.wait_until_entries(2);
+
+    assert!(
+        fixture
+            .status_events()
+            .iter()
+            .any(|event| event.in_flight_transcriptions() == 2),
+        "status must expose both durable in-flight transcriptions"
+    );
+
+    gate.release();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fixture.recorded_history().len() < 2 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(fixture.transcription_inputs().len(), 2);
+    assert_eq!(fixture.delivered_texts().len(), 2);
+    assert_eq!(fixture.recorded_history().len(), 2);
+}
+
+#[test]
 fn connection_bound_maintenance_lease_gates_starts_until_explicit_release() {
     let fixture = RuntimeFixture::new();
     let server = Arc::new(ListenerSocketServer::new(
@@ -1914,12 +1978,15 @@ fn status_stream_sends_newline_json_frames() {
     let mut line = String::new();
 
     reader.read_line(&mut line).expect("read initial status");
-    assert_eq!(line, "{\"state\":\"idle\",\"level\":0.0}\n");
+    assert_eq!(line, "{\"state\":\"idle\",\"level\":0.0,\"in_flight\":0}\n");
 
     line.clear();
     publisher.publish_recording_level(listener::MicrophoneLevel::new(0.5));
     reader.read_line(&mut line).expect("read recording status");
-    assert_eq!(line, "{\"state\":\"recording\",\"level\":0.5}\n");
+    assert_eq!(
+        line,
+        "{\"state\":\"recording\",\"level\":0.5,\"in_flight\":0}\n"
+    );
 }
 
 #[test]

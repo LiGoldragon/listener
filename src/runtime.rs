@@ -602,6 +602,36 @@ impl ListenerRuntime {
         self.status_publisher.publish_finalizing();
     }
 
+    pub fn publish_starting(&self) {
+        self.status_publisher.publish_starting();
+    }
+
+    pub fn publish_transcribing(&self) {
+        self.status_publisher.publish_transcribing();
+    }
+
+    pub fn publish_recording(&self) {
+        self.status_publisher
+            .publish_recording_level(crate::MicrophoneLevel::silent());
+    }
+
+    pub fn publish_idle(&self) {
+        self.status_publisher.publish_idle();
+    }
+
+    pub fn publish_delivered(&self) {
+        self.status_publisher.publish_delivered();
+    }
+
+    pub fn publish_error(&self) {
+        self.status_publisher.publish_error();
+    }
+
+    pub fn set_in_flight_transcriptions(&self, in_flight_transcriptions: usize) {
+        self.status_publisher
+            .set_in_flight_transcriptions(in_flight_transcriptions);
+    }
+
     pub fn publish_cancelling(&self) {
         self.status_publisher.publish_cancelling();
     }

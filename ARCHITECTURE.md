@@ -68,7 +68,8 @@ store directly, or bypass the daemon path.
   proves binary archive round trips.
 - `src/command.rs` is the thin ordinary CLI client.
 - `src/daemon.rs` owns the serialized listener lifecycle actor, concurrent
-  socket readers, and connection-bound maintenance leases.
+  socket readers, one foreground recording slot, a session-keyed set of
+  in-flight finalizations, and connection-bound maintenance leases.
 - `src/runtime.rs` lowers `signal-listener` operations into runtime state and
   effects. Status is a direct projection of that state; `Toggle` atomically
   selects start or graceful completion from the daemon-owned active slot.
@@ -196,14 +197,22 @@ Ordinary lifecycle conflicts stay on the public reply surface as typed
 stop or cancel while idle reports no active capture, and stop or cancel with a
 different session reports both active and requested sessions. `Stop` and a
 recording `Toggle` transition once to finalizing and promptly reply
-`CompletionRequested`; the finalizer then compacts, transcribes, and delivers
-without holding the socket actor. A second graceful request for that session
-repeats the truthful acknowledgement instead of starting another finalizer.
-`Toggle` never turns into discard: it reports the in-progress graceful state
-while startup/finalization proceeds. Explicit `Cancel` alone suppresses work;
+`CompletionRequested`; the finalizer then compacts, transcribes, records
+history, and delivers without occupying the foreground recording slot. A new
+`Start` or `Toggle` can therefore begin the next durable recording while any
+number of older sessions are finalizing or transcribing. Finalizations remain
+addressable by session for repeated stop acknowledgement and explicit cancel,
+and the OpenAI actor dispatches independent requests concurrently. The locked,
+atomic history store serializes completion-order appends, so concurrently
+finished transcripts cannot overwrite one another.
+
+`Toggle` never turns into discard: while a foreground recording exists it
+gracefully completes that recording; otherwise it starts a new one even when
+older transcriptions remain in flight. Explicit `Cancel` alone suppresses work;
 it acknowledges immediately from startup, recording, finalization,
-transcription, and an already-cancelling phase. Status exposes capturing,
-finalizing, transcribing, delivered, and error transitions without transcript
-text. The maintenance queue gates new starts from its FIFO front, grants only
-when this actor is idle, and drops its owner on connection EOF or daemon exit.
-These outcomes are not lowered to `RequestUnimplemented`.
+transcription, and an already-cancelling phase. Status exposes the foreground
+state plus an `in_flight` transcription count without transcript text. The
+maintenance queue gates new starts from its FIFO front and grants only after
+both the foreground slot and every finalization are idle; it drops its owner on
+connection EOF or daemon exit. These outcomes are not lowered to
+`RequestUnimplemented`.

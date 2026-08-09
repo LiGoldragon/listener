@@ -3,14 +3,15 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::Path,
-    sync::mpsc,
+    sync::{Arc, Barrier, mpsc},
     thread,
     time::Duration,
 };
 
 use listener::{
-    BatchTranscriptionInput, BatchTranscriptionRequest, Error, OpenAiCredentialSource,
-    OpenAiRestTranscriber, OpenAiTranscriptionRequestConfiguration, RecordingAudioFormat,
+    BatchTranscriber, BatchTranscriptionInput, BatchTranscriptionRequest, Error,
+    OpenAiBatchTranscriptionActor, OpenAiCredentialSource, OpenAiRestTranscriber,
+    OpenAiTranscriptionRequestConfiguration, RecordingAudioFormat, StatusPublisher,
     TranscriptionCustomization, TranscriptionCustomizationEnvironment,
     TranscriptionCustomizationTextSource,
 };
@@ -213,9 +214,119 @@ fn openai_form_sends_configured_prompt_with_every_transcription_request() {
     }
 }
 
+#[test]
+fn openai_actor_dispatches_two_transcriptions_in_parallel() {
+    let server = ParallelOpenAiCaptureServer::spawn();
+    let directory = TempDir::new().expect("create parallel transcription tempdir");
+    let transcriber = Arc::new(OpenAiBatchTranscriptionActor::new(
+        OpenAiRestTranscriber::new(
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("build http client"),
+            OpenAiCredentialSource::literal("test-openai-key"),
+            OpenAiTranscriptionRequestConfiguration::new_with_endpoint(
+                server.endpoint(),
+                "test-model",
+                "en",
+                "test prompt",
+            ),
+        ),
+        StatusPublisher::silent(),
+        Duration::from_secs(5),
+    ));
+
+    let mut workers = Vec::new();
+    for index in 0..2 {
+        let input_path = directory.path().join(format!("parallel-{index}.s16le"));
+        fs::write(&input_path, [0_u8, 0_u8]).expect("write parallel pcm input");
+        let artifact = DurableAudioArtifact::new(AudioArtifactPath::new(WirePath::new(
+            input_path.to_string_lossy().into_owned(),
+        )));
+        let input = BatchTranscriptionInput::signed_sixteen_bit_little_endian_pcm(
+            input_path,
+            RecordingAudioFormat::signed_sixteen_bit_little_endian_mono_16khz(),
+        );
+        let transcriber = Arc::clone(&transcriber);
+        workers.push(thread::spawn(move || {
+            transcriber.transcribe(BatchTranscriptionRequest::new_with_input(artifact, input))
+        }));
+    }
+
+    server.wait_until_both_requests_are_in_flight();
+    server.release();
+    for worker in workers {
+        assert_eq!(
+            worker
+                .join()
+                .expect("parallel transcription thread joins")
+                .expect("parallel transcription succeeds")
+                .as_str(),
+            "captured transcript"
+        );
+    }
+}
+
 struct OpenAiCaptureServer {
     endpoint: String,
     request_receiver: mpsc::Receiver<String>,
+}
+
+struct ParallelOpenAiCaptureServer {
+    endpoint: String,
+    request_receiver: mpsc::Receiver<()>,
+    release_barrier: Arc<Barrier>,
+}
+
+impl ParallelOpenAiCaptureServer {
+    fn spawn() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind parallel OpenAI test server");
+        let endpoint = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("read parallel OpenAI test address")
+        );
+        let (request_sender, request_receiver) = mpsc::channel();
+        let release_barrier = Arc::new(Barrier::new(3));
+        let worker_barrier = Arc::clone(&release_barrier);
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept parallel OpenAI request");
+                let request_sender = request_sender.clone();
+                let release_barrier = Arc::clone(&worker_barrier);
+                thread::spawn(move || {
+                    let _ = RecordedHttpRequest::read_from(&mut stream);
+                    request_sender
+                        .send(())
+                        .expect("record in-flight OpenAI request");
+                    release_barrier.wait();
+                    RecordedHttpRequest::write_success_response(&mut stream);
+                });
+            }
+        });
+        Self {
+            endpoint,
+            request_receiver,
+            release_barrier,
+        }
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    fn wait_until_both_requests_are_in_flight(&self) {
+        for _ in 0..2 {
+            self.request_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("both OpenAI requests must arrive before either response");
+        }
+    }
+
+    fn release(&self) {
+        self.release_barrier.wait();
+    }
 }
 
 impl OpenAiCaptureServer {

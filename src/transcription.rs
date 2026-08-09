@@ -2,7 +2,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     thread,
     time::Duration,
 };
@@ -373,10 +373,9 @@ impl BatchTranscriber for OpenAiBatchTranscriptionActor {
 }
 
 struct TranscriptionActorWorker {
-    transcriber: OpenAiRestTranscriber,
+    transcriber: Arc<OpenAiRestTranscriber>,
     status_publisher: StatusPublisher,
     receiver: mpsc::Receiver<TranscriptionActorMessage>,
-    in_flight: Option<DurableAudioArtifact>,
 }
 
 impl TranscriptionActorWorker {
@@ -386,10 +385,9 @@ impl TranscriptionActorWorker {
         receiver: mpsc::Receiver<TranscriptionActorMessage>,
     ) -> Self {
         Self {
-            transcriber,
+            transcriber: Arc::new(transcriber),
             status_publisher,
             receiver,
-            in_flight: None,
         }
     }
 
@@ -407,15 +405,17 @@ impl TranscriptionActorWorker {
         }
     }
 
-    fn handle_transcription(&mut self, request: TranscriptionActorRequest) {
-        self.in_flight = Some(request.request().artifact().clone());
-        self.status_publisher.publish_transcribing();
-        let result = self.transcriber.transcribe(request.request().clone());
-        if result.is_err() {
-            self.status_publisher.publish_error();
-        }
-        let _ = request.reply(result);
-        self.in_flight = None;
+    fn handle_transcription(&self, request: TranscriptionActorRequest) {
+        let transcriber = Arc::clone(&self.transcriber);
+        let status_publisher = self.status_publisher.clone();
+        thread::spawn(move || {
+            status_publisher.publish_transcribing();
+            let result = transcriber.transcribe(request.request().clone());
+            if result.is_err() {
+                status_publisher.publish_error();
+            }
+            let _ = request.reply(result);
+        });
     }
 }
 

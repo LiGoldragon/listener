@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs,
     io::ErrorKind,
     os::unix::{
@@ -299,6 +299,7 @@ struct ListenerOperationActor {
     receiver: mpsc::Receiver<ListenerOperationMail>,
     mailbox: ListenerOperationMailbox,
     operation: ListenerOperationState,
+    finalizations: BTreeMap<u64, ListenerFinalizationState>,
     leases: MaintenanceLeaseState,
     terminal_status: Option<CaptureStatus>,
 }
@@ -312,6 +313,7 @@ impl ListenerOperationActor {
             receiver,
             mailbox: mailbox.clone(),
             operation: ListenerOperationState::Idle,
+            finalizations: BTreeMap::new(),
             leases: MaintenanceLeaseState::for_current_daemon(),
             terminal_status: None,
         };
@@ -333,12 +335,15 @@ impl ListenerOperationActor {
             ListenerOperationMail::CancellationCompleted(output) => {
                 self.finish_cancellation(output)
             }
-            ListenerOperationMail::FinalizationPhase(phase) => self.advance_finalization(phase),
-            ListenerOperationMail::FinalizationCompleted(output) => {
-                self.finish_finalization(output)
+            ListenerOperationMail::FinalizationPhase { session, phase } => {
+                self.advance_finalization(session, phase)
+            }
+            ListenerOperationMail::FinalizationCompleted { session, output } => {
+                self.finish_finalization(session, output)
             }
         }
-        self.leases.grant_if_idle(self.operation.is_idle());
+        self.leases
+            .grant_if_idle(self.operation.is_idle() && self.finalizations.is_empty());
     }
 
     fn handle_request(&mut self, request: ListenerOperationRequest) {
@@ -387,12 +392,6 @@ impl ListenerOperationActor {
         match &self.operation {
             ListenerOperationState::Idle => self.begin_start(reply),
             ListenerOperationState::Capturing { session, .. } => self.stop(session.clone(), reply),
-            ListenerOperationState::Finalizing {
-                session, artifact, ..
-            } => self.reply(
-                reply,
-                Self::completion_requested(session.clone(), artifact.clone()),
-            ),
             ListenerOperationState::Starting { start, .. } => {
                 self.reply(reply, Self::already_active(start.session().clone()))
             }
@@ -404,6 +403,10 @@ impl ListenerOperationActor {
     }
 
     fn cancel(&mut self, session: CaptureSession, reply: ListenerReplySink) {
+        if self.finalizations.contains_key(&session.value()) {
+            self.request_finalization_cancellation(session, reply);
+            return;
+        }
         let Some((active, _)) = self.operation.active_capture() else {
             self.reply(reply, Output::NoActive(NoActiveCapture {}));
             return;
@@ -416,6 +419,16 @@ impl ListenerOperationActor {
     }
 
     fn stop(&mut self, session: CaptureSession, reply: ListenerReplySink) {
+        if let Some(finalization) = self.finalizations.get(&session.value()) {
+            self.reply(
+                reply,
+                Self::completion_requested(
+                    finalization.session.clone(),
+                    finalization.artifact.clone(),
+                ),
+            );
+            return;
+        }
         let operation = std::mem::replace(&mut self.operation, ListenerOperationState::Idle);
         match operation {
             ListenerOperationState::Capturing {
@@ -424,15 +437,20 @@ impl ListenerOperationActor {
             } if active == session => match self.runtime.begin_capture_finalization(active.clone())
             {
                 Ok(work) => {
-                    self.runtime.publish_finalizing();
                     let cancellation = CaptureCancellationSignal::new();
-                    self.operation = ListenerOperationState::Finalizing {
-                        session: active.clone(),
-                        artifact: artifact.clone(),
-                        cancellation: cancellation.clone(),
-                        phase: CaptureFinalizationPhase::Finalizing,
-                    };
-                    self.spawn_finalization(work, cancellation);
+                    self.finalizations.insert(
+                        active.value(),
+                        ListenerFinalizationState {
+                            session: active.clone(),
+                            artifact: artifact.clone(),
+                            cancellation: cancellation.clone(),
+                            phase: CaptureFinalizationPhase::Finalizing,
+                        },
+                    );
+                    self.runtime
+                        .set_in_flight_transcriptions(self.finalizations.len());
+                    self.runtime.publish_finalizing();
+                    self.spawn_finalization(active.clone(), work, cancellation);
                     self.reply(reply, Self::completion_requested(active, artifact));
                 }
                 Err(error) => self.reply(reply, error.into_stop_reply()),
@@ -446,21 +464,6 @@ impl ListenerOperationActor {
                     artifact,
                 };
                 self.reply(reply, Self::session_mismatch(active, session));
-            }
-            ListenerOperationState::Finalizing {
-                session: active,
-                artifact,
-                cancellation,
-                phase,
-            } if active == session => {
-                let response = Self::completion_requested(active.clone(), artifact.clone());
-                self.operation = ListenerOperationState::Finalizing {
-                    session: active,
-                    artifact,
-                    cancellation,
-                    phase,
-                };
-                self.reply(reply, response);
             }
             other => {
                 self.operation = other;
@@ -500,33 +503,6 @@ impl ListenerOperationActor {
                     Err(error) => self.reply(reply, error.into_cancel_reply()),
                 }
             }
-            ListenerOperationState::Finalizing {
-                session,
-                artifact,
-                cancellation,
-                phase,
-            } => {
-                if cancellation.request() {
-                    self.runtime.publish_cancelling();
-                    let output = Self::cancellation_requested(session.clone(), artifact.clone());
-                    self.operation = ListenerOperationState::Finalizing {
-                        session,
-                        artifact,
-                        cancellation,
-                        phase,
-                    };
-                    self.reply(reply, output);
-                } else {
-                    let output = Self::completion_requested(session.clone(), artifact.clone());
-                    self.operation = ListenerOperationState::Finalizing {
-                        session,
-                        artifact,
-                        cancellation,
-                        phase,
-                    };
-                    self.reply(reply, output);
-                }
-            }
             ListenerOperationState::Cancelling { session, artifact } => {
                 let output = Self::cancellation_requested(session.clone(), artifact.clone());
                 self.operation = ListenerOperationState::Cancelling { session, artifact };
@@ -534,6 +510,35 @@ impl ListenerOperationActor {
             }
             ListenerOperationState::Idle => self.reply(reply, Output::NoActive(NoActiveCapture {})),
         }
+    }
+
+    fn request_finalization_cancellation(
+        &mut self,
+        session: CaptureSession,
+        reply: ListenerReplySink,
+    ) {
+        let output = {
+            let finalization = self
+                .finalizations
+                .get(&session.value())
+                .expect("finalization session was checked before cancellation");
+            if finalization.cancellation.request() {
+                Self::cancellation_requested(
+                    finalization.session.clone(),
+                    finalization.artifact.clone(),
+                )
+            } else {
+                Self::completion_requested(
+                    finalization.session.clone(),
+                    finalization.artifact.clone(),
+                )
+            }
+        };
+        if matches!(&output, Output::CancellationRequested(_)) {
+            self.runtime.publish_cancelling();
+        }
+        self.publish_current_status();
+        self.reply(reply, output);
     }
 
     fn finish_start(&mut self, completion: ListenerStartCompletion) {
@@ -587,26 +592,25 @@ impl ListenerOperationActor {
         if matches!(self.operation, ListenerOperationState::Cancelling { .. }) {
             self.operation = ListenerOperationState::Idle;
             self.terminal_status = None;
+            self.publish_current_status();
         }
     }
 
-    fn advance_finalization(&mut self, phase: CaptureFinalizationPhase) {
-        if let ListenerOperationState::Finalizing {
-            phase: current,
-            cancellation,
-            ..
-        } = &mut self.operation
-            && !cancellation.is_requested()
+    fn advance_finalization(&mut self, session: CaptureSession, phase: CaptureFinalizationPhase) {
+        if let Some(finalization) = self.finalizations.get_mut(&session.value())
+            && !finalization.cancellation.is_requested()
         {
-            *current = phase;
+            finalization.phase = phase;
+            self.publish_current_status();
         }
     }
 
-    fn finish_finalization(&mut self, output: Output) {
-        let operation = std::mem::replace(&mut self.operation, ListenerOperationState::Idle);
-        let ListenerOperationState::Finalizing { session, .. } = operation else {
+    fn finish_finalization(&mut self, session: CaptureSession, output: Output) {
+        if self.finalizations.remove(&session.value()).is_none() {
             return;
-        };
+        }
+        self.runtime
+            .set_in_flight_transcriptions(self.finalizations.len());
         self.terminal_status = match output {
             Output::Stopped(stopped) => Some(CaptureStatus::Delivered(
                 stopped.stopped_session.payload().clone(),
@@ -614,6 +618,7 @@ impl ListenerOperationActor {
             Output::Cancelled(_) => None,
             _ => Some(CaptureStatus::Error(session)),
         };
+        self.publish_current_status();
     }
 
     fn spawn_start(&self) {
@@ -640,28 +645,34 @@ impl ListenerOperationActor {
 
     fn spawn_finalization(
         &self,
+        session: CaptureSession,
         work: RuntimeCaptureFinalizationWork,
         cancellation: CaptureCancellationSignal,
     ) {
         let sender = self.mailbox.sender.clone();
         let (phase_sender, phase_receiver) = mpsc::channel();
         let phase_mailbox = self.mailbox.sender.clone();
+        let phase_session = session.clone();
         thread::spawn(move || {
             while let Ok(phase) = phase_receiver.recv() {
-                let _ = phase_mailbox.send(ListenerOperationMail::FinalizationPhase(phase));
+                let _ = phase_mailbox.send(ListenerOperationMail::FinalizationPhase {
+                    session: phase_session.clone(),
+                    phase,
+                });
             }
         });
         thread::spawn(move || {
             let output = work.execute(cancellation, phase_sender);
-            let _ = sender.send(ListenerOperationMail::FinalizationCompleted(output));
+            let _ = sender.send(ListenerOperationMail::FinalizationCompleted { session, output });
         });
     }
 
     fn status(&self) -> Output {
         let status = match &self.operation {
-            ListenerOperationState::Idle => {
-                self.terminal_status.clone().unwrap_or(CaptureStatus::Idle)
-            }
+            ListenerOperationState::Idle => self
+                .latest_finalization_status()
+                .or_else(|| self.terminal_status.clone())
+                .unwrap_or(CaptureStatus::Idle),
             ListenerOperationState::Starting { start, .. } => {
                 CaptureStatus::Capturing(ActiveCapture {
                     active_capture_session: ActiveCaptureSession::new(start.session().clone()),
@@ -675,23 +686,32 @@ impl ListenerOperationActor {
                     durable_audio_artifact: artifact.clone(),
                 })
             }
-            ListenerOperationState::Finalizing {
-                session,
-                artifact,
-                phase,
-                ..
-            } => {
-                let capture = ActiveCapture {
-                    active_capture_session: ActiveCaptureSession::new(session.clone()),
-                    durable_audio_artifact: artifact.clone(),
-                };
-                match phase {
-                    CaptureFinalizationPhase::Finalizing => CaptureStatus::Finalizing(capture),
-                    CaptureFinalizationPhase::Transcribing => CaptureStatus::Transcribing(capture),
-                }
-            }
         };
         Output::status_reported(status)
+    }
+
+    fn latest_finalization_status(&self) -> Option<CaptureStatus> {
+        self.finalizations
+            .last_key_value()
+            .map(|(_, finalization)| finalization.status())
+    }
+
+    fn publish_current_status(&self) {
+        match &self.operation {
+            ListenerOperationState::Starting { .. } => self.runtime.publish_starting(),
+            ListenerOperationState::Capturing { .. } => self.runtime.publish_recording(),
+            ListenerOperationState::Cancelling { .. } => self.runtime.publish_cancelling(),
+            ListenerOperationState::Idle => match self.latest_finalization_status() {
+                Some(CaptureStatus::Finalizing(_)) => self.runtime.publish_finalizing(),
+                Some(CaptureStatus::Transcribing(_)) => self.runtime.publish_transcribing(),
+                Some(_) => self.runtime.publish_idle(),
+                None => match &self.terminal_status {
+                    Some(CaptureStatus::Delivered(_)) => self.runtime.publish_delivered(),
+                    Some(CaptureStatus::Error(_)) => self.runtime.publish_error(),
+                    _ => self.runtime.publish_idle(),
+                },
+            },
+        }
     }
 
     fn reply(&self, reply: ListenerReplySink, output: Output) {
@@ -755,8 +775,14 @@ enum ListenerOperationMail {
     Disconnected(ConnectionIdentifier),
     StartCompleted(ListenerStartCompletion),
     CancellationCompleted(Output),
-    FinalizationPhase(CaptureFinalizationPhase),
-    FinalizationCompleted(Output),
+    FinalizationPhase {
+        session: CaptureSession,
+        phase: CaptureFinalizationPhase,
+    },
+    FinalizationCompleted {
+        session: CaptureSession,
+        output: Output,
+    },
 }
 
 struct ListenerStartCompletion {
@@ -774,12 +800,6 @@ enum ListenerOperationState {
         session: CaptureSession,
         artifact: signal_listener::DurableAudioArtifact,
     },
-    Finalizing {
-        session: CaptureSession,
-        artifact: signal_listener::DurableAudioArtifact,
-        cancellation: CaptureCancellationSignal,
-        phase: CaptureFinalizationPhase,
-    },
     Cancelling {
         session: CaptureSession,
         artifact: signal_listener::DurableAudioArtifact,
@@ -791,16 +811,34 @@ impl ListenerOperationState {
         match self {
             Self::Idle => None,
             Self::Starting { start, .. } => Some((start.session(), start.artifact())),
-            Self::Capturing { session, artifact }
-            | Self::Finalizing {
-                session, artifact, ..
+            Self::Capturing { session, artifact } | Self::Cancelling { session, artifact } => {
+                Some((session, artifact))
             }
-            | Self::Cancelling { session, artifact } => Some((session, artifact)),
         }
     }
 
     fn is_idle(&self) -> bool {
         matches!(self, Self::Idle)
+    }
+}
+
+struct ListenerFinalizationState {
+    session: CaptureSession,
+    artifact: signal_listener::DurableAudioArtifact,
+    cancellation: CaptureCancellationSignal,
+    phase: CaptureFinalizationPhase,
+}
+
+impl ListenerFinalizationState {
+    fn status(&self) -> CaptureStatus {
+        let capture = ActiveCapture {
+            active_capture_session: ActiveCaptureSession::new(self.session.clone()),
+            durable_audio_artifact: self.artifact.clone(),
+        };
+        match self.phase {
+            CaptureFinalizationPhase::Finalizing => CaptureStatus::Finalizing(capture),
+            CaptureFinalizationPhase::Transcribing => CaptureStatus::Transcribing(capture),
+        }
     }
 }
 
@@ -944,13 +982,14 @@ impl MaintenanceLeaseState {
     }
 
     fn grant_if_idle(&mut self, idle: bool) {
-        if idle && self.holder.is_none() {
-            if let Some(waiter) = self.waiters.pop_front() {
-                self.holder = Some(waiter.connection);
-                waiter
-                    .reply
-                    .respond(Output::maintenance_lease_granted(self.epoch.clone()));
-            }
+        if idle
+            && self.holder.is_none()
+            && let Some(waiter) = self.waiters.pop_front()
+        {
+            self.holder = Some(waiter.connection);
+            waiter
+                .reply
+                .respond(Output::maintenance_lease_granted(self.epoch.clone()));
         }
     }
 }
