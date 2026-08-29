@@ -20,12 +20,16 @@ pub mod maintenance;
 #[cfg(feature = "nota-text")]
 pub mod meta;
 pub mod notification;
+pub mod provider;
+pub mod provider_policy;
 pub mod recall;
 pub mod recording_log;
 pub mod runtime;
+pub mod segmentation;
 pub mod status;
 pub mod transcription;
 pub mod transport;
+mod wispr;
 
 pub use capture::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureMaintenanceSnapshot,
@@ -50,12 +54,18 @@ pub use history::{
 pub use latency::LatencyInstrumentation;
 pub use maintenance::CaptureMaintenance;
 #[cfg(feature = "nota-text")]
-pub use meta::MetaCommandLine;
+pub use meta::{MetaCommandLine, MetaProviderPolicyClient, MetaProviderPolicySocket};
 pub use notification::{
     ClipboardSuccessNotification, FreedesktopDbusNotificationTransport,
     FreedesktopNotificationTransport, FreedesktopSuccessNotifier, SilentSuccessNotifier,
     SuccessNotifier,
 };
+pub use provider::{
+    ProviderAttempt, ProviderAttemptOutcome, ProviderAttemptState, ProviderIdentifier,
+    ProviderPolicy, ProviderRouter, ProviderTranscriptRequest, TranscriptProvider,
+    WisprFlowProvider, WisprFlowTransport, WisprSessionBoundary,
+};
+pub use provider_policy::{MetaProviderPolicyService, ProviderPolicyStore};
 pub use recall::{RecallOutcome, RecallSelector, TranscriptRecall};
 pub use recording_log::{
     RawPcmExport, RecordingAudioFormat, RecordingInputSource, RecordingLog, RecordingLogDurability,

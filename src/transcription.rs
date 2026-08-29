@@ -2,11 +2,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, mpsc},
-    thread,
+    sync::Arc,
     time::Duration,
 };
 
+use kameo::{Actor, actor::Spawn, message::{Context, Message}};
 use signal_listener::{DurableAudioArtifact, TranscriptText};
 
 use serde::Deserialize;
@@ -23,7 +23,6 @@ const OPENAI_TRANSCRIPTION_GENERIC_INSTRUCTION: &str = "Transcribe spoken Englis
 pub const TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_ENVIRONMENT_VARIABLE: &str =
     "LISTENER_TRANSCRIPTION_CUSTOMIZATION_ARCHIVE";
 const OPENAI_MAXIMUM_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
-const TRANSCRIPTION_ACTOR_QUEUE_CAPACITY: usize = 1;
 const TRANSCRIPTION_ACTOR_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
 const TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_MAGIC: [u8; 8] = *b"LSTNVOC\0";
 const TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_VERSION: u32 = 1;
@@ -322,8 +321,9 @@ impl TranscriptionPrompt {
 }
 
 pub struct OpenAiBatchTranscriptionActor {
-    sender: mpsc::SyncSender<TranscriptionActorMessage>,
-    reply_timeout: Duration,
+    runtime: tokio::runtime::Runtime,
+    transcriber: OpenAiRestTranscriber,
+    status_publisher: StatusPublisher,
 }
 
 impl OpenAiBatchTranscriptionActor {
@@ -338,116 +338,69 @@ impl OpenAiBatchTranscriptionActor {
     pub fn new(
         transcriber: OpenAiRestTranscriber,
         status_publisher: StatusPublisher,
-        reply_timeout: Duration,
+        _reply_timeout: Duration,
     ) -> Self {
-        let (sender, receiver) = mpsc::sync_channel(TRANSCRIPTION_ACTOR_QUEUE_CAPACITY);
-        TranscriptionActorWorker::new(transcriber, status_publisher, receiver).spawn();
-        Self {
-            sender,
-            reply_timeout,
-        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Listener Tokio runtime construction must succeed");
+        Self { runtime, transcriber, status_publisher }
     }
 }
 
 impl BatchTranscriber for OpenAiBatchTranscriptionActor {
     fn transcribe(&self, request: BatchTranscriptionRequest) -> Result<TranscriptText> {
-        let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
-        self.sender
-            .send(TranscriptionActorMessage::Transcribe(
-                TranscriptionActorRequest::new(request, reply_sender),
-            ))
-            .map_err(|_| Error::TranscriptionActorUnavailable {
-                message: "transcription actor is not running".to_owned(),
-            })?;
-        reply_receiver
-            .recv_timeout(self.reply_timeout)
-            .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout => Error::TranscriptionActorUnavailable {
-                    message: "OpenAI transcription actor timed out".to_owned(),
-                },
-                mpsc::RecvTimeoutError::Disconnected => Error::TranscriptionActorUnavailable {
-                    message: "OpenAI transcription actor disconnected".to_owned(),
-                },
-            })?
+        self.runtime.block_on(async {
+            let worker = OpenAiTranscriptionWorker::spawn_with_mailbox(
+                OpenAiTranscriptionWorker::new(
+                    self.transcriber.clone(),
+                    self.status_publisher.clone(),
+                ),
+                kameo::mailbox::bounded(1),
+            );
+            worker.ask(TranscribeWithOpenAi(request)).send().await
+                .map_err(|error| Error::TranscriptionActorUnavailable { message: error.to_string() })
+        })
     }
 }
 
-struct TranscriptionActorWorker {
+#[derive(Actor)]
+struct OpenAiTranscriptionWorker {
     transcriber: Arc<OpenAiRestTranscriber>,
     status_publisher: StatusPublisher,
-    receiver: mpsc::Receiver<TranscriptionActorMessage>,
 }
 
-impl TranscriptionActorWorker {
+impl OpenAiTranscriptionWorker {
     fn new(
         transcriber: OpenAiRestTranscriber,
         status_publisher: StatusPublisher,
-        receiver: mpsc::Receiver<TranscriptionActorMessage>,
     ) -> Self {
         Self {
             transcriber: Arc::new(transcriber),
             status_publisher,
-            receiver,
         }
     }
+}
 
-    fn spawn(mut self) {
-        thread::spawn(move || self.run());
-    }
+struct TranscribeWithOpenAi(BatchTranscriptionRequest);
 
-    fn run(&mut self) {
-        while let Ok(message) = self.receiver.recv() {
-            match message {
-                TranscriptionActorMessage::Transcribe(request) => {
-                    self.handle_transcription(request)
-                }
-            }
-        }
-    }
+impl Message<TranscribeWithOpenAi> for OpenAiTranscriptionWorker {
+    type Reply = Result<TranscriptText>;
 
-    fn handle_transcription(&self, request: TranscriptionActorRequest) {
+    async fn handle(
+        &mut self,
+        message: TranscribeWithOpenAi,
+        _context: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.status_publisher.publish_transcribing();
         let transcriber = Arc::clone(&self.transcriber);
-        let status_publisher = self.status_publisher.clone();
-        thread::spawn(move || {
-            status_publisher.publish_transcribing();
-            let result = transcriber.transcribe(request.request().clone());
-            if result.is_err() {
-                status_publisher.publish_error();
-            }
-            let _ = request.reply(result);
-        });
-    }
-}
-
-enum TranscriptionActorMessage {
-    Transcribe(TranscriptionActorRequest),
-}
-
-struct TranscriptionActorRequest {
-    request: BatchTranscriptionRequest,
-    reply_sender: mpsc::SyncSender<Result<TranscriptText>>,
-}
-
-impl TranscriptionActorRequest {
-    fn new(
-        request: BatchTranscriptionRequest,
-        reply_sender: mpsc::SyncSender<Result<TranscriptText>>,
-    ) -> Self {
-        Self {
-            request,
-            reply_sender,
+        let result = tokio::task::spawn_blocking(move || transcriber.transcribe(message.0))
+            .await
+            .map_err(|error| Error::TranscriptionActorUnavailable { message: error.to_string() })?;
+        if result.is_err() {
+            self.status_publisher.publish_error();
         }
-    }
-
-    fn request(&self) -> &BatchTranscriptionRequest {
-        &self.request
-    }
-
-    fn reply(
-        self,
-        result: Result<TranscriptText>,
-    ) -> std::result::Result<(), mpsc::SendError<Result<TranscriptText>>> {
-        self.reply_sender.send(result)
+        result
     }
 }
 

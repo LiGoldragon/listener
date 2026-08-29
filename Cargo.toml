@@ -46,6 +46,7 @@ kameo                = { git = "https://github.com/LiGoldragon/kameo.git", rev =
 nota                 = { package = "nota", git = "https://github.com/LiGoldragon/nota.git", rev = "7d0651a0e098efea5fe2578cb06d88e009d40ff0", optional = true }
 reqwest              = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 rkyv                 = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
+sema-engine          = { git = "https://github.com/LiGoldragon/sema-engine.git", rev = "93a6b5f063292e000a7bf395fdd5b46e3e943068" }
 serde                = { version = "1", features = ["derive"] }
 serde_json           = "1"
 signal-frame         = { git = "https://github.com/LiGoldragon/signal-frame.git", rev = "f46872e7e8edae5264c892443d415a273b231234", default-features = false }
