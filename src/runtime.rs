@@ -21,16 +21,19 @@ use crate::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureStore, Configuration,
     DurableProviderFinalizer, Error, FreedesktopSuccessNotifier, LatencyInstrumentation,
     MetaProviderPolicyService, OpenAiBatchProvider, OpenAiBatchTranscriptionActor,
-    OutputTargetDispatcher, ProviderJobStore, ProviderPolicy, ProviderRouter,
+    OutputTargetDispatcher, ProviderCircuitBreaker, ProviderJobStore, ProviderPolicy,
+    ProviderRouter,
     RecoveredCaptureRecordings, Result, SilentSuccessNotifier, SuccessNotifier,
     TranscriptHistoryStore,
 };
-use crate::{BatchTranscriber, ProcessAudioCaptureBackend, StatusPublisher};
+use crate::{BatchTranscriber, ProcessAudioCaptureBackend, StatusPublisher, TranscriptProvider};
 
 pub struct ListenerRuntime {
     configuration: Configuration,
     capture_store: CaptureStore,
     capture_backend: Arc<dyn AudioCaptureBackend>,
+    transcriber: Arc<dyn BatchTranscriber>,
+    output_target_dispatcher: OutputTargetDispatcher,
     provider_finalizer: std::result::Result<DurableProviderFinalizer, String>,
     provider_policy_service: Option<Arc<MetaProviderPolicyService>>,
     history_store: TranscriptHistoryStore,
@@ -198,9 +201,12 @@ impl ListenerRuntime {
             delivery_ownership_admission,
         } = dependencies;
         let capture_store = CaptureStore::from_configuration(&configuration);
+        let transcriber: Arc<dyn BatchTranscriber> = Arc::from(transcriber);
         let provider_finalizer = Self::provider_finalizer(
             &configuration,
-            Arc::from(transcriber),
+            ProviderRouter::new(vec![Arc::new(OpenAiBatchProvider::new(Arc::clone(
+                &transcriber,
+            )))]),
             output_target_dispatcher.clone(),
             history_store.clone(),
         );
@@ -208,6 +214,8 @@ impl ListenerRuntime {
             configuration,
             capture_store,
             capture_backend: Arc::from(capture_backend),
+            transcriber,
+            output_target_dispatcher,
             provider_finalizer,
             provider_policy_service: None,
             history_store,
@@ -223,7 +231,7 @@ impl ListenerRuntime {
 
     fn provider_finalizer(
         configuration: &Configuration,
-        transcriber: Arc<dyn BatchTranscriber>,
+        router: ProviderRouter,
         dispatcher: OutputTargetDispatcher,
         history: TranscriptHistoryStore,
     ) -> std::result::Result<DurableProviderFinalizer, String> {
@@ -235,7 +243,7 @@ impl ListenerRuntime {
         .map(|jobs| {
             DurableProviderFinalizer::new(
                 jobs,
-                ProviderRouter::new(vec![Arc::new(OpenAiBatchProvider::new(transcriber))]),
+                router,
                 dispatcher,
                 history,
             )
@@ -254,6 +262,28 @@ impl ListenerRuntime {
     /// and for synthetic provider fixtures; it never accepts secret bytes.
     pub fn use_provider_finalizer(&mut self, finalizer: DurableProviderFinalizer) {
         self.provider_finalizer = Ok(finalizer);
+    }
+
+    /// Installs Wispr first and the already-hosted OpenAI worker second. The
+    /// durable meta policy still selects which configured provider may run.
+    pub fn use_wispr_then_openai_provider(
+        &mut self,
+        wispr: Arc<dyn TranscriptProvider>,
+        circuit_breaker: Arc<ProviderCircuitBreaker>,
+    ) {
+        let router = ProviderRouter::with_circuit_breaker(
+            vec![
+                wispr,
+                Arc::new(OpenAiBatchProvider::new(Arc::clone(&self.transcriber))),
+            ],
+            circuit_breaker,
+        );
+        self.provider_finalizer = Self::provider_finalizer(
+            &self.configuration,
+            router,
+            self.output_target_dispatcher.clone(),
+            self.history_store.clone(),
+        );
     }
 
     pub fn handle_input(&mut self, input: Input) -> Output {

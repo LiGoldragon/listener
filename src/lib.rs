@@ -61,12 +61,13 @@ pub use meta::{
 };
 pub use notification::{
     ClipboardSuccessNotification, FreedesktopDbusNotificationTransport,
-    FreedesktopNotificationTransport, FreedesktopSuccessNotifier, ProviderHealthNotification,
-    SilentSuccessNotifier, SuccessNotifier,
+    FreedesktopDbusProviderHealthNotificationTransport, FreedesktopNotificationTransport,
+    FreedesktopProviderHealthNotifier, FreedesktopSuccessNotifier, ProviderHealthNotification,
+    ProviderHealthNotificationTransport, SilentSuccessNotifier, SuccessNotifier,
 };
 pub use provider::{
     ProviderAttempt, ProviderAttemptOutcome, ProviderAttemptState, ProviderCircuitBreaker,
-    ProviderHealthEvent, ProviderHealthSink, ProviderIdentifier, ProviderPolicy, ProviderRouter,
+    ProviderHealthEvent, ProviderHealthFanout, ProviderHealthSink, ProviderIdentifier, ProviderPolicy, ProviderRouter,
     ProviderTranscriptRequest, TranscriptProvider, WisprFlowProvider, WisprFlowTransport,
     WisprSessionBoundary,
 };

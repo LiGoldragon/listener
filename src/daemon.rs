@@ -12,12 +12,14 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
         mpsc,
+        OnceLock,
     },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use signal_frame::ExchangeIdentifier;
+use kameo::{Actor, actor::{ActorRef, Spawn}, message::{Context, Message}};
 use signal_listener::{
     ActiveCapture, ActiveCaptureSession, CaptureCancellationRequested, CaptureCompletionRequested,
     CaptureSession, CaptureStatus, CompletionRequestedSession, DaemonEpoch, Input,
@@ -31,8 +33,9 @@ use crate::runtime::{
 };
 use crate::{
     CaptureMaintenance, Configuration, ContractFrameCodec, ContractFrameStream, Error,
-    LatencyInstrumentation, ListenerRuntime, MetaProviderPolicyServer, MetaProviderPolicyService,
-    ProviderPolicyStore, Result, StatusStreamServer,
+    FreedesktopProviderHealthNotifier, LatencyInstrumentation, ListenerRuntime,
+    MetaProviderPolicyServer, MetaProviderPolicyService, ProviderCircuitBreaker,
+    ProviderHealthFanout, ProviderPolicyStore, Result, StatusStreamServer,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,11 +64,22 @@ impl ListenerDaemon {
         let (status_server, status_publisher) =
             StatusStreamServer::from_configuration_with_latency(&configuration, latency.clone());
         let _status_thread = status_server.spawn()?;
+        let provider_health = Arc::new(ProviderHealthFanout::new(vec![
+            Arc::new(status_publisher.clone()),
+            Arc::new(FreedesktopProviderHealthNotifier::default()),
+        ]));
         let mut runtime = ListenerRuntime::from_configuration_with_status_and_latency(
             configuration.clone(),
-            status_publisher,
+            status_publisher.clone(),
             latency.clone(),
         )?;
+        runtime.use_wispr_then_openai_provider(
+            crate::wispr::production_wispr_provider(),
+            Arc::new(ProviderCircuitBreaker::new(
+                Duration::from_secs(30),
+                provider_health,
+            )),
+        );
         let maintenance = CaptureMaintenance::from_configuration(&configuration)?;
         runtime.advance_session_sequence(maintenance.snapshot().next_session_value());
         let _maintenance_thread = maintenance.spawn();
@@ -265,10 +279,28 @@ impl ConnectionReadError {
 
 #[derive(Clone)]
 struct ListenerOperationMailbox {
-    sender: mpsc::Sender<ListenerOperationMail>,
+    runtime: Arc<tokio::runtime::Runtime>,
+    actor: Arc<OnceLock<ActorRef<ListenerOperationActor>>>,
 }
 
 impl ListenerOperationMailbox {
+    fn unbound() -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("ListenerCore Tokio runtime construction must succeed");
+        Self {
+            runtime: Arc::new(runtime),
+            actor: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn bind(&self, actor: ActorRef<ListenerOperationActor>) {
+        self.actor
+            .set(actor)
+            .expect("ListenerCore actor is bound only once");
+    }
+
     fn request(&self, input: Input) -> Result<Output> {
         let (sender, receiver) = mpsc::sync_channel(1);
         self.send(ListenerOperationMail::Request(
@@ -304,15 +336,23 @@ impl ListenerOperationMailbox {
     }
 
     fn send(&self, mail: ListenerOperationMail) -> Result<()> {
-        self.sender.send(mail).map_err(|_| Error::NotImplemented {
+        let Some(actor) = self.actor.get() else {
+            return Err(Error::NotImplemented {
+                surface: "listener core actor not initialized",
+            });
+        };
+        actor.tell(mail).blocking_send().map_err(|_| Error::NotImplemented {
             surface: "listener operation actor",
         })
     }
 }
 
+/// The bounded Kameo/Tokio owner of all mutable Listener runtime state. Socket
+/// tasks and blocking capture/finalization workers can only return typed work
+/// completions through this mailbox; none hold a direct runtime reference.
+#[derive(Actor)]
 struct ListenerOperationActor {
     runtime: ListenerRuntime,
-    receiver: mpsc::Receiver<ListenerOperationMail>,
     mailbox: ListenerOperationMailbox,
     operation: ListenerOperationState,
     finalizations: BTreeMap<u64, ListenerFinalizationState>,
@@ -322,25 +362,21 @@ struct ListenerOperationActor {
 
 impl ListenerOperationActor {
     fn spawn(runtime: ListenerRuntime) -> ListenerOperationMailbox {
-        let (sender, receiver) = mpsc::channel();
-        let mailbox = ListenerOperationMailbox { sender };
+        let mailbox = ListenerOperationMailbox::unbound();
         let actor = Self {
             runtime,
-            receiver,
             mailbox: mailbox.clone(),
             operation: ListenerOperationState::Idle,
             finalizations: BTreeMap::new(),
             leases: MaintenanceLeaseState::for_current_daemon(),
             terminal_status: None,
         };
-        thread::spawn(move || actor.run());
+        let _runtime_guard = mailbox.runtime.enter();
+        mailbox.bind(ListenerOperationActor::spawn_with_mailbox(
+            actor,
+            kameo::mailbox::bounded(128),
+        ));
         mailbox
-    }
-
-    fn run(mut self) {
-        while let Ok(mail) = self.receiver.recv() {
-            self.handle_mail(mail);
-        }
     }
 
     fn handle_mail(&mut self, mail: ListenerOperationMail) {
@@ -642,9 +678,9 @@ impl ListenerOperationActor {
             return;
         };
         let start = RuntimeCaptureStartWork::from(start);
-        let sender = self.mailbox.sender.clone();
+        let mailbox = self.mailbox.clone();
         thread::spawn(move || {
-            let _ = sender.send(ListenerOperationMail::StartCompleted(
+            let _ = mailbox.send(ListenerOperationMail::StartCompleted(
                 ListenerStartCompletion {
                     result: start.start(),
                 },
@@ -653,9 +689,9 @@ impl ListenerOperationActor {
     }
 
     fn spawn_cancellation(&self, work: RuntimeCaptureCancellationWork) {
-        let sender = self.mailbox.sender.clone();
+        let mailbox = self.mailbox.clone();
         thread::spawn(move || {
-            let _ = sender.send(ListenerOperationMail::CancellationCompleted(work.execute()));
+            let _ = mailbox.send(ListenerOperationMail::CancellationCompleted(work.execute()));
         });
     }
 
@@ -665,9 +701,9 @@ impl ListenerOperationActor {
         work: RuntimeCaptureFinalizationWork,
         cancellation: CaptureCancellationSignal,
     ) {
-        let sender = self.mailbox.sender.clone();
+        let mailbox = self.mailbox.clone();
         let (phase_sender, phase_receiver) = mpsc::channel();
-        let phase_mailbox = self.mailbox.sender.clone();
+        let phase_mailbox = self.mailbox.clone();
         let phase_session = session.clone();
         thread::spawn(move || {
             while let Ok(phase) = phase_receiver.recv() {
@@ -679,7 +715,7 @@ impl ListenerOperationActor {
         });
         thread::spawn(move || {
             let output = work.execute(cancellation, phase_sender);
-            let _ = sender.send(ListenerOperationMail::FinalizationCompleted { session, output });
+            let _ = mailbox.send(ListenerOperationMail::FinalizationCompleted { session, output });
         });
     }
 
@@ -799,6 +835,18 @@ enum ListenerOperationMail {
         session: CaptureSession,
         output: Output,
     },
+}
+
+impl Message<ListenerOperationMail> for ListenerOperationActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        mail: ListenerOperationMail,
+        _context: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_mail(mail);
+    }
 }
 
 struct ListenerStartCompletion {

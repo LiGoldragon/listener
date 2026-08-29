@@ -6,15 +6,17 @@
 //! wire client; Listener never performs a live provider call in its test path.
 
 use std::{
+    process::Command,
     sync::{Arc, Mutex},
-    time::Instant,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use signal_listener::TranscriptText;
 
 use crate::{
-    ProviderAttemptState, ProviderTranscriptRequest, RecordingLog, WisprFlowTransport,
-    WisprSessionBoundary,
+    ProviderAttemptState, ProviderTranscriptRequest, RecordingLog, TranscriptProvider,
+    WisprFlowProvider, WisprFlowTransport, WisprSessionBoundary,
 };
 
 pub(crate) const TRANSCRIBE_STREAM_PATH: &str =
@@ -22,6 +24,11 @@ pub(crate) const TRANSCRIBE_STREAM_PATH: &str =
 pub(crate) const WISPR_GRPC_HOST: &str = "inference.wisprflow.com";
 pub(crate) const WISPR_SAMPLE_RATE: u32 = 16_000;
 pub(crate) const WISPR_MAXIMUM_SAMPLES: u64 = 350 * WISPR_SAMPLE_RATE as u64;
+const WISPR_SESSION_SECRET_NAME: &str = "wispr-flow/session";
+const WISPR_USER_ID_SECRET_NAME: &str = "wispr-flow/user-id";
+const WISPR_SESSION_CACHE_LIFETIME: Duration = Duration::from_secs(300);
+const WISPR_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+static NEXT_WISPR_REQUEST_IDENTIFIER: AtomicU64 = AtomicU64::new(1);
 
 /// An opaque, expiring session. It deliberately exposes no value accessor and
 /// does not implement Debug, Serialize, or Clone.
@@ -43,6 +50,26 @@ impl WisprSession {
 /// is acquired; they must never return it to logs or durable state.
 pub(crate) trait WisprSessionSource: Send + Sync {
     fn refresh_session(&self) -> Result<WisprSession, ProviderAttemptState>;
+}
+
+/// Local, request-time secret consumer for the opaque Wispr session. It never
+/// stores, logs, serializes, or returns the token beyond `WisprSession`; the
+/// gopass entry name is an identifier, not credential material.
+pub(crate) struct GopassWisprSessionSource {
+    secret_name: &'static str,
+}
+
+impl Default for GopassWisprSessionSource {
+    fn default() -> Self {
+        Self { secret_name: WISPR_SESSION_SECRET_NAME }
+    }
+}
+
+impl WisprSessionSource for GopassWisprSessionSource {
+    fn refresh_session(&self) -> Result<WisprSession, ProviderAttemptState> {
+        let value = local_secret(self.secret_name)?;
+        Ok(WisprSession::new(value, Instant::now() + WISPR_SESSION_CACHE_LIFETIME))
+    }
 }
 
 struct SessionCache {
@@ -145,6 +172,37 @@ pub(crate) trait WisprWireIdentity: Send + Sync {
     fn fresh_request_identifiers(&self) -> Result<WisprRequestIdentifiers, ProviderAttemptState>;
 }
 
+/// Resolves the non-public Wispr identity at submission time through the same
+/// local secret boundary. The request/session identifiers are newly generated
+/// opaque values and never enter durable provider-job state.
+pub(crate) struct GopassWisprWireIdentity {
+    user_id_secret_name: &'static str,
+}
+
+impl Default for GopassWisprWireIdentity {
+    fn default() -> Self {
+        Self { user_id_secret_name: WISPR_USER_ID_SECRET_NAME }
+    }
+}
+
+impl WisprWireIdentity for GopassWisprWireIdentity {
+    fn user_id(&self) -> Result<String, ProviderAttemptState> {
+        local_secret(self.user_id_secret_name)
+    }
+
+    fn fresh_request_identifiers(&self) -> Result<WisprRequestIdentifiers, ProviderAttemptState> {
+        let sequence = NEXT_WISPR_REQUEST_IDENTIFIER.fetch_add(1, Ordering::Relaxed);
+        let epoch_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ProviderAttemptState::Unavailable)?
+            .as_nanos();
+        Ok(WisprRequestIdentifiers::new(
+            format!("listener-{epoch_nanos}-{sequence}"),
+            format!("listener-request-{epoch_nanos}-{sequence}"),
+        ))
+    }
+}
+
 pub(crate) struct WisprRequestIdentifiers {
     session_id: String,
     request_id: String,
@@ -190,6 +248,130 @@ impl WisprGrpcStreamCall {
 /// prevents tests from issuing a network request.
 pub(crate) trait WisprGrpcStreamingBoundary: Send + Sync {
     fn stream(&self, call: WisprGrpcStreamCall) -> Result<Vec<Vec<u8>>, ProviderAttemptState>;
+}
+
+/// Concrete TLS/HTTP2 gRPC boundary. It is intentionally narrow: call
+/// metadata and encoded frames arrive from the private codec, while failures
+/// leave as typed routing states without exposing server bodies or request
+/// metadata. Tests exercise framing only and never invoke this boundary.
+pub(crate) struct ReqwestWisprGrpcStreamingBoundary {
+    client: reqwest::blocking::Client,
+}
+
+impl Default for ReqwestWisprGrpcStreamingBoundary {
+    fn default() -> Self {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(WISPR_REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        Self { client }
+    }
+}
+
+impl WisprGrpcStreamingBoundary for ReqwestWisprGrpcStreamingBoundary {
+    fn stream(&self, call: WisprGrpcStreamCall) -> Result<Vec<Vec<u8>>, ProviderAttemptState> {
+        if call.host != WISPR_GRPC_HOST || call.method != TRANSCRIBE_STREAM_PATH {
+            return Err(ProviderAttemptState::ProtocolFailure);
+        }
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in call.metadata {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| ProviderAttemptState::ProtocolFailure)?;
+            let value = reqwest::header::HeaderValue::from_str(&value)
+                .map_err(|_| ProviderAttemptState::ProtocolFailure)?;
+            headers.insert(name, value);
+        }
+        let request_body = grpc_encode_messages(&call.messages);
+        let response = self
+            .client
+            .post(format!("https://{}{}", call.host, call.method))
+            .headers(headers)
+            .body(request_body)
+            .send()
+            .map_err(|_| ProviderAttemptState::TransientFailure)?;
+        if !response.status().is_success() {
+            return Err(match response.status().as_u16() {
+                401 | 403 => ProviderAttemptState::AuthenticationExpired,
+                408 | 429 | 500..=599 => ProviderAttemptState::TransientFailure,
+                _ => ProviderAttemptState::Rejected,
+            });
+        }
+        let bytes = response
+            .bytes()
+            .map_err(|_| ProviderAttemptState::TransientFailure)?;
+        grpc_decode_messages(&bytes)
+    }
+}
+
+fn grpc_encode_messages(messages: &[Vec<u8>]) -> Vec<u8> {
+    let capacity = messages.iter().map(|message| message.len() + 5).sum();
+    let mut encoded = Vec::with_capacity(capacity);
+    for message in messages {
+        encoded.push(0);
+        encoded.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(message);
+    }
+    encoded
+}
+
+fn grpc_decode_messages(bytes: &[u8]) -> Result<Vec<Vec<u8>>, ProviderAttemptState> {
+    let mut messages = Vec::new();
+    let mut position = 0;
+    while position < bytes.len() {
+        let compressed = *bytes.get(position).ok_or(ProviderAttemptState::ProtocolFailure)?;
+        position += 1;
+        if compressed != 0 {
+            return Err(ProviderAttemptState::ProtocolFailure);
+        }
+        let size = bytes
+            .get(position..position + 4)
+            .ok_or(ProviderAttemptState::ProtocolFailure)
+            .map(|length| u32::from_be_bytes(length.try_into().expect("four bytes")) as usize)?;
+        position += 4;
+        let end = position.checked_add(size).ok_or(ProviderAttemptState::ProtocolFailure)?;
+        let message = bytes
+            .get(position..end)
+            .ok_or(ProviderAttemptState::ProtocolFailure)?;
+        messages.push(message.to_vec());
+        position = end;
+    }
+    Ok(messages)
+}
+
+fn local_secret(secret_name: &str) -> Result<String, ProviderAttemptState> {
+    let output = Command::new("gopass")
+        .args(["show", "-o", secret_name])
+        .output()
+        .map_err(|_| ProviderAttemptState::Unavailable)?;
+    if !output.status.success() {
+        return Err(ProviderAttemptState::Unavailable);
+    }
+    let value = String::from_utf8(output.stdout)
+        .map_err(|_| ProviderAttemptState::Unavailable)?
+        .trim()
+        .to_owned();
+    if value.is_empty() {
+        return Err(ProviderAttemptState::Unavailable);
+    }
+    Ok(value)
+}
+
+/// The production host gets a fully concrete private provider, while its
+/// secret/session values remain request-local. The provider's public router
+/// interface has no credential getter or persistence projection.
+pub(crate) fn production_wispr_provider() -> Arc<dyn TranscriptProvider> {
+    let session = Arc::new(RefreshingWisprSessionBoundary::new(Arc::new(
+        GopassWisprSessionSource::default(),
+    )));
+    let wire = Arc::new(ObservedWisprGrpcClient::new(
+        Arc::new(ReqwestWisprGrpcStreamingBoundary::default()),
+        Arc::new(GopassWisprWireIdentity::default()),
+    ));
+    let transport = Arc::new(ProtocolWisprFlowTransport::new(
+        Arc::new(RecordingLogWisprMediaAdapter),
+        wire,
+    ));
+    Arc::new(WisprFlowProvider::new(session, transport))
 }
 
 /// Concrete encoder/parser for the publicly observed Wispr Flow wire shape.
@@ -730,6 +912,16 @@ mod tests {
             calls[0].metadata().iter().any(
                 |(name, value)| *name == "authorization" && value == "Bearer synthetic-session"
             )
+        );
+    }
+
+    #[test]
+    fn grpc_framing_round_trips_without_contacting_a_provider() {
+        let encoded = grpc_encode_messages(&[vec![1, 2], vec![3, 4, 5]]);
+        assert_eq!(grpc_decode_messages(&encoded), Ok(vec![vec![1, 2], vec![3, 4, 5]]));
+        assert_eq!(
+            grpc_decode_messages(&[1, 0, 0, 0, 0]),
+            Err(ProviderAttemptState::ProtocolFailure),
         );
     }
 

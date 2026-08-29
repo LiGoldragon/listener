@@ -15,7 +15,10 @@ use std::{
 
 use serde::Serialize;
 
-use crate::{Configuration, Error, LatencyInstrumentation, RecordingSampleFormat, Result};
+use crate::{
+    Configuration, Error, LatencyInstrumentation, ProviderAttemptState, ProviderHealthEvent,
+    ProviderHealthSink, ProviderIdentifier, RecordingSampleFormat, Result,
+};
 
 const STATUS_SOCKET_MODE: u32 = 0o660;
 const STATUS_IDLE_DELAY: Duration = Duration::from_millis(900);
@@ -207,14 +210,14 @@ impl StatusPublisher {
     }
 
     pub fn recorder() -> (Self, StatusEventRecorder) {
-        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::new(Mutex::new(StatusEventRecording::default()));
         (
             Self {
-                sink: StatusPublisherSink::Recorder(Arc::clone(&events)),
+                sink: StatusPublisherSink::Recorder(Arc::clone(&recorder)),
                 latency_instrumentation: LatencyInstrumentation::disabled(),
                 in_flight_transcriptions: Arc::new(AtomicUsize::new(0)),
             },
-            StatusEventRecorder::new(events),
+            StatusEventRecorder::new(recorder),
         )
     }
 
@@ -239,9 +242,25 @@ impl StatusPublisher {
             StatusPublisherSink::Stream(sender) => {
                 let _ = sender.send(StatusStreamMessage::Publish(event));
             }
-            StatusPublisherSink::Recorder(events) => {
-                if let Ok(mut events) = events.lock() {
-                    events.push(event);
+            StatusPublisherSink::Recorder(recording) => {
+                if let Ok(mut recording) = recording.lock() {
+                    recording.events.push(event);
+                }
+            }
+        }
+    }
+
+    /// Publishes a typed, redacted provider health push to the local status
+    /// stream. It deliberately does not replace the current capture state.
+    pub fn publish_provider_health(&self, event: ProviderHealthEvent) {
+        match &self.sink {
+            StatusPublisherSink::Silent => {}
+            StatusPublisherSink::Stream(sender) => {
+                let _ = sender.send(StatusStreamMessage::ProviderHealth(event));
+            }
+            StatusPublisherSink::Recorder(recording) => {
+                if let Ok(mut recording) = recording.lock() {
+                    recording.provider_health.push(event);
                 }
             }
         }
@@ -293,21 +312,45 @@ impl StatusPublisher {
 enum StatusPublisherSink {
     Silent,
     Stream(mpsc::Sender<StatusStreamMessage>),
-    Recorder(Arc<Mutex<Vec<ListenerStatusEvent>>>),
+    Recorder(Arc<Mutex<StatusEventRecording>>),
 }
 
 #[derive(Clone)]
 pub struct StatusEventRecorder {
-    events: Arc<Mutex<Vec<ListenerStatusEvent>>>,
+    recording: Arc<Mutex<StatusEventRecording>>,
 }
 
 impl StatusEventRecorder {
-    fn new(events: Arc<Mutex<Vec<ListenerStatusEvent>>>) -> Self {
-        Self { events }
+    fn new(recording: Arc<Mutex<StatusEventRecording>>) -> Self {
+        Self { recording }
     }
 
     pub fn events(&self) -> Vec<ListenerStatusEvent> {
-        self.events.lock().expect("status events").clone()
+        self.recording
+            .lock()
+            .expect("status events")
+            .events
+            .clone()
+    }
+
+    pub fn provider_health(&self) -> Vec<ProviderHealthEvent> {
+        self.recording
+            .lock()
+            .expect("status events")
+            .provider_health
+            .clone()
+    }
+}
+
+#[derive(Default)]
+struct StatusEventRecording {
+    events: Vec<ListenerStatusEvent>,
+    provider_health: Vec<ProviderHealthEvent>,
+}
+
+impl ProviderHealthSink for StatusPublisher {
+    fn publish(&self, event: ProviderHealthEvent) {
+        self.publish_provider_health(event);
     }
 }
 
@@ -515,8 +558,10 @@ impl StatusStreamLoop {
                 Err(_) => return false,
             },
         };
-        if let Some(StatusStreamMessage::Publish(event)) = message {
-            self.broadcast(event);
+        match message {
+            Some(StatusStreamMessage::Publish(event)) => self.broadcast(event),
+            Some(StatusStreamMessage::ProviderHealth(event)) => self.broadcast_provider_health(event),
+            None => {}
         }
         true
     }
@@ -535,6 +580,16 @@ impl StatusStreamLoop {
             Ok(line) => StatusStreamBroadcastLine::new(line),
             Err(_) => return,
         };
+        shared_state
+            .clients
+            .retain_mut(|stream| line.write_to(stream).is_ok());
+    }
+
+    fn broadcast_provider_health(&mut self, event: ProviderHealthEvent) {
+        let Ok(mut shared_state) = self.shared_state.lock() else {
+            return;
+        };
+        let line = StatusStreamBroadcastLine::new(ProviderHealthPush::from_event(event).json_line());
         shared_state
             .clients
             .retain_mut(|stream| line.write_to(stream).is_ok());
@@ -579,6 +634,59 @@ impl StatusStreamBroadcastLine {
 
 enum StatusStreamMessage {
     Publish(ListenerStatusEvent),
+    ProviderHealth(ProviderHealthEvent),
+}
+
+/// A local status-stream push. Its explicit event tag keeps it distinct from
+/// capture-state snapshots and its typed values never contain response text,
+/// credentials, session identifiers, or artifact paths.
+#[derive(Serialize)]
+struct ProviderHealthPush {
+    event: &'static str,
+    provider: &'static str,
+    state: &'static str,
+}
+
+impl ProviderHealthPush {
+    fn from_event(event: ProviderHealthEvent) -> Self {
+        match event {
+            ProviderHealthEvent::Degraded { provider, state } => Self {
+                event: "provider-degraded",
+                provider: provider_health_provider(provider),
+                state: provider_health_state(state),
+            },
+            ProviderHealthEvent::Recovered { provider } => Self {
+                event: "provider-recovered",
+                provider: provider_health_provider(provider),
+                state: "recovered",
+            },
+        }
+    }
+
+    fn json_line(&self) -> String {
+        serde_json::to_string(self)
+            .map(|json| format!("{json}\n"))
+            .unwrap_or_else(|_| "{\"event\":\"provider-health-unavailable\"}\n".to_owned())
+    }
+}
+
+fn provider_health_provider(provider: ProviderIdentifier) -> &'static str {
+    provider.as_str()
+}
+
+fn provider_health_state(state: ProviderAttemptState) -> &'static str {
+    match state {
+        ProviderAttemptState::Succeeded => "succeeded",
+        ProviderAttemptState::Unavailable => "unavailable",
+        ProviderAttemptState::Rejected => "rejected",
+        ProviderAttemptState::TransientFailure => "transient-failure",
+        ProviderAttemptState::ProtocolFailure => "protocol-failure",
+        ProviderAttemptState::SizeLimit => "size-limit",
+        ProviderAttemptState::AuthenticationExpired => "authentication-expired",
+        ProviderAttemptState::Cancelled => "cancelled",
+        ProviderAttemptState::LocalArtifactFailure => "local-artifact-failure",
+        ProviderAttemptState::AmbiguousAfterSubmit => "ambiguous-after-submit",
+    }
 }
 
 impl MicrophoneLevel {

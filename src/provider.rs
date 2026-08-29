@@ -107,6 +107,27 @@ pub trait ProviderHealthSink: Send + Sync {
     fn publish(&self, event: ProviderHealthEvent);
 }
 
+/// One typed event can drive multiple local projections without giving the
+/// router access to either transport. Every sink receives the same redacted
+/// event value; no provider response, session, or artifact is fanned out.
+pub struct ProviderHealthFanout {
+    sinks: Vec<Arc<dyn ProviderHealthSink>>,
+}
+
+impl ProviderHealthFanout {
+    pub fn new(sinks: Vec<Arc<dyn ProviderHealthSink>>) -> Self {
+        Self { sinks }
+    }
+}
+
+impl ProviderHealthSink for ProviderHealthFanout {
+    fn publish(&self, event: ProviderHealthEvent) {
+        for sink in &self.sinks {
+            sink.publish(event);
+        }
+    }
+}
+
 struct SilentProviderHealthSink;
 impl ProviderHealthSink for SilentProviderHealthSink {
     fn publish(&self, _event: ProviderHealthEvent) {}

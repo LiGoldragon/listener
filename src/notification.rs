@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use signal_listener::TranscriptText;
 use zbus::{Message, message::Flags, zvariant::OwnedValue};
 
-use crate::{ProviderHealthEvent, ProviderIdentifier};
+use crate::{ProviderHealthEvent, ProviderHealthSink, ProviderIdentifier};
 
 const APPLICATION_NAME: &str = "Listener";
 const TITLE: &str = "Listener Clipboard:";
@@ -40,6 +40,7 @@ impl ProviderHealthNotification {
         Self { body }
     }
 
+    pub fn application_name(&self) -> &'static str { APPLICATION_NAME }
     pub fn title(&self) -> &'static str { "Listener transcription provider" }
     pub fn body(&self) -> &str { &self.body }
 }
@@ -120,6 +121,76 @@ impl FreedesktopNotificationTransport for FreedesktopDbusNotificationTransport {
             return;
         };
         let _ = connection.send(&message);
+    }
+}
+
+/// Delivery boundary for provider health. Its value is already a redacted
+/// projection, so session material, provider diagnostics, and transcript text
+/// cannot cross from routing to the desktop bus.
+pub trait ProviderHealthNotificationTransport: Send + Sync {
+    fn notify(&self, notification: ProviderHealthNotification);
+}
+
+#[derive(Default)]
+pub struct FreedesktopDbusProviderHealthNotificationTransport;
+
+impl ProviderHealthNotificationTransport for FreedesktopDbusProviderHealthNotificationTransport {
+    fn notify(&self, notification: ProviderHealthNotification) {
+        let Ok(message) = (FreedesktopProviderHealthNotifyRequest { notification }).message() else {
+            return;
+        };
+        let Ok(connection) = zbus::blocking::Connection::session() else {
+            return;
+        };
+        let _ = connection.send(&message);
+    }
+}
+
+struct FreedesktopProviderHealthNotifyRequest {
+    notification: ProviderHealthNotification,
+}
+
+impl FreedesktopProviderHealthNotifyRequest {
+    fn message(&self) -> zbus::Result<Message> {
+        let hints = HashMap::from([("transient".to_owned(), OwnedValue::from(true))]);
+        Message::method(NOTIFICATION_PATH, NOTIFICATION_METHOD)?
+            .destination(NOTIFICATION_DESTINATION)?
+            .interface(NOTIFICATION_INTERFACE)?
+            .with_flags(Flags::NoReplyExpected)?
+            .build(&(
+                self.notification.application_name(),
+                0_u32,
+                "",
+                self.notification.title(),
+                self.notification.body(),
+                Vec::<String>::new(),
+                hints,
+                EXPIRE_TIMEOUT_MILLISECONDS,
+            ))
+    }
+}
+
+/// The host-installed typed health sink. It projects the event only once, at
+/// the desktop boundary; router state still retains just its typed event.
+pub struct FreedesktopProviderHealthNotifier {
+    transport: Arc<dyn ProviderHealthNotificationTransport>,
+}
+
+impl FreedesktopProviderHealthNotifier {
+    pub fn new(transport: Arc<dyn ProviderHealthNotificationTransport>) -> Self {
+        Self { transport }
+    }
+}
+
+impl Default for FreedesktopProviderHealthNotifier {
+    fn default() -> Self {
+        Self::new(Arc::new(FreedesktopDbusProviderHealthNotificationTransport))
+    }
+}
+
+impl ProviderHealthSink for FreedesktopProviderHealthNotifier {
+    fn publish(&self, event: ProviderHealthEvent) {
+        self.transport.notify(ProviderHealthNotification::from_event(event));
     }
 }
 
