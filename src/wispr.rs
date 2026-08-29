@@ -9,7 +9,10 @@ use std::{path::Path, sync::{Arc, Mutex}, time::Instant};
 
 use signal_listener::TranscriptText;
 
-use crate::{ProviderAttemptState, ProviderTranscriptRequest, WisprFlowTransport, WisprSessionBoundary};
+use crate::{
+    ProviderAttemptState, ProviderTranscriptRequest, RecordingLog, WisprFlowTransport,
+    WisprSessionBoundary,
+};
 
 pub(crate) const TRANSCRIBE_STREAM_PATH: &str = "/flow_api.v1.TranscriptionService/TranscribeStream";
 pub(crate) const WISPR_GRPC_HOST: &str = "inference.wisprflow.com";
@@ -395,6 +398,46 @@ fn is_wispr_pcm16_wav(wav: &[u8]) -> bool {
 /// durable source without changing OpenAI's media behavior.
 pub(crate) trait WisprMediaAdapter: Send + Sync {
     fn wav_pcm16(&self, artifact: &Path) -> Result<Vec<u8>, ProviderAttemptState>;
+}
+
+/// Converts Listener's committed recording-log PCM authority directly to the
+/// observed provider's 16 kHz mono signed-16-bit WAV. It has no network or
+/// credential access and rejects any incompatible recording before encoding.
+pub(crate) struct RecordingLogWisprMediaAdapter;
+
+impl WisprMediaAdapter for RecordingLogWisprMediaAdapter {
+    fn wav_pcm16(&self, artifact: &Path) -> Result<Vec<u8>, ProviderAttemptState> {
+        let recovered = RecordingLog::new(artifact)
+            .recover()
+            .map_err(|_| ProviderAttemptState::LocalArtifactFailure)?;
+        let (format, pcm) = recovered
+            .raw_pcm_bytes()
+            .map_err(|_| ProviderAttemptState::LocalArtifactFailure)?;
+        if format.sample_rate() != WISPR_SAMPLE_RATE
+            || format.channel_count() != 1
+            || format.sample_format() != crate::RecordingSampleFormat::SignedSixteenBitLittleEndian
+            || pcm.len() % 2 != 0
+        {
+            return Err(ProviderAttemptState::LocalArtifactFailure);
+        }
+        let data_length = u32::try_from(pcm.len()).map_err(|_| ProviderAttemptState::SizeLimit)?;
+        let riff_length = data_length.checked_add(36).ok_or(ProviderAttemptState::SizeLimit)?;
+        let mut wav = Vec::with_capacity(44 + pcm.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&riff_length.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&WISPR_SAMPLE_RATE.to_le_bytes());
+        wav.extend_from_slice(&(WISPR_SAMPLE_RATE * 2).to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_length.to_le_bytes());
+        wav.extend_from_slice(&pcm);
+        Ok(wav)
+    }
 }
 
 pub(crate) struct ProtocolWisprFlowTransport {

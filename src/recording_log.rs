@@ -717,6 +717,21 @@ impl RecoveredRecordingLog {
             byte_length: self.total_payload_bytes(),
         })
     }
+
+    /// Reads the recovered, committed PCM authority without constructing a
+    /// provider-owned artifact. Callers must bound/slice it before transport.
+    pub fn raw_pcm_bytes(&self) -> Result<(RecordingAudioFormat, Vec<u8>)> {
+        let mut source = File::open(&self.path)?;
+        let mut bytes = Vec::with_capacity(usize::try_from(self.total_payload_bytes()).unwrap_or(0));
+        let mut payload = Vec::new();
+        for record in &self.records {
+            source.seek(SeekFrom::Start(record.payload_position()))?;
+            payload.resize(record.payload_length() as usize, 0);
+            source.read_exact(&mut payload)?;
+            bytes.extend_from_slice(&payload);
+        }
+        Ok((self.header.audio_format(), bytes))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
