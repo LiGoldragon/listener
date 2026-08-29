@@ -1,6 +1,6 @@
 [package]
 name         = "listener"
-version      = "0.14.0"
+version      = "0.15.0"
 edition      = "2024"
 rust-version = "1.89"
 license      = "MIT OR Apache-2.0"
@@ -41,15 +41,17 @@ nota-text = ["dep:nota", "signal-frame/nota-text", "signal-listener/nota-text", 
 [dependencies]
 crc32fast            = "1"
 fs2                  = "0.4"
-meta-signal-listener = { git = "https://github.com/LiGoldragon/meta-signal-listener.git", branch = "main", default-features = false }
-nota                 = { package = "nota", git = "https://github.com/LiGoldragon/nota.git", branch = "main", optional = true }
+meta-signal-listener = { git = "https://github.com/LiGoldragon/meta-signal-listener.git", branch = "listener-wispr-01a04e75", default-features = false }
+kameo                = { git = "https://github.com/LiGoldragon/kameo.git", rev = "f491b45d7dcb55e5837eddde3d5d7ca8ceaa9f01", default-features = false, features = ["macros"] }
+nota                 = { package = "nota", git = "https://github.com/LiGoldragon/nota.git", rev = "7d0651a0e098efea5fe2578cb06d88e009d40ff0", optional = true }
 reqwest              = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 rkyv                 = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
 serde                = { version = "1", features = ["derive"] }
 serde_json           = "1"
-signal-frame         = { git = "https://github.com/LiGoldragon/signal-frame.git", branch = "main", default-features = false }
-signal-listener      = { git = "https://github.com/LiGoldragon/signal-listener.git", branch = "main", default-features = false }
+signal-frame         = { git = "https://github.com/LiGoldragon/signal-frame.git", rev = "f46872e7e8edae5264c892443d415a273b231234", default-features = false }
+signal-listener      = { git = "https://github.com/LiGoldragon/signal-listener.git", rev = "b44a9e7a2161e1fd77df6ecde64bb824f2dd2069", default-features = false }
 thiserror            = "2"
+tokio                = { version = "1", features = ["net", "process", "rt-multi-thread", "sync", "time"] }
 zbus                 = "4.4"
 
 [dev-dependencies]
