@@ -4,6 +4,8 @@ pub const SAMPLE_RATE: u64 = 16_000;
 pub const HARD_CUT_SAMPLES: u64 = 350 * SAMPLE_RATE;
 pub const PAUSE_SEARCH_START_SAMPLES: u64 = 330 * SAMPLE_RATE;
 pub const DEFAULT_OVERLAP_SAMPLES: u64 = SAMPLE_RATE;
+const PAUSE_MINIMUM_SAMPLES: u64 = SAMPLE_RATE / 2;
+const SILENCE_AMPLITUDE: i16 = 400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentSampleRange { start: u64, end: u64 }
@@ -23,6 +25,47 @@ pub fn plan_next_segment(start: u64, available_end: u64, pause_at: Option<u64>, 
     let end = pause.unwrap_or(hard_end);
     let segment = SegmentSampleRange::new(start, end)?;
     Some((segment, end.saturating_sub(overlap.min(end - start))))
+}
+
+/// Plans contiguous master chunks from raw mono PCM sample indices. A stable
+/// low-amplitude pause near the 5:50 boundary wins; otherwise the hard cut is
+/// exact. The final shorter tail is retained, and every following chunk starts
+/// one second before the prior master end for provider seam context.
+pub fn plan_raw_pcm_segments(pcm_s16le: &[u8]) -> Vec<SegmentSampleRange> {
+    let samples = pcm_s16le.len() / 2;
+    let available_end = u64::try_from(samples).unwrap_or(u64::MAX);
+    let mut segments = Vec::new();
+    let mut start = 0;
+    while let Some((segment, next)) = plan_next_segment(
+        start,
+        available_end,
+        stable_pause_at(pcm_s16le, start, available_end),
+        DEFAULT_OVERLAP_SAMPLES,
+    ) {
+        segments.push(segment);
+        start = next;
+    }
+    if start < available_end {
+        if let Some(tail) = SegmentSampleRange::new(start, available_end) { segments.push(tail); }
+    }
+    segments
+}
+
+fn stable_pause_at(pcm_s16le: &[u8], start: u64, available_end: u64) -> Option<u64> {
+    let begin = start.checked_add(PAUSE_SEARCH_START_SAMPLES)?;
+    let limit = start.checked_add(HARD_CUT_SAMPLES)?.min(available_end);
+    let mut run_start = None;
+    for index in begin..limit {
+        let offset = usize::try_from(index.checked_mul(2)?).ok()?;
+        let sample = i16::from_le_bytes([*pcm_s16le.get(offset)?, *pcm_s16le.get(offset + 1)?]);
+        if sample.unsigned_abs() <= SILENCE_AMPLITUDE as u16 {
+            run_start.get_or_insert(index);
+            if index + 1 - run_start? >= PAUSE_MINIMUM_SAMPLES { return Some(run_start?); }
+        } else {
+            run_start = None;
+        }
+    }
+    None
 }
 
 /// Reassembles chunk text conservatively. Only an exact normalized overlap of
@@ -63,5 +106,17 @@ mod tests {
     fn only_removes_strong_exact_seams() {
         assert_eq!(stitch_transcripts(&["one two three".into(), "two three four".into()]), "one two three four");
         assert_eq!(stitch_transcripts(&["one two".into(), "two differs".into()]), "one two two differs");
+    }
+    #[test]
+    fn raw_pcm_planning_keeps_tail_and_uses_a_stable_pause() {
+        let samples = usize::try_from(HARD_CUT_SAMPLES + SAMPLE_RATE).unwrap();
+        let mut pcm = vec![1_000_i16; samples];
+        let pause = usize::try_from(PAUSE_SEARCH_START_SAMPLES + SAMPLE_RATE).unwrap();
+        pcm[pause..pause + usize::try_from(PAUSE_MINIMUM_SAMPLES).unwrap()].fill(0);
+        let bytes: Vec<u8> = pcm.into_iter().flat_map(i16::to_le_bytes).collect();
+        let planned = plan_raw_pcm_segments(&bytes);
+        assert_eq!(planned[0].end(), u64::try_from(pause).unwrap());
+        assert_eq!(planned[1].start(), u64::try_from(pause).unwrap() - DEFAULT_OVERLAP_SAMPLES);
+        assert_eq!(planned.last().unwrap().end(), u64::try_from(samples).unwrap());
     }
 }
