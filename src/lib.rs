@@ -62,8 +62,9 @@ pub use notification::{
     SuccessNotifier,
 };
 pub use provider::{
-    ProviderAttempt, ProviderAttemptOutcome, ProviderAttemptState, ProviderIdentifier,
-    ProviderPolicy, ProviderRouter, ProviderTranscriptRequest, TranscriptProvider,
+    ProviderAttempt, ProviderAttemptOutcome, ProviderAttemptState, ProviderCircuitBreaker,
+    ProviderHealthEvent, ProviderHealthSink, ProviderIdentifier, ProviderPolicy, ProviderRouter,
+    ProviderTranscriptRequest, TranscriptProvider,
     WisprFlowProvider, WisprFlowTransport, WisprSessionBoundary,
 };
 pub use provider_job::{ProviderJob, ProviderJobStore};

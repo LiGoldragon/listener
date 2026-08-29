@@ -4,7 +4,7 @@
 //! the durable Listener artifact: a fallback receives the exact same request,
 //! never an in-memory or provider-owned copy.
 
-use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf, sync::{Arc, Mutex}, time::{Duration, Instant}};
 
 use signal_listener::TranscriptText;
 
@@ -72,6 +72,74 @@ impl ProviderAttemptState {
     }
 }
 
+/// Redacted provider-health change suitable for status, push, or desktop
+/// notification. It has a stable provider and typed state, never provider
+/// response text, request identifiers, artifact paths, or credentials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderHealthEvent {
+    Degraded { provider: ProviderIdentifier, state: ProviderAttemptState },
+    Recovered { provider: ProviderIdentifier },
+}
+
+pub trait ProviderHealthSink: Send + Sync {
+    fn publish(&self, event: ProviderHealthEvent);
+}
+
+struct SilentProviderHealthSink;
+impl ProviderHealthSink for SilentProviderHealthSink { fn publish(&self, _event: ProviderHealthEvent) {} }
+
+#[derive(Clone, Copy)]
+enum ProviderCircuitState { Closed, Open { retry_after: Instant }, HalfOpen }
+
+/// A single-probe circuit breaker. The first eligible caller changes Open to
+/// HalfOpen under the mutex; concurrent callers are refused until that one
+/// probe records success or failure.
+pub struct ProviderCircuitBreaker {
+    cooldown: Duration,
+    states: Mutex<BTreeMap<ProviderIdentifier, ProviderCircuitState>>,
+    sink: Arc<dyn ProviderHealthSink>,
+}
+
+impl ProviderCircuitBreaker {
+    // Exception: Too trivial. Construction fixes the health event boundary.
+    pub fn new(cooldown: Duration, sink: Arc<dyn ProviderHealthSink>) -> Self {
+        Self { cooldown, states: Mutex::new(BTreeMap::new()), sink }
+    }
+
+    pub fn permit(&self, provider: ProviderIdentifier) -> bool {
+        let Ok(mut states) = self.states.lock() else { return false; };
+        match states.get(&provider).copied().unwrap_or(ProviderCircuitState::Closed) {
+            ProviderCircuitState::Closed => true,
+            ProviderCircuitState::HalfOpen => false,
+            ProviderCircuitState::Open { retry_after } if Instant::now() < retry_after => false,
+            ProviderCircuitState::Open { .. } => {
+                states.insert(provider, ProviderCircuitState::HalfOpen);
+                true
+            }
+        }
+    }
+
+    pub fn record_failure(&self, provider: ProviderIdentifier, state: ProviderAttemptState) {
+        let Ok(mut states) = self.states.lock() else { return; };
+        let was_closed = matches!(states.get(&provider), None | Some(ProviderCircuitState::Closed));
+        states.insert(provider, ProviderCircuitState::Open { retry_after: Instant::now() + self.cooldown });
+        drop(states);
+        if was_closed { self.sink.publish(ProviderHealthEvent::Degraded { provider, state }); }
+    }
+
+    pub fn record_success(&self, provider: ProviderIdentifier) {
+        let Ok(mut states) = self.states.lock() else { return; };
+        let was_degraded = matches!(states.get(&provider), Some(ProviderCircuitState::Open { .. } | ProviderCircuitState::HalfOpen));
+        states.insert(provider, ProviderCircuitState::Closed);
+        drop(states);
+        if was_degraded { self.sink.publish(ProviderHealthEvent::Recovered { provider }); }
+    }
+}
+
+impl Default for ProviderCircuitBreaker {
+    fn default() -> Self { Self::new(Duration::from_secs(30), Arc::new(SilentProviderHealthSink)) }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderTranscriptRequest {
     artifact_path: PathBuf,
@@ -130,11 +198,19 @@ impl ProviderAttemptOutcome {
 #[derive(Clone)]
 pub struct ProviderRouter {
     providers: BTreeMap<ProviderIdentifier, Arc<dyn TranscriptProvider>>,
+    circuit_breaker: Arc<ProviderCircuitBreaker>,
 }
 
 impl ProviderRouter {
     pub fn new(providers: Vec<Arc<dyn TranscriptProvider>>) -> Self {
-        Self { providers: providers.into_iter().map(|provider| (provider.identifier(), provider)).collect() }
+        Self::with_circuit_breaker(providers, Arc::new(ProviderCircuitBreaker::default()))
+    }
+
+    pub fn with_circuit_breaker(
+        providers: Vec<Arc<dyn TranscriptProvider>>,
+        circuit_breaker: Arc<ProviderCircuitBreaker>,
+    ) -> Self {
+        Self { providers: providers.into_iter().map(|provider| (provider.identifier(), provider)).collect(), circuit_breaker }
     }
 
     pub fn transcribe(&self, policy: ProviderPolicy, request: ProviderTranscriptRequest) -> ProviderAttemptOutcome {
@@ -144,8 +220,13 @@ impl ProviderRouter {
                 attempts.push(ProviderAttempt::new(*provider_id, request.artifact_path().clone(), ProviderAttemptState::Unavailable));
                 continue;
             };
+            if !self.circuit_breaker.permit(*provider_id) {
+                attempts.push(ProviderAttempt::new(*provider_id, request.artifact_path().clone(), ProviderAttemptState::Unavailable));
+                continue;
+            }
             match provider.transcribe(&request) {
                 Ok(transcript) => {
+                    self.circuit_breaker.record_success(*provider_id);
                     attempts.push(ProviderAttempt::new(
                         *provider_id,
                         request.artifact_path().clone(),
@@ -154,6 +235,7 @@ impl ProviderRouter {
                     return ProviderAttemptOutcome { transcript: Some(transcript), attempts };
                 }
                 Err(state) => {
+                    if state.permits_fallback() { self.circuit_breaker.record_failure(*provider_id, state); }
                     attempts.push(ProviderAttempt::new(*provider_id, request.artifact_path().clone(), state));
                     if !state.permits_fallback() { break; }
                 }
