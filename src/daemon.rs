@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
+        Arc,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
@@ -30,7 +31,8 @@ use crate::runtime::{
 };
 use crate::{
     CaptureMaintenance, Configuration, ContractFrameCodec, ContractFrameStream, Error,
-    LatencyInstrumentation, ListenerRuntime, Result, StatusStreamServer,
+    LatencyInstrumentation, ListenerRuntime, MetaProviderPolicyServer, MetaProviderPolicyService,
+    ProviderPolicyStore, Result, StatusStreamServer,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,7 +69,19 @@ impl ListenerDaemon {
         let maintenance = CaptureMaintenance::from_configuration(&configuration)?;
         runtime.advance_session_sequence(maintenance.snapshot().next_session_value());
         let _maintenance_thread = maintenance.spawn();
-        ListenerSocketServer::new_with_latency(configuration, runtime, latency).serve()
+        let policy_store = ProviderPolicyStore::open(
+            configuration.capture_store_directory().join("transcription-provider-policy.sema"),
+        ).map_err(|error| Error::ProviderPolicyUnavailable { message: error.to_string() })?;
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let meta_server = MetaProviderPolicyServer::bind(
+            configuration.meta_socket_path(), configuration.meta_socket_mode(),
+            Arc::new(MetaProviderPolicyService::new(policy_store)),
+        )?;
+        let meta_thread = meta_server.spawn_until(Arc::clone(&stopping));
+        let result = ListenerSocketServer::new_with_latency(configuration, runtime, latency).serve();
+        stopping.store(true, std::sync::atomic::Ordering::Release);
+        let _ = meta_thread.join();
+        result
     }
 
     pub fn run_to_exit_code() -> ExitCode {

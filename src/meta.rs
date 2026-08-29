@@ -4,10 +4,13 @@
 //! length-prefixed `meta-signal-listener` frame per connection.
 
 use std::{
+    fs,
     io::{Read, Write},
-    os::unix::net::UnixStream,
+    os::unix::{fs::PermissionsExt, net::{UnixListener, UnixStream}},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use meta_signal_listener::{Frame, FrameBody, Input, Output};
@@ -15,7 +18,7 @@ use signal_frame::{
     ExchangeIdentifier, ExchangeLane, LaneSequence, Reply, SessionEpoch, SubReply,
 };
 
-use crate::{Configuration, Error, MetaProviderPolicyService, Result};
+use crate::{Configuration, Error, MetaProviderPolicyService, Result, daemon::DaemonSocketBinding};
 
 const MAXIMUM_META_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
@@ -97,6 +100,43 @@ impl MetaProviderPolicyClient {
 
 pub struct MetaProviderPolicySocket {
     service: Arc<MetaProviderPolicyService>,
+}
+
+/// Bound privileged meta service. Its accept loop is owned by the Listener
+/// daemon supervisor; it is never a fire-and-forget worker.
+pub struct MetaProviderPolicyServer {
+    listener: UnixListener,
+    socket: MetaProviderPolicySocket,
+}
+
+impl MetaProviderPolicyServer {
+    pub fn bind(
+        path: impl Into<PathBuf>,
+        mode: u32,
+        service: Arc<MetaProviderPolicyService>,
+    ) -> Result<Self> {
+        let binding = DaemonSocketBinding::new(path, mode);
+        binding.prepare()?;
+        let listener = UnixListener::bind(binding.path())?;
+        fs::set_permissions(binding.path(), fs::Permissions::from_mode(binding.mode()))?;
+        listener.set_nonblocking(true)?;
+        Ok(Self { listener, socket: MetaProviderPolicySocket::new(service) })
+    }
+
+    pub fn serve_until(self, stopping: Arc<AtomicBool>) -> Result<()> {
+        while !stopping.load(Ordering::Acquire) {
+            match self.listener.accept() {
+                Ok((stream, _)) => { let _ = self.socket.handle_connection(stream); }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(10)),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn spawn_until(self, stopping: Arc<AtomicBool>) -> JoinHandle<Result<()>> {
+        thread::spawn(move || self.serve_until(stopping))
+    }
 }
 
 trait ServesMetaProviderPolicySocket {

@@ -1,11 +1,12 @@
 use std::{
     io::{Read, Write},
     os::unix::net::UnixStream,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
 };
 
 use listener::{
-    MetaProviderPolicyService, MetaProviderPolicySocket, ProviderIdentifier, ProviderPolicyStore,
+    MetaProviderPolicyClient, MetaProviderPolicyServer, MetaProviderPolicyService,
+    MetaProviderPolicySocket, ProviderIdentifier, ProviderPolicyStore,
 };
 use meta_signal_listener::{
     Frame, FrameBody, Input, Output, TranscriptionProviderConfigurationRejectionReason,
@@ -159,4 +160,23 @@ fn privileged_socket_preserves_the_meta_exchange_and_returns_the_persisted_gener
         };
         assert_eq!(receipt.payload().payload().value(), 1);
     });
+}
+
+#[test]
+fn privileged_meta_server_binds_the_configured_socket_and_stops_with_its_owner() {
+    let directory = tempfile::tempdir().expect("temporary policy server");
+    let socket_path = directory.path().join("listener-meta.sock");
+    let service = Arc::new(MetaProviderPolicyService::new(
+        ProviderPolicyStore::open(directory.path().join("listener.sema")).expect("open store"),
+    ));
+    let server = MetaProviderPolicyServer::bind(&socket_path, 0o600, service).expect("bind meta socket");
+    let stopping = Arc::new(AtomicBool::new(false));
+    let worker = server.spawn_until(Arc::clone(&stopping));
+
+    let output = MetaProviderPolicyClient::new(&socket_path)
+        .request(Input::ConfigureTranscriptionProviders(wispr_then_openai()))
+        .expect("request durable policy");
+    assert!(matches!(output, Output::TranscriptionProvidersConfigured(_)));
+    stopping.store(true, Ordering::Release);
+    worker.join().expect("server thread").expect("server exits cleanly");
 }

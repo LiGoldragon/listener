@@ -12,6 +12,9 @@ pub enum Error {
     #[error("configuration archive decode failed")]
     ConfigurationDecode,
 
+    #[error("durable transcription provider policy unavailable: {message}")]
+    ProviderPolicyUnavailable { message: String },
+
     #[error("transcription customization archive encode failed")]
     TranscriptionCustomizationEncode,
 

@@ -55,7 +55,7 @@ pub use history::{
 pub use latency::LatencyInstrumentation;
 pub use maintenance::CaptureMaintenance;
 #[cfg(feature = "nota-text")]
-pub use meta::{MetaCommandLine, MetaProviderPolicyClient, MetaProviderPolicySocket};
+pub use meta::{MetaCommandLine, MetaProviderPolicyClient, MetaProviderPolicyServer, MetaProviderPolicySocket};
 pub use notification::{
     ClipboardSuccessNotification, FreedesktopDbusNotificationTransport,
     FreedesktopNotificationTransport, FreedesktopSuccessNotifier, SilentSuccessNotifier,
