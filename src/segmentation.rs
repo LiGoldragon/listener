@@ -51,6 +51,25 @@ pub fn plan_raw_pcm_segments(pcm_s16le: &[u8]) -> Vec<SegmentSampleRange> {
     segments
 }
 
+/// Returns only ranges that have reached a stable pause or the hard 5:50 cut.
+/// The shorter live tail intentionally remains raw-log authority until a later
+/// commit closes another range or Stop asks for the final assembly.
+pub fn plan_closed_raw_pcm_segments(pcm_s16le: &[u8]) -> Vec<SegmentSampleRange> {
+    let available_end = u64::try_from(pcm_s16le.len() / 2).unwrap_or(u64::MAX);
+    let mut segments = Vec::new();
+    let mut start = 0;
+    while let Some((segment, next)) = plan_next_segment(
+        start,
+        available_end,
+        stable_pause_at(pcm_s16le, start, available_end),
+        DEFAULT_OVERLAP_SAMPLES,
+    ) {
+        segments.push(segment);
+        start = next;
+    }
+    segments
+}
+
 fn stable_pause_at(pcm_s16le: &[u8], start: u64, available_end: u64) -> Option<u64> {
     let begin = start.checked_add(PAUSE_SEARCH_START_SAMPLES)?;
     let limit = start.checked_add(HARD_CUT_SAMPLES)?.min(available_end);
@@ -118,5 +137,18 @@ mod tests {
         assert_eq!(planned[0].end(), u64::try_from(pause).unwrap());
         assert_eq!(planned[1].start(), u64::try_from(pause).unwrap() - DEFAULT_OVERLAP_SAMPLES);
         assert_eq!(planned.last().unwrap().end(), u64::try_from(samples).unwrap());
+    }
+
+    #[test]
+    fn closed_planning_omits_the_live_tail_until_stop() {
+        let samples = usize::try_from(HARD_CUT_SAMPLES + SAMPLE_RATE / 2).unwrap();
+        let pcm: Vec<u8> = vec![1_000_i16; samples]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        assert_eq!(
+            plan_closed_raw_pcm_segments(&pcm),
+            vec![SegmentSampleRange::new(0, HARD_CUT_SAMPLES).unwrap()],
+        );
     }
 }

@@ -3,6 +3,7 @@ use std::{
     io::{ErrorKind, Read},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::Arc,
     thread::{self, JoinHandle},
     time::{Duration, SystemTime},
 };
@@ -153,6 +154,13 @@ pub trait ActiveAudioCapture: Send {
     }
 }
 
+/// A best-effort, non-blocking notice emitted only after a PCM record is
+/// durably committed. Implementations must treat the raw recording log as the
+/// authority: a delayed or coalesced notice may defer work, never lose audio.
+pub trait CommittedSampleSink: Send + Sync {
+    fn committed_sample_end(&self, sample_end: u64);
+}
+
 #[derive(Clone)]
 pub struct AudioCaptureStart {
     session: CaptureSession,
@@ -160,6 +168,7 @@ pub struct AudioCaptureStart {
     input_source: InputSource,
     status_publisher: StatusPublisher,
     latency_instrumentation: LatencyInstrumentation,
+    committed_sample_sink: Option<Arc<dyn CommittedSampleSink>>,
 }
 
 impl AudioCaptureStart {
@@ -175,6 +184,7 @@ impl AudioCaptureStart {
             input_source,
             status_publisher,
             latency_instrumentation: LatencyInstrumentation::disabled(),
+            committed_sample_sink: None,
         }
     }
 
@@ -183,6 +193,14 @@ impl AudioCaptureStart {
         latency_instrumentation: LatencyInstrumentation,
     ) -> Self {
         self.latency_instrumentation = latency_instrumentation;
+        self
+    }
+
+    pub fn with_committed_sample_sink(
+        mut self,
+        committed_sample_sink: Arc<dyn CommittedSampleSink>,
+    ) -> Self {
+        self.committed_sample_sink = Some(committed_sample_sink);
         self
     }
 
@@ -208,6 +226,10 @@ impl AudioCaptureStart {
 
     pub fn latency_instrumentation(&self) -> LatencyInstrumentation {
         self.latency_instrumentation.clone()
+    }
+
+    pub fn committed_sample_sink(&self) -> Option<Arc<dyn CommittedSampleSink>> {
+        self.committed_sample_sink.clone()
     }
 }
 
@@ -1187,6 +1209,7 @@ impl AudioCaptureCommand {
             request.status_publisher(),
             Some(live_encoder.sender()),
         )
+        .with_committed_sample_sink(request.committed_sample_sink())
         .spawn();
 
         Ok(Box::new(ProcessAudioCapture {
@@ -1247,6 +1270,7 @@ pub struct CaptureWriter<Input> {
     pending_pcm: CaptureWriterPendingPcm,
     status_publisher: StatusPublisher,
     live_encoder: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    committed_sample_sink: Option<Arc<dyn CommittedSampleSink>>,
     read_buffer_bytes: usize,
 }
 
@@ -1270,8 +1294,17 @@ impl<Input: Read> CaptureWriter<Input> {
             pending_pcm,
             status_publisher,
             live_encoder,
+            committed_sample_sink: None,
             read_buffer_bytes,
         }
+    }
+
+    pub fn with_committed_sample_sink(
+        mut self,
+        committed_sample_sink: Option<Arc<dyn CommittedSampleSink>>,
+    ) -> Self {
+        self.committed_sample_sink = committed_sample_sink;
+        self
     }
 
     pub fn write_until_capture_stops(mut self) -> Result<()> {
@@ -1286,6 +1319,7 @@ impl<Input: Read> CaptureWriter<Input> {
                 &mut self.recording_log,
                 &self.status_publisher,
                 self.live_encoder.as_ref(),
+                self.committed_sample_sink.as_ref(),
             )?;
         }
         self.pending_pcm.finish()?;
@@ -1349,6 +1383,7 @@ impl CaptureWriterPendingPcm {
         recording_log: &mut RecordingLogWriter,
         status_publisher: &StatusPublisher,
         live_encoder: Option<&std::sync::mpsc::Sender<Vec<u8>>>,
+        committed_sample_sink: Option<&Arc<dyn CommittedSampleSink>>,
     ) -> Result<()> {
         self.bytes.extend_from_slice(bytes);
         let bytes_per_frame = usize::from(self.audio_format.bytes_per_frame());
@@ -1366,7 +1401,13 @@ impl CaptureWriterPendingPcm {
                     self.audio_format.sample_format(),
                 ),
             );
-            recording_log.append_record(payload)?;
+            let commit = recording_log.append_record(payload)?;
+            if let Some(committed_sample_sink) = committed_sample_sink {
+                let payload_samples = u64::from(commit.payload_length())
+                    / u64::from(recording_log.audio_format().bytes_per_frame());
+                committed_sample_sink
+                    .committed_sample_end(commit.frame_offset().saturating_add(payload_samples));
+            }
             if let Some(live_encoder) = live_encoder {
                 let _ = live_encoder.send(payload.to_vec());
             }

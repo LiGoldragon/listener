@@ -18,7 +18,8 @@ use signal_listener::{
 };
 
 use crate::{
-    ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureStore, Configuration,
+    ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureStore, CommittedSampleSink,
+    Configuration,
     DurableProviderFinalizer, Error, FreedesktopSuccessNotifier, LatencyInstrumentation,
     MetaProviderPolicyService, OpenAiBatchProvider, OpenAiBatchTranscriptionActor,
     OutputTargetDispatcher, ProviderCircuitBreaker, ProviderJobStore, ProviderPolicy,
@@ -707,6 +708,28 @@ impl ListenerRuntime {
         ))
     }
 
+    /// Builds bounded background work for ranges that are already durably
+    /// committed while capture continues. It never delivers or compacts; Stop
+    /// remains the sole finalizer for the tail and assembled transcript.
+    pub fn begin_committed_segment_finalization(
+        &self,
+        session: CaptureSession,
+        committed_sample_end: u64,
+    ) -> Result<RuntimeCommittedSegmentWork> {
+        let finalizer = self.provider_finalizer.as_ref().map_err(|message| {
+            Error::ProviderFinalizationUnavailable {
+                message: message.clone(),
+            }
+        })?;
+        Ok(RuntimeCommittedSegmentWork {
+            session: session.clone(),
+            artifact: self.capture_store.artifact_for_session(&session),
+            finalizer: finalizer.clone(),
+            policy: self.current_provider_policy()?,
+            committed_sample_end,
+        })
+    }
+
     pub fn publish_finalizing(&self) {
         self.status_publisher.publish_finalizing();
     }
@@ -831,6 +854,7 @@ pub struct RuntimeCaptureStartWork {
     capture_backend: Arc<dyn AudioCaptureBackend>,
     status_publisher: StatusPublisher,
     latency_instrumentation: LatencyInstrumentation,
+    committed_sample_sink: Option<Arc<dyn CommittedSampleSink>>,
 }
 
 impl RuntimeCaptureStartWork {
@@ -849,6 +873,7 @@ impl RuntimeCaptureStartWork {
             capture_backend,
             status_publisher,
             latency_instrumentation,
+            committed_sample_sink: None,
         }
     }
 
@@ -868,19 +893,55 @@ impl RuntimeCaptureStartWork {
             capture_backend: Arc::clone(&self.capture_backend),
             status_publisher: self.status_publisher.clone(),
             latency_instrumentation: self.latency_instrumentation.clone(),
+            committed_sample_sink: self.committed_sample_sink.clone(),
         }
     }
 
+    pub fn with_committed_sample_sink(
+        mut self,
+        committed_sample_sink: Arc<dyn CommittedSampleSink>,
+    ) -> Self {
+        self.committed_sample_sink = Some(committed_sample_sink);
+        self
+    }
+
     pub fn start(&self) -> Result<Box<dyn ActiveAudioCapture>> {
-        self.capture_backend.start(
-            AudioCaptureStart::new(
+        let request = AudioCaptureStart::new(
                 self.session.clone(),
                 self.artifact.clone(),
                 self.input_source,
                 self.status_publisher.clone(),
             )
-            .with_latency_instrumentation(self.latency_instrumentation.clone()),
-        )
+            .with_latency_instrumentation(self.latency_instrumentation.clone());
+        let request = match &self.committed_sample_sink {
+            Some(sink) => request.with_committed_sample_sink(Arc::clone(sink)),
+            None => request,
+        };
+        self.capture_backend.start(request)
+    }
+}
+
+pub struct RuntimeCommittedSegmentWork {
+    session: CaptureSession,
+    artifact: signal_listener::DurableAudioArtifact,
+    finalizer: DurableProviderFinalizer,
+    policy: ProviderPolicy,
+    committed_sample_end: u64,
+}
+
+impl RuntimeCommittedSegmentWork {
+    pub fn execute(self) -> Result<()> {
+        self.finalizer
+            .prepare_recording_log_completed_segments(
+                &self.session,
+                self.artifact,
+                self.policy,
+                self.committed_sample_end,
+            )
+            .map(|_| ())
+            .map_err(|error| Error::ProviderFinalizationUnavailable {
+                message: error.to_string(),
+            })
     }
 }
 

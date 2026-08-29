@@ -35,6 +35,7 @@ mod wispr;
 
 pub use capture::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureMaintenanceSnapshot,
+    CommittedSampleSink,
     CaptureRetentionAge, CaptureRetentionByteLimit, CaptureRetentionPolicy, CaptureStore,
     ProcessAudioCaptureBackend, RecoveredCaptureRecordings, TerminalCaptureState,
 };
@@ -83,7 +84,10 @@ pub use recording_log::{
     RecordingLogDurabilityPolicy, RecordingLogHeader, RecordingLogRecordCommit, RecordingLogWriter,
     RecordingSampleFormat, RecordingStartTime, RecoveredRecordingLog,
 };
-pub use runtime::{DeliveryOwnershipAdmission, ListenerRuntime, RuntimeFinalizationFeedback};
+pub use runtime::{
+    DeliveryOwnershipAdmission, ListenerRuntime, RuntimeCommittedSegmentWork,
+    RuntimeFinalizationFeedback,
+};
 pub use segmentation::SegmentSampleRange;
 pub use status::{
     ListenerStatusEvent, ListenerStatusState, MicrophoneLevel, StatusEventRecorder,

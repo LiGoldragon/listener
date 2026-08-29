@@ -308,6 +308,46 @@ impl AudioCaptureBackend for FileAudioCaptureBackend {
     }
 }
 
+/// Writes a synthetic recording longer than the 5:50 planner boundary before
+/// returning control to the actor. The committed-sample notice deliberately
+/// races `StartCompleted`, which proves the actor reschedules from durable
+/// offsets rather than relying on a lossy edge notification.
+struct ContinuousFileAudioCaptureBackend;
+
+impl AudioCaptureBackend for ContinuousFileAudioCaptureBackend {
+    fn start(&self, request: AudioCaptureStart) -> listener::Result<Box<dyn ActiveAudioCapture>> {
+        let artifact_path = request.artifact_path();
+        fs::create_dir_all(artifact_path.parent().expect("artifact parent"))?;
+        let header = RecordingLogHeader::from_capture_start(
+            request.session(),
+            request.input_source(),
+            RecordingAudioFormat::signed_sixteen_bit_little_endian_mono_16khz(),
+        )?;
+        let mut writer = RecordingLogWriter::create(&artifact_path, header)?;
+        let total_samples: u64 = 351 * 16_000;
+        let chunk = vec![1_u8; 8_192];
+        let chunk_samples = u64::try_from(chunk.len() / 2).expect("chunk sample count fits");
+        let mut remaining_samples = total_samples;
+        while remaining_samples > 0 {
+            let samples = remaining_samples.min(chunk_samples);
+            let bytes = usize::try_from(samples * 2).expect("synthetic chunk fits");
+            writer.append_record(&chunk[..bytes])?;
+            remaining_samples -= samples;
+        }
+        request
+            .committed_sample_sink()
+            .expect("daemon supplies the committed-sample sink")
+            .committed_sample_end(total_samples);
+        Ok(Box::new(FileAudioCapture::new_with_shutdown_gates(
+            request.artifact().clone(),
+            writer,
+            request.status_publisher(),
+            None,
+            None,
+        )))
+    }
+}
+
 struct BlockingStartupAudioCaptureBackend {
     startup_gate: BlockingGate,
 }
@@ -1817,6 +1857,40 @@ fn actor_toggle_completes_recording_with_one_transcription_and_delivery() {
         fixture.recorded_history(),
         vec!["transcribed text".to_owned()]
     );
+}
+
+#[test]
+fn actor_transcribes_a_closed_raw_log_segment_before_stop_and_delivers_once() {
+    let fixture = RuntimeFixture::new();
+    let runtime = fixture.runtime_with_capture_backend(Box::new(ContinuousFileAudioCaptureBackend));
+    let server = ListenerSocketServer::new(fixture.configuration(), runtime);
+
+    let session = match server
+        .handle_input(Input::Start(StartCapture {}))
+        .expect("start synthetic continuous capture through actor")
+    {
+        Output::Started(started) => started.payload().payload().clone(),
+        other => panic!("expected started reply, got {other:?}"),
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while fixture.transcription_inputs().is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let inputs_before_stop = fixture.transcription_inputs();
+    assert_eq!(inputs_before_stop.len(), 1, "closed 5:50 range must run before Stop");
+    assert!(matches!(
+        inputs_before_stop[0].format(),
+        BatchTranscriptionInputFormat::SignedSixteenBitLittleEndianPcm { .. }
+    ));
+    assert!(fixture.delivered_texts().is_empty());
+    assert!(fixture.recorded_history().is_empty());
+
+    CancellationProbe::assert_completion_requested(&server, Input::stop(session.clone()), &session);
+    CancellationProbe::wait_until_delivered(&server, &session);
+    assert_eq!(fixture.transcription_inputs().len(), 2, "Stop processes only the live tail");
+    assert_eq!(fixture.delivered_texts(), vec!["transcribed text".to_owned()]);
+    assert_eq!(fixture.recorded_history(), vec!["transcribed text".to_owned()]);
 }
 
 #[test]

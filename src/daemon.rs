@@ -10,7 +10,7 @@ use std::{
     process::ExitCode,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
         OnceLock,
     },
@@ -32,7 +32,7 @@ use crate::runtime::{
     RuntimeCaptureFinalizationWork, RuntimeCaptureStartWork,
 };
 use crate::{
-    CaptureMaintenance, Configuration, ContractFrameCodec, ContractFrameStream, Error,
+    CaptureMaintenance, CommittedSampleSink, Configuration, ContractFrameCodec, ContractFrameStream, Error,
     FreedesktopProviderHealthNotifier, LatencyInstrumentation, ListenerRuntime,
     MetaProviderPolicyServer, MetaProviderPolicyService, ProviderCircuitBreaker,
     ProviderHealthFanout, ProviderPolicyStore, Result, StatusStreamServer,
@@ -345,6 +345,70 @@ impl ListenerOperationMailbox {
             surface: "listener operation actor",
         })
     }
+
+    fn try_send(&self, mail: ListenerOperationMail) -> bool {
+        self.actor
+            .get()
+            .is_some_and(|actor| actor.tell(mail).try_send().is_ok())
+    }
+}
+
+/// Coalesces durable writer progress into ListenerCore's bounded mailbox. The
+/// latest sample end survives a full mailbox; another notice or Stop catches
+/// the raw log up by offset, so durable capture never waits on transcription.
+#[derive(Clone)]
+struct ListenerCommittedSampleSink {
+    inner: Arc<ListenerCommittedSampleState>,
+}
+
+struct ListenerCommittedSampleState {
+    session: CaptureSession,
+    mailbox: ListenerOperationMailbox,
+    committed_sample_end: AtomicU64,
+    notification_queued: AtomicBool,
+}
+
+impl ListenerCommittedSampleSink {
+    fn new(session: CaptureSession, mailbox: ListenerOperationMailbox) -> Self {
+        Self {
+            inner: Arc::new(ListenerCommittedSampleState {
+                session,
+                mailbox,
+                committed_sample_end: AtomicU64::new(0),
+                notification_queued: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    fn current_end(&self) -> u64 {
+        self.inner.committed_sample_end.load(Ordering::Acquire)
+    }
+
+    fn acknowledge_notification(&self) {
+        self.inner.notification_queued.store(false, Ordering::Release);
+    }
+
+    fn resignal(&self) {
+        self.acknowledge_notification();
+        CommittedSampleSink::committed_sample_end(self, self.current_end());
+    }
+}
+
+impl CommittedSampleSink for ListenerCommittedSampleSink {
+    fn committed_sample_end(&self, sample_end: u64) {
+        self.inner
+            .committed_sample_end
+            .fetch_max(sample_end, Ordering::AcqRel);
+        if !self.inner.notification_queued.swap(true, Ordering::AcqRel) {
+            let message = ListenerOperationMail::RecordingCommitted {
+                session: self.inner.session.clone(),
+                sink: Arc::new(self.clone()),
+            };
+            if !self.inner.mailbox.try_send(message) {
+                self.inner.notification_queued.store(false, Ordering::Release);
+            }
+        }
+    }
 }
 
 /// The bounded Kameo/Tokio owner of all mutable Listener runtime state. Socket
@@ -356,6 +420,7 @@ struct ListenerOperationActor {
     mailbox: ListenerOperationMailbox,
     operation: ListenerOperationState,
     finalizations: BTreeMap<u64, ListenerFinalizationState>,
+    continuous_finalizations: BTreeMap<u64, ListenerContinuousFinalizationState>,
     leases: MaintenanceLeaseState,
     terminal_status: Option<CaptureStatus>,
 }
@@ -368,6 +433,7 @@ impl ListenerOperationActor {
             mailbox: mailbox.clone(),
             operation: ListenerOperationState::Idle,
             finalizations: BTreeMap::new(),
+            continuous_finalizations: BTreeMap::new(),
             leases: MaintenanceLeaseState::for_current_daemon(),
             terminal_status: None,
         };
@@ -392,6 +458,12 @@ impl ListenerOperationActor {
             }
             ListenerOperationMail::FinalizationCompleted { session, output } => {
                 self.finish_finalization(session, output)
+            }
+            ListenerOperationMail::RecordingCommitted { session, sink } => {
+                self.schedule_committed_segments(session, sink)
+            }
+            ListenerOperationMail::CommittedSegmentsCompleted { session } => {
+                self.finish_committed_segments(session)
             }
         }
         self.leases
@@ -608,6 +680,16 @@ impl ListenerOperationActor {
                 let session = start.session().clone();
                 let artifact = start.artifact().clone();
                 let output = self.runtime.install_started_capture(start, capture);
+                let committed_samples = Arc::clone(&completion.committed_samples);
+                self.continuous_finalizations.insert(
+                    session.value(),
+                    ListenerContinuousFinalizationState::new(committed_samples.clone()),
+                );
+                // A bounded mailbox may have coalesced or rejected the first
+                // post-commit notice while Start was still installing. Re-read
+                // the durable offset after installation so a delayed scheduler
+                // catches up from raw-log authority without blocking capture.
+                committed_samples.resignal();
                 self.reply(reply, output);
                 if cancellation.is_requested() {
                     self.runtime.publish_cancelling();
@@ -642,6 +724,9 @@ impl ListenerOperationActor {
 
     fn finish_cancellation(&mut self, _output: Output) {
         if matches!(self.operation, ListenerOperationState::Cancelling { .. }) {
+            if let ListenerOperationState::Cancelling { session, .. } = &self.operation {
+                self.continuous_finalizations.remove(&session.value());
+            }
             self.operation = ListenerOperationState::Idle;
             self.terminal_status = None;
             self.publish_current_status();
@@ -661,6 +746,7 @@ impl ListenerOperationActor {
         if self.finalizations.remove(&session.value()).is_none() {
             return;
         }
+        self.continuous_finalizations.remove(&session.value());
         self.runtime
             .set_in_flight_transcriptions(self.finalizations.len());
         self.terminal_status = match output {
@@ -677,15 +763,60 @@ impl ListenerOperationActor {
         let ListenerOperationState::Starting { start, .. } = &self.operation else {
             return;
         };
-        let start = RuntimeCaptureStartWork::from(start);
+        let sink = Arc::new(ListenerCommittedSampleSink::new(
+            start.session().clone(),
+            self.mailbox.clone(),
+        ));
+        let start = RuntimeCaptureStartWork::from(start)
+            .with_committed_sample_sink(sink.clone());
         let mailbox = self.mailbox.clone();
         thread::spawn(move || {
             let _ = mailbox.send(ListenerOperationMail::StartCompleted(
                 ListenerStartCompletion {
                     result: start.start(),
+                    committed_samples: sink,
                 },
             ));
         });
+    }
+
+    fn schedule_committed_segments(
+        &mut self,
+        session: CaptureSession,
+        sink: Arc<ListenerCommittedSampleSink>,
+    ) {
+        let Some(state) = self.continuous_finalizations.get_mut(&session.value()) else {
+            return;
+        };
+        sink.acknowledge_notification();
+        let committed_sample_end = sink.current_end();
+        if state.running || committed_sample_end <= state.last_scheduled_sample_end {
+            return;
+        }
+        let work = match self
+            .runtime
+            .begin_committed_segment_finalization(session.clone(), committed_sample_end)
+        {
+            Ok(work) => work,
+            Err(_) => return,
+        };
+        state.running = true;
+        state.last_scheduled_sample_end = committed_sample_end;
+        let mailbox = self.mailbox.clone();
+        thread::spawn(move || {
+            let _ = work.execute();
+            let _ = mailbox.send(ListenerOperationMail::CommittedSegmentsCompleted { session });
+        });
+    }
+
+    fn finish_committed_segments(&mut self, session: CaptureSession) {
+        let Some(state) = self.continuous_finalizations.get_mut(&session.value()) else {
+            return;
+        };
+        state.running = false;
+        if state.sink.current_end() > state.last_scheduled_sample_end {
+            state.sink.resignal();
+        }
     }
 
     fn spawn_cancellation(&self, work: RuntimeCaptureCancellationWork) {
@@ -835,6 +966,13 @@ enum ListenerOperationMail {
         session: CaptureSession,
         output: Output,
     },
+    RecordingCommitted {
+        session: CaptureSession,
+        sink: Arc<ListenerCommittedSampleSink>,
+    },
+    CommittedSegmentsCompleted {
+        session: CaptureSession,
+    },
 }
 
 impl Message<ListenerOperationMail> for ListenerOperationActor {
@@ -851,6 +989,7 @@ impl Message<ListenerOperationMail> for ListenerOperationActor {
 
 struct ListenerStartCompletion {
     result: Result<Box<dyn crate::ActiveAudioCapture>>,
+    committed_samples: Arc<ListenerCommittedSampleSink>,
 }
 
 enum ListenerOperationState {
@@ -902,6 +1041,22 @@ impl ListenerFinalizationState {
         match self.phase {
             CaptureFinalizationPhase::Finalizing => CaptureStatus::Finalizing(capture),
             CaptureFinalizationPhase::Transcribing => CaptureStatus::Transcribing(capture),
+        }
+    }
+}
+
+struct ListenerContinuousFinalizationState {
+    sink: Arc<ListenerCommittedSampleSink>,
+    running: bool,
+    last_scheduled_sample_end: u64,
+}
+
+impl ListenerContinuousFinalizationState {
+    fn new(sink: Arc<ListenerCommittedSampleSink>) -> Self {
+        Self {
+            sink,
+            running: false,
+            last_scheduled_sample_end: 0,
         }
     }
 }

@@ -4,7 +4,7 @@
 //! saves provider attempts and the chosen transcript before either projection;
 //! it uses a stable delivery intent id and writes the receipt after delivery.
 
-use std::{collections::BTreeMap, io::Write, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, io::Write, path::PathBuf, sync::{Arc, Mutex}};
 
 use signal_listener::{
     AudioArtifactPath, CaptureSession, DeliveryOutcomes, DurableAudioArtifact, OutputTargets,
@@ -13,7 +13,7 @@ use signal_listener::{
 use thiserror::Error;
 
 use crate::provider_job::ProviderJobStoreError;
-use crate::segmentation::{plan_raw_pcm_segments, stitch_transcripts};
+use crate::segmentation::{plan_closed_raw_pcm_segments, plan_raw_pcm_segments, stitch_transcripts};
 use crate::{
     BatchTranscriber, BatchTranscriptionInput, BatchTranscriptionRequest, OutputTargetDispatcher,
     ProviderAttempt, ProviderAttemptState, ProviderIdentifier, ProviderJobStore, ProviderPolicy,
@@ -200,6 +200,7 @@ pub struct DurableProviderFinalizer {
     router: ProviderRouter,
     dispatcher: OutputTargetDispatcher,
     history: TranscriptHistoryStore,
+    execution_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl DurableProviderFinalizer {
@@ -214,6 +215,7 @@ impl DurableProviderFinalizer {
             router,
             dispatcher,
             history,
+            execution_locks: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -282,6 +284,10 @@ impl DurableProviderFinalizer {
         artifact: DurableAudioArtifact,
         policy: ProviderPolicy,
     ) -> Result<PreparedProviderFinalization, ProviderFinalizationError> {
+        let execution_lock = self.execution_lock_for(session)?;
+        let _execution = execution_lock
+            .lock()
+            .map_err(|_| ProviderFinalizationError::AllProvidersFailed)?;
         let job = self.jobs.begin(
             session.value().to_string().as_str(),
             artifact.path().as_str(),
@@ -359,6 +365,89 @@ impl DurableProviderFinalizer {
             attempts,
             segments,
         })
+    }
+
+    /// Runs only raw-log ranges closed by a pause or the hard 5:50 boundary.
+    /// It persists their attempt/transcript provenance but intentionally never
+    /// writes the assembled result, history, or delivery receipt: Stop owns
+    /// the final live tail and the one delivery. The shared lock serializes a
+    /// racing Stop against this bounded background work.
+    pub fn prepare_recording_log_completed_segments(
+        &self,
+        session: &CaptureSession,
+        artifact: DurableAudioArtifact,
+        policy: ProviderPolicy,
+        committed_sample_end: u64,
+    ) -> Result<Vec<PreparedProviderSegment>, ProviderFinalizationError> {
+        let execution_lock = self.execution_lock_for(session)?;
+        let _execution = execution_lock
+            .lock()
+            .map_err(|_| ProviderFinalizationError::AllProvidersFailed)?;
+        let job = self.jobs.begin(
+            session.value().to_string().as_str(),
+            artifact.path().as_str(),
+            policy,
+        )?;
+        if job.result()?.is_some() {
+            return Ok(Vec::new());
+        }
+        let policy = job.policy()?;
+        let recovered = RecordingLog::new(artifact.path().as_str())
+            .recover()
+            .map_err(|_| ProviderFinalizationError::AllProvidersFailed)?;
+        let (format, pcm) = recovered
+            .raw_pcm_bytes()
+            .map_err(|_| ProviderFinalizationError::AllProvidersFailed)?;
+        if format != crate::RecordingAudioFormat::signed_sixteen_bit_little_endian_mono_16khz() {
+            return Err(ProviderFinalizationError::AllProvidersFailed);
+        }
+        let bounded_bytes = usize::try_from(committed_sample_end)
+            .ok()
+            .and_then(|samples| samples.checked_mul(usize::from(format.bytes_per_frame())))
+            .map(|end| end.min(pcm.len()))
+            .ok_or(ProviderFinalizationError::AllProvidersFailed)?;
+        let existing = job
+            .segments()?
+            .into_iter()
+            .map(|segment| ((segment.range().start(), segment.range().end()), segment))
+            .collect::<BTreeMap<_, _>>();
+        let mut prepared = Vec::new();
+        for range in plan_closed_raw_pcm_segments(&pcm[..bounded_bytes]) {
+            let key = (range.start(), range.end());
+            if let Some(existing) = existing.get(&key) {
+                prepared.push(PreparedProviderSegment {
+                    range,
+                    attempts: existing.attempts().to_vec(),
+                });
+                continue;
+            }
+            let request = ProviderTranscriptRequest::for_sample_range(
+                PathBuf::from(artifact.path().as_str()),
+                range,
+            );
+            let outcome = self.router.transcribe(policy.clone(), request);
+            let attempts = outcome.attempts().to_vec();
+            let transcript = outcome
+                .transcript()
+                .ok_or(ProviderFinalizationError::AllProvidersFailed)?;
+            job.record_segment(range, &attempts, transcript.as_str())?;
+            prepared.push(PreparedProviderSegment { range, attempts });
+        }
+        Ok(prepared)
+    }
+
+    fn execution_lock_for(
+        &self,
+        session: &CaptureSession,
+    ) -> Result<Arc<Mutex<()>>, ProviderFinalizationError> {
+        let mut locks = self
+            .execution_locks
+            .lock()
+            .map_err(|_| ProviderFinalizationError::AllProvidersFailed)?;
+        Ok(locks
+            .entry(session.value().to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone())
     }
 
     /// Persist the logical history intent only after cancellation no longer
