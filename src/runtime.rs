@@ -245,6 +245,13 @@ impl ListenerRuntime {
         self.provider_policy_service = Some(service);
     }
 
+    /// Installs a host-composed router finalizer. This is the production
+    /// injection seam for the credential-free Wispr session/transport boundary
+    /// and for synthetic provider fixtures; it never accepts secret bytes.
+    pub fn use_provider_finalizer(&mut self, finalizer: DurableProviderFinalizer) {
+        self.provider_finalizer = Ok(finalizer);
+    }
+
     pub fn handle_input(&mut self, input: Input) -> Output {
         match input {
             Input::Start(start) => self.start(start).unwrap_or_else(Error::into_start_reply),
