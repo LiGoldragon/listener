@@ -21,6 +21,7 @@ pub mod maintenance;
 pub mod meta;
 pub mod notification;
 pub mod provider;
+pub mod provider_finalization;
 pub mod provider_job;
 pub mod provider_policy;
 pub mod recall;
@@ -44,7 +45,7 @@ pub use compact_audio::{CompactAudioArtifact, LiveOpusWebmEncoder, OpusWebmEncod
 pub use configuration::{Configuration, ConfigurationEnvironment};
 pub use daemon::ListenerDaemon;
 pub use delivery::{
-    ClipboardCommand, ClipboardDelivery, OutputTargetDispatcher, TranscriptDelivery,
+    ClipboardCommand, ClipboardDelivery, DeliveryId, OutputTargetDispatcher, TranscriptDelivery,
     TranscriptDeliveryRequest,
 };
 pub use error::{Error, Result};
@@ -68,6 +69,10 @@ pub use provider::{
     WisprFlowProvider, WisprFlowTransport, WisprSessionBoundary,
 };
 pub use provider_job::{ProviderJob, ProviderJobStore};
+pub use provider_finalization::{
+    DurableProviderFinalizer, OpenAiBatchProvider, PreparedProviderFinalization, ProviderFinalizationError,
+    ProviderFinalizationOutcome,
+};
 pub use provider_policy::{MetaProviderPolicyService, ProviderPolicyStore};
 pub use recall::{RecallOutcome, RecallSelector, TranscriptRecall};
 pub use recording_log::{

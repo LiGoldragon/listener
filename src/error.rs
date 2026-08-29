@@ -15,6 +15,9 @@ pub enum Error {
     #[error("durable transcription provider policy unavailable: {message}")]
     ProviderPolicyUnavailable { message: String },
 
+    #[error("durable provider finalization unavailable: {message}")]
+    ProviderFinalizationUnavailable { message: String },
+
     #[error("transcription customization archive encode failed")]
     TranscriptionCustomizationEncode,
 

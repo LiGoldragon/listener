@@ -5,9 +5,32 @@ use std::{
 };
 
 use signal_listener::{
-    DeliveredTo, DeliveryFailure, DeliveryFailureReason, DeliveryOutcome, DeliveryOutcomes,
-    OutputTarget, OutputTargets, TranscriptText,
+    CaptureSession, DeliveredTo, DeliveryFailure, DeliveryFailureReason, DeliveryOutcome,
+    DeliveryOutcomes, OutputTarget, OutputTargets, TranscriptText,
 };
+
+/// Stable idempotency key for one external delivery intent. Listener's result
+/// and history are exactly-once logical records, while a crash after an
+/// external write and before its receipt can reapply the same payload. The
+/// clipboard end state is idempotent; physical delivery is at-least-once.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeliveryId(String);
+
+impl DeliveryId {
+    pub fn for_session(session: &CaptureSession, target: OutputTarget) -> Self {
+        Self(format!("listener:{}:{}", session.value(), target_code(target)))
+    }
+
+    fn unspecified(target: OutputTarget) -> Self {
+        Self(format!("listener:unspecified:{}", target_code(target)))
+    }
+
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+fn target_code(target: OutputTarget) -> &'static str {
+    match target { OutputTarget::SystemClipboard => "system-clipboard" }
+}
 
 pub trait TranscriptDelivery: Send + Sync {
     fn deliver(&self, request: TranscriptDeliveryRequest) -> DeliveryOutcome;
@@ -15,17 +38,29 @@ pub trait TranscriptDelivery: Send + Sync {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranscriptDeliveryRequest {
+    delivery_id: DeliveryId,
     target: OutputTarget,
     transcript_text: TranscriptText,
 }
 
 impl TranscriptDeliveryRequest {
     pub fn new(target: OutputTarget, transcript_text: TranscriptText) -> Self {
+        Self::with_delivery_id(DeliveryId::unspecified(target), target, transcript_text)
+    }
+
+    pub fn with_delivery_id(
+        delivery_id: DeliveryId,
+        target: OutputTarget,
+        transcript_text: TranscriptText,
+    ) -> Self {
         Self {
+            delivery_id,
             target,
             transcript_text,
         }
     }
+
+    pub fn delivery_id(&self) -> &DeliveryId { &self.delivery_id }
 
     pub fn target(&self) -> OutputTarget {
         self.target
@@ -65,6 +100,22 @@ impl OutputTargetDispatcher {
         DeliveryOutcomes::new(outcomes)
     }
 
+    /// The caller writes a durable intent before this boundary and a receipt
+    /// only after this call returns.
+    pub fn deliver_for_session(
+        &self,
+        session: &CaptureSession,
+        output_targets: &OutputTargets,
+        transcript_text: &TranscriptText,
+    ) -> DeliveryOutcomes {
+        let outcomes = output_targets.as_slice().iter().map(|target| {
+            self.deliver_to_target_with_id(
+                DeliveryId::for_session(session, *target), *target, transcript_text.clone(),
+            )
+        }).collect();
+        DeliveryOutcomes::new(outcomes)
+    }
+
     fn deliver_to_target(
         &self,
         target: OutputTarget,
@@ -78,6 +129,19 @@ impl OutputTargetDispatcher {
                         transcript_text,
                     ))
             }
+        }
+    }
+
+    fn deliver_to_target_with_id(
+        &self,
+        delivery_id: DeliveryId,
+        target: OutputTarget,
+        transcript_text: TranscriptText,
+    ) -> DeliveryOutcome {
+        match target {
+            OutputTarget::SystemClipboard => self.system_clipboard.deliver(
+                TranscriptDeliveryRequest::with_delivery_id(delivery_id, target, transcript_text),
+            ),
         }
     }
 }

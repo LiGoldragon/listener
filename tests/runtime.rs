@@ -920,13 +920,17 @@ fn successful_capture_retains_canonical_opus_artifact_and_is_not_retryable() {
     }
 
     match runtime.handle_input(Input::Retry(RetryCapture::new(session))) {
-        Output::Unimplemented(unimplemented) => assert_eq!(
-            unimplemented.reason.payload(),
-            &UnimplementedReason::StoreUnavailable,
-            "a terminally converted capture has no retry media"
+        Output::Retried(retried) => assert_eq!(
+            retried.transcript_text.payload(),
+            "transcribed text",
+            "retry resumes the durable result even after compact media was reaped"
         ),
-        other => panic!("expected store-unavailable retry reply, got {other:?}"),
+        other => panic!("expected durable retry reply, got {other:?}"),
     }
+    assert_eq!(
+        fixture.transcription_inputs().len(), 1,
+        "retry must not call a provider again when the durable result exists"
+    );
 }
 
 #[test]

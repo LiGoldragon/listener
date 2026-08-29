@@ -73,9 +73,11 @@ impl ListenerDaemon {
             configuration.capture_store_directory().join("transcription-provider-policy.sema"),
         ).map_err(|error| Error::ProviderPolicyUnavailable { message: error.to_string() })?;
         let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let policy_service = Arc::new(MetaProviderPolicyService::new(policy_store));
+        runtime.use_provider_policy_service(Arc::clone(&policy_service));
         let meta_server = MetaProviderPolicyServer::bind(
             configuration.meta_socket_path(), configuration.meta_socket_mode(),
-            Arc::new(MetaProviderPolicyService::new(policy_store)),
+            policy_service,
         )?;
         let meta_thread = meta_server.spawn_until(Arc::clone(&stopping));
         let result = ListenerSocketServer::new_with_latency(configuration, runtime, latency).serve();

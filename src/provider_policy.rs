@@ -196,6 +196,15 @@ impl MetaProviderPolicyService {
             store: Mutex::new(store),
         }
     }
+
+    /// Snapshot the current durable policy for a newly-created job. A job
+    /// persists this generation before it enters provider routing.
+    pub fn current(&self) -> Result<Option<ProviderPolicy>, ProviderPolicyStoreError> {
+        self.store
+            .lock()
+            .map_err(|_| ProviderPolicyStoreError::PolicyInvariant { count: usize::MAX })?
+            .current()
+    }
 }
 
 impl HandlesMetaProviderPolicy for MetaProviderPolicyService {

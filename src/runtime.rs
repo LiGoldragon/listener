@@ -19,12 +19,14 @@ use signal_listener::{
 
 use crate::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureStore, Configuration, Error,
-    FreedesktopSuccessNotifier, LatencyInstrumentation, OpenAiBatchTranscriptionActor,
+    DurableProviderFinalizer, FreedesktopSuccessNotifier, LatencyInstrumentation, OpenAiBatchProvider,
+    OpenAiBatchTranscriptionActor, MetaProviderPolicyService, ProviderJobStore, ProviderPolicy,
+    ProviderRouter,
     OutputTargetDispatcher, RecoveredCaptureRecordings, Result, SilentSuccessNotifier,
-    SuccessNotifier, TranscriptHistoryEntry, TranscriptHistoryStore,
+    SuccessNotifier, TranscriptHistoryStore,
 };
 use crate::{
-    BatchTranscriber, BatchTranscriptionInput, BatchTranscriptionRequest,
+    BatchTranscriber,
     ProcessAudioCaptureBackend, StatusPublisher,
 };
 
@@ -32,8 +34,8 @@ pub struct ListenerRuntime {
     configuration: Configuration,
     capture_store: CaptureStore,
     capture_backend: Arc<dyn AudioCaptureBackend>,
-    transcriber: Arc<dyn BatchTranscriber>,
-    output_target_dispatcher: OutputTargetDispatcher,
+    provider_finalizer: std::result::Result<DurableProviderFinalizer, String>,
+    provider_policy_service: Option<Arc<MetaProviderPolicyService>>,
     history_store: TranscriptHistoryStore,
     success_notifier: Arc<dyn SuccessNotifier>,
     status_publisher: StatusPublisher,
@@ -199,12 +201,15 @@ impl ListenerRuntime {
             delivery_ownership_admission,
         } = dependencies;
         let capture_store = CaptureStore::from_configuration(&configuration);
+        let provider_finalizer = Self::provider_finalizer(
+            &configuration, Arc::from(transcriber), output_target_dispatcher.clone(), history_store.clone(),
+        );
         Self {
             configuration,
             capture_store,
             capture_backend: Arc::from(capture_backend),
-            transcriber: Arc::from(transcriber),
-            output_target_dispatcher,
+            provider_finalizer,
+            provider_policy_service: None,
             history_store,
             success_notifier,
             status_publisher,
@@ -214,6 +219,30 @@ impl ListenerRuntime {
             active_capture: None,
             orphaned_recordings: RecoveredCaptureRecordings::empty(),
         }
+    }
+
+    fn provider_finalizer(
+        configuration: &Configuration,
+        transcriber: Arc<dyn BatchTranscriber>,
+        dispatcher: OutputTargetDispatcher,
+        history: TranscriptHistoryStore,
+    ) -> std::result::Result<DurableProviderFinalizer, String> {
+        ProviderJobStore::open(
+            configuration.capture_store_directory().join("transcription-provider-jobs.sema"),
+        )
+        .map(|jobs| DurableProviderFinalizer::new(
+            jobs,
+            ProviderRouter::new(vec![Arc::new(OpenAiBatchProvider::new(transcriber))]),
+            dispatcher,
+            history,
+        ))
+        .map_err(|error| error.to_string())
+    }
+
+    /// The daemon shares its serialized durable policy owner with the runtime;
+    /// every new job snapshots it once before its first provider attempt.
+    pub fn use_provider_policy_service(&mut self, service: Arc<MetaProviderPolicyService>) {
+        self.provider_policy_service = Some(service);
     }
 
     pub fn handle_input(&mut self, input: Input) -> Output {
@@ -284,10 +313,8 @@ impl ListenerRuntime {
                 return Err(error);
             }
         };
-        let transcript_text = match self
-            .transcribe_compact_capture(stopped_capture.session(), compact_artifact.clone())
-        {
-            Ok(transcript_text) => transcript_text,
+        let finalization = match self.finalize_compact_capture(stopped_capture.session(), compact_artifact.clone()) {
+            Ok(finalization) => finalization,
             Err(error) => {
                 self.capture_store
                     .mark_transcription_failed(stopped_capture.session())
@@ -296,15 +323,11 @@ impl ListenerRuntime {
                 return Err(error);
             }
         };
-        if self.record_transcript_history(stopped_capture.session(), &transcript_text) {
-            self.capture_store.mark_terminal_capture(
-                stopped_capture.session(),
-                crate::TerminalCaptureState::Completed,
-            )?;
-        }
-        let delivery_outcomes = self
-            .output_target_dispatcher
-            .deliver(self.configuration.output_targets(), &transcript_text);
+        self.capture_store.mark_terminal_capture(
+            stopped_capture.session(), crate::TerminalCaptureState::Completed,
+        )?;
+        let transcript_text = finalization.transcript().clone();
+        let delivery_outcomes = finalization.delivery_outcomes().clone();
         publish_delivery_feedback(
             &delivery_outcomes,
             &transcript_text,
@@ -379,26 +402,18 @@ impl ListenerRuntime {
 
     pub fn retry_capture(&mut self, request: RetryCapture) -> Result<Output> {
         let session = request.into_payload();
-        if self.history_store.contains_session(&session)? {
-            return Err(Error::CaptureNotFound {
-                session: session.value(),
-            });
-        }
         let compact_artifact = self.capture_store.compact_audio_for_session(&session)?;
-        let transcript_text = match self.transcribe_compact_capture(&session, compact_artifact) {
-            Ok(transcript) => transcript,
+        let finalization = match self.finalize_compact_capture(&session, compact_artifact) {
+            Ok(finalization) => finalization,
             Err(error) => {
                 self.capture_store.mark_transcription_failed(&session).ok();
                 return Err(error);
             }
         };
-        if self.record_transcript_history(&session, &transcript_text) {
-            self.capture_store
-                .mark_terminal_capture(&session, crate::TerminalCaptureState::Completed)?;
-        }
-        let outcomes = self
-            .output_target_dispatcher
-            .deliver(self.configuration.output_targets(), &transcript_text);
+        self.capture_store
+            .mark_terminal_capture(&session, crate::TerminalCaptureState::Completed)?;
+        let transcript_text = finalization.transcript().clone();
+        let outcomes = finalization.delivery_outcomes().clone();
         publish_delivery_feedback(
             &outcomes,
             &transcript_text,
@@ -456,32 +471,33 @@ impl ListenerRuntime {
         }
     }
 
-    fn transcribe_compact_capture(
+    fn finalize_compact_capture(
         &self,
         session: &CaptureSession,
         compact_artifact: signal_listener::DurableAudioArtifact,
-    ) -> Result<TranscriptText> {
-        let input = BatchTranscriptionInput::webm_opus(std::path::PathBuf::from(
-            compact_artifact.path().as_str(),
-        ));
-        let transcript = self
-            .transcriber
-            .transcribe(BatchTranscriptionRequest::new_with_input(
-                compact_artifact,
-                input,
-            ))?;
+    ) -> Result<crate::ProviderFinalizationOutcome> {
+        let policy = self.current_provider_policy()?;
+        let finalizer = self.provider_finalizer.as_ref().map_err(|message| Error::ProviderFinalizationUnavailable {
+            message: message.clone(),
+        })?;
+        let prepared = finalizer.prepare(session, compact_artifact, policy)
+            .map_err(|_| Error::TranscriptionBackendUnavailable { message: "all configured providers unavailable; audio preserved".to_owned() })?;
+        finalizer.record_history(session, prepared.transcript())
+            .map_err(|error| Error::ProviderFinalizationUnavailable { message: error.to_string() })?;
+        let delivery_outcomes = finalizer.deliver(session, self.configuration.output_targets(), prepared.transcript())
+            .map_err(|error| Error::ProviderFinalizationUnavailable { message: error.to_string() })?;
         self.capture_store.clear_transcription_failure(session)?;
-        Ok(transcript)
+        Ok(crate::ProviderFinalizationOutcome::from_prepared(prepared, delivery_outcomes))
     }
 
-    fn record_transcript_history(
-        &self,
-        session: &CaptureSession,
-        transcript_text: &TranscriptText,
-    ) -> bool {
-        TranscriptHistoryEntry::recorded_now(session.clone(), transcript_text.clone())
-            .and_then(|entry| self.history_store.append(&entry))
-            .is_ok()
+    fn current_provider_policy(&self) -> Result<ProviderPolicy> {
+        self.provider_policy_service.as_ref()
+            .map(|service| service.current())
+            .transpose()
+            .map_err(|error| Error::ProviderPolicyUnavailable { message: error.to_string() })?
+            .flatten()
+            .or_else(|| Some(ProviderPolicy::wispr_then_openai()))
+            .ok_or_else(|| Error::ProviderPolicyUnavailable { message: "no valid provider policy".to_owned() })
     }
 
     /// Return only the runtime-owned active slot. This must remain O(1):
@@ -586,9 +602,8 @@ impl ListenerRuntime {
         Ok(RuntimeCaptureFinalizationWork::new(
             active_capture,
             self.capture_store.clone(),
-            Arc::clone(&self.transcriber),
-            self.output_target_dispatcher.clone(),
-            self.history_store.clone(),
+            self.provider_finalizer.clone(),
+            self.provider_policy_service.clone(),
             self.configuration.output_targets().clone(),
             RuntimeDeliveryFeedback {
                 success_notifier: Arc::clone(&self.success_notifier),
@@ -848,9 +863,8 @@ impl RuntimeFinalizationFeedback {
 pub struct RuntimeCaptureFinalizationWork {
     active_capture: RuntimeActiveCapture,
     capture_store: CaptureStore,
-    transcriber: Arc<dyn BatchTranscriber>,
-    output_target_dispatcher: OutputTargetDispatcher,
-    history_store: TranscriptHistoryStore,
+    provider_finalizer: std::result::Result<DurableProviderFinalizer, String>,
+    provider_policy_service: Option<Arc<MetaProviderPolicyService>>,
     output_targets: OutputTargets,
     feedback: RuntimeDeliveryFeedback,
     completion: RuntimeCancellationCompletion,
@@ -860,9 +874,8 @@ impl RuntimeCaptureFinalizationWork {
     fn new(
         active_capture: RuntimeActiveCapture,
         capture_store: CaptureStore,
-        transcriber: Arc<dyn BatchTranscriber>,
-        output_target_dispatcher: OutputTargetDispatcher,
-        history_store: TranscriptHistoryStore,
+        provider_finalizer: std::result::Result<DurableProviderFinalizer, String>,
+        provider_policy_service: Option<Arc<MetaProviderPolicyService>>,
         output_targets: OutputTargets,
         feedback: RuntimeDeliveryFeedback,
     ) -> Self {
@@ -873,9 +886,8 @@ impl RuntimeCaptureFinalizationWork {
         Self {
             active_capture,
             capture_store: capture_store.clone(),
-            transcriber,
-            output_target_dispatcher,
-            history_store,
+            provider_finalizer,
+            provider_policy_service,
             output_targets,
             feedback,
             completion,
@@ -898,9 +910,8 @@ impl RuntimeCaptureFinalizationWork {
         let RuntimeCaptureFinalizationWork {
             active_capture,
             capture_store,
-            transcriber,
-            output_target_dispatcher,
-            history_store,
+            provider_finalizer,
+            provider_policy_service,
             output_targets,
             feedback,
             completion,
@@ -942,13 +953,14 @@ impl RuntimeCaptureFinalizationWork {
             return completion.cancelled(stopped_capture.session().clone(), compact_artifact);
         }
         let _ = phase_sender.send(CaptureFinalizationPhase::Transcribing);
-        let transcript_text = match Self::transcribe(
-            &capture_store,
-            &transcriber,
-            stopped_capture.session(),
-            compact_artifact.clone(),
-        ) {
-            Ok(transcript_text) => transcript_text,
+        let policy = match provider_policy_service
+            .as_ref()
+            .map(|service| service.current())
+            .transpose()
+            .map_err(|error| Error::ProviderPolicyUnavailable { message: error.to_string() })
+            .map(|policy| policy.flatten().unwrap_or_else(ProviderPolicy::wispr_then_openai))
+        {
+            Ok(policy) => policy,
             Err(error) => {
                 capture_store
                     .mark_transcription_failed(stopped_capture.session())
@@ -957,20 +969,50 @@ impl RuntimeCaptureFinalizationWork {
                 return error.into_stop_reply();
             }
         };
+        let finalizer = match provider_finalizer {
+            Ok(finalizer) => finalizer,
+            Err(message) => {
+                capture_store.mark_transcription_failed(stopped_capture.session()).ok();
+                completion.status_publisher.publish_error();
+                return Error::ProviderFinalizationUnavailable { message }.into_stop_reply();
+            }
+        };
+        let prepared = match finalizer.prepare(
+            stopped_capture.session(), compact_artifact.clone(), policy,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                capture_store.mark_transcription_failed(stopped_capture.session()).ok();
+                completion.status_publisher.publish_error();
+                return Error::TranscriptionBackendUnavailable {
+                    message: format!("all configured providers unavailable; audio preserved ({error})"),
+                }.into_stop_reply();
+            }
+        };
+        let transcript_text = prepared.transcript().clone();
         delivery_ownership_admission.await_delivery_ownership();
         if !cancellation.claim_delivery_ownership() {
             return completion.cancelled(stopped_capture.session().clone(), compact_artifact);
         }
-        if Self::record_history(&history_store, stopped_capture.session(), &transcript_text)
-            && let Err(error) = capture_store.mark_terminal_capture(
-                stopped_capture.session(),
-                crate::TerminalCaptureState::Completed,
-            )
-        {
+        if let Err(error) = finalizer.record_history(stopped_capture.session(), &transcript_text) {
+            completion.status_publisher.publish_error();
+            return Error::ProviderFinalizationUnavailable { message: error.to_string() }.into_stop_reply();
+        }
+        let delivery_outcomes = match finalizer.deliver(
+            stopped_capture.session(), &output_targets, &transcript_text,
+        ) {
+            Ok(outcomes) => outcomes,
+            Err(error) => {
+                completion.status_publisher.publish_error();
+                return Error::ProviderFinalizationUnavailable { message: error.to_string() }.into_stop_reply();
+            }
+        };
+        if let Err(error) = capture_store.mark_terminal_capture(
+            stopped_capture.session(), crate::TerminalCaptureState::Completed,
+        ) {
             completion.status_publisher.publish_error();
             return error.into_stop_reply();
         }
-        let delivery_outcomes = output_target_dispatcher.deliver(&output_targets, &transcript_text);
         publish_delivery_feedback(
             &delivery_outcomes,
             &transcript_text,
@@ -1001,32 +1043,6 @@ impl RuntimeCaptureFinalizationWork {
         }
     }
 
-    fn transcribe(
-        capture_store: &CaptureStore,
-        transcriber: &Arc<dyn BatchTranscriber>,
-        session: &CaptureSession,
-        compact_artifact: signal_listener::DurableAudioArtifact,
-    ) -> Result<TranscriptText> {
-        let input = BatchTranscriptionInput::webm_opus(std::path::PathBuf::from(
-            compact_artifact.path().as_str(),
-        ));
-        let transcript = transcriber.transcribe(BatchTranscriptionRequest::new_with_input(
-            compact_artifact,
-            input,
-        ))?;
-        capture_store.clear_transcription_failure(session)?;
-        Ok(transcript)
-    }
-
-    fn record_history(
-        history_store: &TranscriptHistoryStore,
-        session: &CaptureSession,
-        transcript_text: &TranscriptText,
-    ) -> bool {
-        TranscriptHistoryEntry::recorded_now(session.clone(), transcript_text.clone())
-            .and_then(|entry| history_store.append(&entry))
-            .is_ok()
-    }
 }
 
 struct RuntimeCancellationCompletion {

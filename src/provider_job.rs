@@ -162,6 +162,14 @@ impl ProviderJob {
     pub fn record_result(&self, transcript: impl AsRef<str>) -> Result<(), ProviderJobStoreError> { self.record_result_text(transcript.as_ref()) }
     // Exception: Too trivial. Reads the durable provider result for retry resumption.
     pub fn result(&self) -> Result<Option<String>, ProviderJobStoreError> { self.stored_result() }
+    /// Returns the policy captured when this stable job began. Retries must
+    /// use this instead of observing a later owner configuration.
+    pub fn policy(&self) -> Result<ProviderPolicy, ProviderJobStoreError> {
+        let stored = self.read()?;
+        let providers = stored.providers.into_iter().map(provider_from_code).collect::<Option<Vec<_>>>()
+            .ok_or(ProviderJobStoreError::InvalidPolicy)?;
+        ProviderPolicy::new(stored.policy_generation, providers).ok_or(ProviderJobStoreError::InvalidPolicy)
+    }
     // Exception: Too trivial. Persists logical history intent before history projection.
     pub fn prepare_history(&self) -> Result<bool, ProviderJobStoreError> { self.prepare_history_once() }
     // Exception: Too trivial. Persists logical history completion by stable job identity.
@@ -203,6 +211,7 @@ impl PersistsProviderJob for ProviderJob {
 }
 
 fn provider_code(provider: ProviderIdentifier) -> u8 { match provider { ProviderIdentifier::WisprFlow => 1, ProviderIdentifier::OpenAi => 2 } }
+fn provider_from_code(provider: u8) -> Option<ProviderIdentifier> { match provider { 1 => Some(ProviderIdentifier::WisprFlow), 2 => Some(ProviderIdentifier::OpenAi), _ => None } }
 fn state_code(state: ProviderAttemptState) -> u8 { match state { ProviderAttemptState::Succeeded => 1, ProviderAttemptState::Unavailable => 2, ProviderAttemptState::Rejected => 3, ProviderAttemptState::TransientFailure => 4, ProviderAttemptState::ProtocolFailure => 5, ProviderAttemptState::SizeLimit => 6, ProviderAttemptState::AuthenticationExpired => 7, ProviderAttemptState::Cancelled => 8, ProviderAttemptState::LocalArtifactFailure => 9, ProviderAttemptState::AmbiguousAfterSubmit => 10 } }
 
 #[allow(dead_code)]
