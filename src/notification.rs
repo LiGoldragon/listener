@@ -3,6 +3,8 @@ use std::{collections::HashMap, sync::Arc};
 use signal_listener::TranscriptText;
 use zbus::{Message, message::Flags, zvariant::OwnedValue};
 
+use crate::{ProviderHealthEvent, ProviderIdentifier};
+
 const APPLICATION_NAME: &str = "Listener";
 const TITLE: &str = "Listener Clipboard:";
 const EXPIRE_TIMEOUT_MILLISECONDS: i32 = 2500;
@@ -18,6 +20,32 @@ pub trait SuccessNotifier: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipboardSuccessNotification {
     body: String,
+}
+
+/// A deliberately redacted desktop projection of a provider-health event.
+/// It confirms retained audio and fallback behavior without exposing request,
+/// provider diagnostic, transcript, or credential data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderHealthNotification { body: String }
+
+impl ProviderHealthNotification {
+    pub fn from_event(event: ProviderHealthEvent) -> Self {
+        let provider = match event {
+            ProviderHealthEvent::Degraded { provider, .. } | ProviderHealthEvent::Recovered { provider } => provider_label(provider),
+        };
+        let body = match event {
+            ProviderHealthEvent::Degraded { .. } => format!("{provider} is unavailable; audio is preserved and fallback will be used."),
+            ProviderHealthEvent::Recovered { .. } => format!("{provider} has recovered."),
+        };
+        Self { body }
+    }
+
+    pub fn title(&self) -> &'static str { "Listener transcription provider" }
+    pub fn body(&self) -> &str { &self.body }
+}
+
+fn provider_label(provider: ProviderIdentifier) -> &'static str {
+    match provider { ProviderIdentifier::WisprFlow => "Wispr Flow", ProviderIdentifier::OpenAi => "OpenAI" }
 }
 
 impl ClipboardSuccessNotification {

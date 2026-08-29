@@ -59,7 +59,7 @@ pub use meta::{MetaCommandLine, MetaProviderPolicyClient, MetaProviderPolicySock
 pub use notification::{
     ClipboardSuccessNotification, FreedesktopDbusNotificationTransport,
     FreedesktopNotificationTransport, FreedesktopSuccessNotifier, SilentSuccessNotifier,
-    SuccessNotifier,
+    ProviderHealthNotification, SuccessNotifier,
 };
 pub use provider::{
     ProviderAttempt, ProviderAttemptOutcome, ProviderAttemptState, ProviderCircuitBreaker,
