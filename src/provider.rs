@@ -106,7 +106,7 @@ pub struct ProviderAttempt {
 }
 
 impl ProviderAttempt {
-    fn new(provider: ProviderIdentifier, artifact_path: PathBuf, state: ProviderAttemptState) -> Self {
+    pub(crate) fn new(provider: ProviderIdentifier, artifact_path: PathBuf, state: ProviderAttemptState) -> Self {
         Self { provider, artifact_path, state }
     }
     pub fn provider(&self) -> ProviderIdentifier { self.provider }

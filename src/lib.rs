@@ -21,6 +21,7 @@ pub mod maintenance;
 pub mod meta;
 pub mod notification;
 pub mod provider;
+pub mod provider_job;
 pub mod provider_policy;
 pub mod recall;
 pub mod recording_log;
@@ -65,6 +66,7 @@ pub use provider::{
     ProviderPolicy, ProviderRouter, ProviderTranscriptRequest, TranscriptProvider,
     WisprFlowProvider, WisprFlowTransport, WisprSessionBoundary,
 };
+pub use provider_job::{ProviderJob, ProviderJobStore};
 pub use provider_policy::{MetaProviderPolicyService, ProviderPolicyStore};
 pub use recall::{RecallOutcome, RecallSelector, TranscriptRecall};
 pub use recording_log::{
