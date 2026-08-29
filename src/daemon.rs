@@ -833,19 +833,18 @@ impl ListenerOperationActor {
         cancellation: CaptureCancellationSignal,
     ) {
         let mailbox = self.mailbox.clone();
-        let (phase_sender, phase_receiver) = mpsc::channel();
         let phase_mailbox = self.mailbox.clone();
         let phase_session = session.clone();
         thread::spawn(move || {
-            while let Ok(phase) = phase_receiver.recv() {
-                let _ = phase_mailbox.send(ListenerOperationMail::FinalizationPhase {
+            let output = work.execute(cancellation, move |phase| {
+                // Phase changes are advisory; the final completion carries
+                // authority. Coalesce under mailbox pressure instead of
+                // creating a second blocking phase-pump thread.
+                let _ = phase_mailbox.try_send(ListenerOperationMail::FinalizationPhase {
                     session: phase_session.clone(),
                     phase,
                 });
-            }
-        });
-        thread::spawn(move || {
-            let output = work.execute(cancellation, phase_sender);
+            });
             let _ = mailbox.send(ListenerOperationMail::FinalizationCompleted { session, output });
         });
     }

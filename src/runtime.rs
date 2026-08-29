@@ -1,7 +1,6 @@
 use std::sync::{
     Arc,
     atomic::{AtomicU8, Ordering},
-    mpsc,
 };
 
 use signal_listener::{
@@ -1057,11 +1056,14 @@ impl RuntimeCaptureFinalizationWork {
         self.active_capture.artifact()
     }
 
-    pub fn execute(
+    pub fn execute<PublishPhase>(
         self,
         cancellation: CaptureCancellationSignal,
-        phase_sender: mpsc::Sender<CaptureFinalizationPhase>,
-    ) -> Output {
+        publish_phase: PublishPhase,
+    ) -> Output
+    where
+        PublishPhase: Fn(CaptureFinalizationPhase),
+    {
         let RuntimeCaptureFinalizationWork {
             active_capture,
             capture_store,
@@ -1101,7 +1103,7 @@ impl RuntimeCaptureFinalizationWork {
         if cancellation.is_requested() {
             return completion.cancelled(stopped_capture.session().clone(), raw_artifact);
         }
-        let _ = phase_sender.send(CaptureFinalizationPhase::Transcribing);
+        publish_phase(CaptureFinalizationPhase::Transcribing);
         let policy = match provider_policy_service
             .as_ref()
             .map(|service| service.current())
