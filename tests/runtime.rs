@@ -928,7 +928,8 @@ fn successful_capture_retains_canonical_opus_artifact_and_is_not_retryable() {
         other => panic!("expected durable retry reply, got {other:?}"),
     }
     assert_eq!(
-        fixture.transcription_inputs().len(), 1,
+        fixture.transcription_inputs().len(),
+        1,
         "retry must not call a provider again when the durable result exists"
     );
 }
@@ -1141,11 +1142,16 @@ fn stop_returns_artifact_transcript_and_delivery_outcome() {
         transcription_inputs[0]
             .path()
             .to_string_lossy()
-            .ends_with(".webm")
+            .ends_with(".pcm")
     );
     match transcription_inputs[0].format() {
-        BatchTranscriptionInputFormat::WebmOpus => {}
-        other => panic!("expected compact WebM/Opus transcription input, got {other:?}"),
+        BatchTranscriptionInputFormat::SignedSixteenBitLittleEndianPcm { audio_format } => {
+            assert_eq!(
+                *audio_format,
+                RecordingAudioFormat::signed_sixteen_bit_little_endian_mono_16khz()
+            );
+        }
+        other => panic!("expected a bounded raw PCM transcription input, got {other:?}"),
     }
     assert_eq!(stopped.transcript_text.as_str(), "transcribed text");
     assert_eq!(
@@ -1855,7 +1861,9 @@ fn actor_records_again_while_two_transcriptions_run_in_parallel_without_losing_h
 
     gate.release();
     let deadline = Instant::now() + Duration::from_secs(2);
-    while fixture.recorded_history().len() < 2 && Instant::now() < deadline {
+    while (fixture.recorded_history().len() < 2 || fixture.delivered_texts().len() < 2)
+        && Instant::now() < deadline
+    {
         thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(fixture.transcription_inputs().len(), 2);

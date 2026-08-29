@@ -4,9 +4,16 @@
 //! the durable Listener artifact: a fallback receives the exact same request,
 //! never an in-memory or provider-owned copy.
 
-use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf, sync::{Arc, Mutex}, time::{Duration, Instant}};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use signal_listener::TranscriptText;
+
+use crate::SegmentSampleRange;
 
 /// A stable provider identity for policy, provenance, and redacted status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -38,16 +45,26 @@ impl ProviderPolicy {
         {
             return None;
         }
-        Some(Self { generation, providers })
+        Some(Self {
+            generation,
+            providers,
+        })
     }
 
     pub fn wispr_then_openai() -> Self {
-        Self::new(1, vec![ProviderIdentifier::WisprFlow, ProviderIdentifier::OpenAi])
-            .expect("the built-in policy is valid")
+        Self::new(
+            1,
+            vec![ProviderIdentifier::WisprFlow, ProviderIdentifier::OpenAi],
+        )
+        .expect("the built-in policy is valid")
     }
 
-    pub fn generation(&self) -> u64 { self.generation }
-    pub fn providers(&self) -> &[ProviderIdentifier] { &self.providers }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn providers(&self) -> &[ProviderIdentifier] {
+        &self.providers
+    }
 }
 
 /// The outcome known before delivery.  It is serializable by the durable job
@@ -77,8 +94,13 @@ impl ProviderAttemptState {
 /// response text, request identifiers, artifact paths, or credentials.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderHealthEvent {
-    Degraded { provider: ProviderIdentifier, state: ProviderAttemptState },
-    Recovered { provider: ProviderIdentifier },
+    Degraded {
+        provider: ProviderIdentifier,
+        state: ProviderAttemptState,
+    },
+    Recovered {
+        provider: ProviderIdentifier,
+    },
 }
 
 pub trait ProviderHealthSink: Send + Sync {
@@ -86,10 +108,16 @@ pub trait ProviderHealthSink: Send + Sync {
 }
 
 struct SilentProviderHealthSink;
-impl ProviderHealthSink for SilentProviderHealthSink { fn publish(&self, _event: ProviderHealthEvent) {} }
+impl ProviderHealthSink for SilentProviderHealthSink {
+    fn publish(&self, _event: ProviderHealthEvent) {}
+}
 
 #[derive(Clone, Copy)]
-enum ProviderCircuitState { Closed, Open { retry_after: Instant }, HalfOpen }
+enum ProviderCircuitState {
+    Closed,
+    Open { retry_after: Instant },
+    HalfOpen,
+}
 
 /// A single-probe circuit breaker. The first eligible caller changes Open to
 /// HalfOpen under the mutex; concurrent callers are refused until that one
@@ -103,12 +131,22 @@ pub struct ProviderCircuitBreaker {
 impl ProviderCircuitBreaker {
     // Exception: Too trivial. Construction fixes the health event boundary.
     pub fn new(cooldown: Duration, sink: Arc<dyn ProviderHealthSink>) -> Self {
-        Self { cooldown, states: Mutex::new(BTreeMap::new()), sink }
+        Self {
+            cooldown,
+            states: Mutex::new(BTreeMap::new()),
+            sink,
+        }
     }
 
     pub fn permit(&self, provider: ProviderIdentifier) -> bool {
-        let Ok(mut states) = self.states.lock() else { return false; };
-        match states.get(&provider).copied().unwrap_or(ProviderCircuitState::Closed) {
+        let Ok(mut states) = self.states.lock() else {
+            return false;
+        };
+        match states
+            .get(&provider)
+            .copied()
+            .unwrap_or(ProviderCircuitState::Closed)
+        {
             ProviderCircuitState::Closed => true,
             ProviderCircuitState::HalfOpen => false,
             ProviderCircuitState::Open { retry_after } if Instant::now() < retry_after => false,
@@ -120,66 +158,142 @@ impl ProviderCircuitBreaker {
     }
 
     pub fn record_failure(&self, provider: ProviderIdentifier, state: ProviderAttemptState) {
-        let Ok(mut states) = self.states.lock() else { return; };
-        let was_closed = matches!(states.get(&provider), None | Some(ProviderCircuitState::Closed));
-        states.insert(provider, ProviderCircuitState::Open { retry_after: Instant::now() + self.cooldown });
+        let Ok(mut states) = self.states.lock() else {
+            return;
+        };
+        let was_closed = matches!(
+            states.get(&provider),
+            None | Some(ProviderCircuitState::Closed)
+        );
+        states.insert(
+            provider,
+            ProviderCircuitState::Open {
+                retry_after: Instant::now() + self.cooldown,
+            },
+        );
         drop(states);
-        if was_closed { self.sink.publish(ProviderHealthEvent::Degraded { provider, state }); }
+        if was_closed {
+            self.sink
+                .publish(ProviderHealthEvent::Degraded { provider, state });
+        }
     }
 
     pub fn record_success(&self, provider: ProviderIdentifier) {
-        let Ok(mut states) = self.states.lock() else { return; };
-        let was_degraded = matches!(states.get(&provider), Some(ProviderCircuitState::Open { .. } | ProviderCircuitState::HalfOpen));
+        let Ok(mut states) = self.states.lock() else {
+            return;
+        };
+        let was_degraded = matches!(
+            states.get(&provider),
+            Some(ProviderCircuitState::Open { .. } | ProviderCircuitState::HalfOpen)
+        );
         states.insert(provider, ProviderCircuitState::Closed);
         drop(states);
-        if was_degraded { self.sink.publish(ProviderHealthEvent::Recovered { provider }); }
+        if was_degraded {
+            self.sink
+                .publish(ProviderHealthEvent::Recovered { provider });
+        }
     }
 }
 
 impl Default for ProviderCircuitBreaker {
-    fn default() -> Self { Self::new(Duration::from_secs(30), Arc::new(SilentProviderHealthSink)) }
+    fn default() -> Self {
+        Self::new(Duration::from_secs(30), Arc::new(SilentProviderHealthSink))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderTranscriptRequest {
     artifact_path: PathBuf,
+    sample_range: Option<SegmentSampleRange>,
     preceding_transcript_tail: String,
     vocabulary: Vec<String>,
 }
 
 impl ProviderTranscriptRequest {
-    pub fn new(artifact_path: PathBuf, preceding_transcript_tail: String, vocabulary: Vec<String>) -> Self {
-        Self { artifact_path, preceding_transcript_tail, vocabulary }
+    pub fn new(
+        artifact_path: PathBuf,
+        preceding_transcript_tail: String,
+        vocabulary: Vec<String>,
+    ) -> Self {
+        Self {
+            artifact_path,
+            sample_range: None,
+            preceding_transcript_tail,
+            vocabulary,
+        }
     }
 
     pub fn for_test(path: impl Into<PathBuf>) -> Self {
         Self::new(path.into(), String::new(), Vec::new())
     }
 
-    pub fn artifact_path(&self) -> &PathBuf { &self.artifact_path }
-    pub fn preceding_transcript_tail(&self) -> &str { &self.preceding_transcript_tail }
-    pub fn vocabulary(&self) -> &[String] { &self.vocabulary }
+    /// A provider request always names the durable capture authority. Segment
+    /// bounds are sample indices into that source, never a provider-owned
+    /// recording or mutable playback position.
+    pub fn for_sample_range(path: impl Into<PathBuf>, sample_range: SegmentSampleRange) -> Self {
+        Self {
+            artifact_path: path.into(),
+            sample_range: Some(sample_range),
+            preceding_transcript_tail: String::new(),
+            vocabulary: Vec::new(),
+        }
+    }
+
+    pub fn artifact_path(&self) -> &PathBuf {
+        &self.artifact_path
+    }
+    pub fn sample_range(&self) -> Option<SegmentSampleRange> {
+        self.sample_range
+    }
+    pub fn preceding_transcript_tail(&self) -> &str {
+        &self.preceding_transcript_tail
+    }
+    pub fn vocabulary(&self) -> &[String] {
+        &self.vocabulary
+    }
 }
 
 pub trait TranscriptProvider: Send + Sync {
     fn identifier(&self) -> ProviderIdentifier;
-    fn transcribe(&self, request: &ProviderTranscriptRequest) -> Result<TranscriptText, ProviderAttemptState>;
+    fn transcribe(
+        &self,
+        request: &ProviderTranscriptRequest,
+    ) -> Result<TranscriptText, ProviderAttemptState>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderAttempt {
     provider: ProviderIdentifier,
     artifact_path: PathBuf,
+    sample_range: Option<SegmentSampleRange>,
     state: ProviderAttemptState,
 }
 
 impl ProviderAttempt {
-    pub(crate) fn new(provider: ProviderIdentifier, artifact_path: PathBuf, state: ProviderAttemptState) -> Self {
-        Self { provider, artifact_path, state }
+    pub(crate) fn new(
+        provider: ProviderIdentifier,
+        request: &ProviderTranscriptRequest,
+        state: ProviderAttemptState,
+    ) -> Self {
+        Self {
+            provider,
+            artifact_path: request.artifact_path().clone(),
+            sample_range: request.sample_range(),
+            state,
+        }
     }
-    pub fn provider(&self) -> ProviderIdentifier { self.provider }
-    pub fn artifact_path(&self) -> &PathBuf { &self.artifact_path }
-    pub fn state(&self) -> ProviderAttemptState { self.state }
+    pub fn provider(&self) -> ProviderIdentifier {
+        self.provider
+    }
+    pub fn artifact_path(&self) -> &PathBuf {
+        &self.artifact_path
+    }
+    pub fn sample_range(&self) -> Option<SegmentSampleRange> {
+        self.sample_range
+    }
+    pub fn state(&self) -> ProviderAttemptState {
+        self.state
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,9 +303,18 @@ pub struct ProviderAttemptOutcome {
 }
 
 impl ProviderAttemptOutcome {
-    pub fn transcript(&self) -> Option<&TranscriptText> { self.transcript.as_ref() }
-    pub fn attempts(&self) -> &[ProviderAttempt] { &self.attempts }
-    pub fn exhausted(attempts: Vec<ProviderAttempt>) -> Self { Self { transcript: None, attempts } }
+    pub fn transcript(&self) -> Option<&TranscriptText> {
+        self.transcript.as_ref()
+    }
+    pub fn attempts(&self) -> &[ProviderAttempt] {
+        &self.attempts
+    }
+    pub fn exhausted(attempts: Vec<ProviderAttempt>) -> Self {
+        Self {
+            transcript: None,
+            attempts,
+        }
+    }
 }
 
 /// A policy router with no provider-specific media or credential knowledge.
@@ -210,18 +333,36 @@ impl ProviderRouter {
         providers: Vec<Arc<dyn TranscriptProvider>>,
         circuit_breaker: Arc<ProviderCircuitBreaker>,
     ) -> Self {
-        Self { providers: providers.into_iter().map(|provider| (provider.identifier(), provider)).collect(), circuit_breaker }
+        Self {
+            providers: providers
+                .into_iter()
+                .map(|provider| (provider.identifier(), provider))
+                .collect(),
+            circuit_breaker,
+        }
     }
 
-    pub fn transcribe(&self, policy: ProviderPolicy, request: ProviderTranscriptRequest) -> ProviderAttemptOutcome {
+    pub fn transcribe(
+        &self,
+        policy: ProviderPolicy,
+        request: ProviderTranscriptRequest,
+    ) -> ProviderAttemptOutcome {
         let mut attempts = Vec::new();
         for provider_id in policy.providers() {
             let Some(provider) = self.providers.get(provider_id) else {
-                attempts.push(ProviderAttempt::new(*provider_id, request.artifact_path().clone(), ProviderAttemptState::Unavailable));
+                attempts.push(ProviderAttempt::new(
+                    *provider_id,
+                    &request,
+                    ProviderAttemptState::Unavailable,
+                ));
                 continue;
             };
             if !self.circuit_breaker.permit(*provider_id) {
-                attempts.push(ProviderAttempt::new(*provider_id, request.artifact_path().clone(), ProviderAttemptState::Unavailable));
+                attempts.push(ProviderAttempt::new(
+                    *provider_id,
+                    &request,
+                    ProviderAttemptState::Unavailable,
+                ));
                 continue;
             }
             match provider.transcribe(&request) {
@@ -229,15 +370,22 @@ impl ProviderRouter {
                     self.circuit_breaker.record_success(*provider_id);
                     attempts.push(ProviderAttempt::new(
                         *provider_id,
-                        request.artifact_path().clone(),
+                        &request,
                         ProviderAttemptState::Succeeded,
                     ));
-                    return ProviderAttemptOutcome { transcript: Some(transcript), attempts };
+                    return ProviderAttemptOutcome {
+                        transcript: Some(transcript),
+                        attempts,
+                    };
                 }
                 Err(state) => {
-                    if state.permits_fallback() { self.circuit_breaker.record_failure(*provider_id, state); }
-                    attempts.push(ProviderAttempt::new(*provider_id, request.artifact_path().clone(), state));
-                    if !state.permits_fallback() { break; }
+                    if state.permits_fallback() {
+                        self.circuit_breaker.record_failure(*provider_id, state);
+                    }
+                    attempts.push(ProviderAttempt::new(*provider_id, &request, state));
+                    if !state.permits_fallback() {
+                        break;
+                    }
                 }
             }
         }
@@ -249,7 +397,10 @@ impl ProviderRouter {
 /// resolve a session only at request time; this API intentionally has no
 /// string getter, Debug implementation, persistence projection, or logging.
 pub trait WisprSessionBoundary: Send + Sync {
-    fn with_session(&self, use_session: &mut dyn FnMut(&str) -> Result<TranscriptText, ProviderAttemptState>) -> Result<TranscriptText, ProviderAttemptState>;
+    fn with_session(
+        &self,
+        use_session: &mut dyn FnMut(&str) -> Result<TranscriptText, ProviderAttemptState>,
+    ) -> Result<TranscriptText, ProviderAttemptState>;
 }
 
 /// Private provider adapter.  The network protocol is injected so tests use
@@ -260,16 +411,25 @@ pub struct WisprFlowProvider {
 }
 
 impl WisprFlowProvider {
-    pub fn new(session: Arc<dyn WisprSessionBoundary>, transport: Arc<dyn WisprFlowTransport>) -> Self {
+    pub fn new(
+        session: Arc<dyn WisprSessionBoundary>,
+        transport: Arc<dyn WisprFlowTransport>,
+    ) -> Self {
         Self { session, transport }
     }
 }
 
 impl TranscriptProvider for WisprFlowProvider {
-    fn identifier(&self) -> ProviderIdentifier { ProviderIdentifier::WisprFlow }
+    fn identifier(&self) -> ProviderIdentifier {
+        ProviderIdentifier::WisprFlow
+    }
 
-    fn transcribe(&self, request: &ProviderTranscriptRequest) -> Result<TranscriptText, ProviderAttemptState> {
-        self.session.with_session(&mut |session| self.transport.transcribe_wav(session, request))
+    fn transcribe(
+        &self,
+        request: &ProviderTranscriptRequest,
+    ) -> Result<TranscriptText, ProviderAttemptState> {
+        self.session
+            .with_session(&mut |session| self.transport.transcribe_wav(session, request))
     }
 }
 
@@ -277,5 +437,9 @@ impl TranscriptProvider for WisprFlowProvider {
 /// PCM16 WAV bounded to the segment hard cut, and may retry one transient
 /// failure before returning the classified result.
 pub trait WisprFlowTransport: Send + Sync {
-    fn transcribe_wav(&self, session: &str, request: &ProviderTranscriptRequest) -> Result<TranscriptText, ProviderAttemptState>;
+    fn transcribe_wav(
+        &self,
+        session: &str,
+        request: &ProviderTranscriptRequest,
+    ) -> Result<TranscriptText, ProviderAttemptState>;
 }

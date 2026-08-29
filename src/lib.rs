@@ -56,23 +56,25 @@ pub use history::{
 pub use latency::LatencyInstrumentation;
 pub use maintenance::CaptureMaintenance;
 #[cfg(feature = "nota-text")]
-pub use meta::{MetaCommandLine, MetaProviderPolicyClient, MetaProviderPolicyServer, MetaProviderPolicySocket};
+pub use meta::{
+    MetaCommandLine, MetaProviderPolicyClient, MetaProviderPolicyServer, MetaProviderPolicySocket,
+};
 pub use notification::{
     ClipboardSuccessNotification, FreedesktopDbusNotificationTransport,
-    FreedesktopNotificationTransport, FreedesktopSuccessNotifier, SilentSuccessNotifier,
-    ProviderHealthNotification, SuccessNotifier,
+    FreedesktopNotificationTransport, FreedesktopSuccessNotifier, ProviderHealthNotification,
+    SilentSuccessNotifier, SuccessNotifier,
 };
 pub use provider::{
     ProviderAttempt, ProviderAttemptOutcome, ProviderAttemptState, ProviderCircuitBreaker,
     ProviderHealthEvent, ProviderHealthSink, ProviderIdentifier, ProviderPolicy, ProviderRouter,
-    ProviderTranscriptRequest, TranscriptProvider,
-    WisprFlowProvider, WisprFlowTransport, WisprSessionBoundary,
+    ProviderTranscriptRequest, TranscriptProvider, WisprFlowProvider, WisprFlowTransport,
+    WisprSessionBoundary,
+};
+pub use provider_finalization::{
+    DurableProviderFinalizer, OpenAiBatchProvider, PreparedProviderFinalization,
+    ProviderFinalizationError, ProviderFinalizationOutcome,
 };
 pub use provider_job::{ProviderJob, ProviderJobStore};
-pub use provider_finalization::{
-    DurableProviderFinalizer, OpenAiBatchProvider, PreparedProviderFinalization, ProviderFinalizationError,
-    ProviderFinalizationOutcome,
-};
 pub use provider_policy::{MetaProviderPolicyService, ProviderPolicyStore};
 pub use recall::{RecallOutcome, RecallSelector, TranscriptRecall};
 pub use recording_log::{
@@ -81,6 +83,7 @@ pub use recording_log::{
     RecordingSampleFormat, RecordingStartTime, RecoveredRecordingLog,
 };
 pub use runtime::{DeliveryOwnershipAdmission, ListenerRuntime, RuntimeFinalizationFeedback};
+pub use segmentation::SegmentSampleRange;
 pub use status::{
     ListenerStatusEvent, ListenerStatusState, MicrophoneLevel, StatusEventRecorder,
     StatusPublisher, StatusStreamServer,

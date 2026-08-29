@@ -5,7 +5,10 @@
 //! refreshes it under one mutex. Tests use synthetic sessions and a synthetic
 //! wire client; Listener never performs a live provider call in its test path.
 
-use std::{path::Path, sync::{Arc, Mutex}, time::Instant};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use signal_listener::TranscriptText;
 
@@ -14,7 +17,8 @@ use crate::{
     WisprSessionBoundary,
 };
 
-pub(crate) const TRANSCRIBE_STREAM_PATH: &str = "/flow_api.v1.TranscriptionService/TranscribeStream";
+pub(crate) const TRANSCRIBE_STREAM_PATH: &str =
+    "/flow_api.v1.TranscriptionService/TranscribeStream";
 pub(crate) const WISPR_GRPC_HOST: &str = "inference.wisprflow.com";
 pub(crate) const WISPR_SAMPLE_RATE: u32 = 16_000;
 pub(crate) const WISPR_MAXIMUM_SAMPLES: u64 = 350 * WISPR_SAMPLE_RATE as u64;
@@ -27,8 +31,12 @@ pub(crate) struct WisprSession {
 }
 
 impl WisprSession {
-    pub(crate) fn new(value: String, valid_until: Instant) -> Self { Self { value, valid_until } }
-    fn is_current_at(&self, now: Instant) -> bool { self.valid_until > now }
+    pub(crate) fn new(value: String, valid_until: Instant) -> Self {
+        Self { value, valid_until }
+    }
+    fn is_current_at(&self, now: Instant) -> bool {
+        self.valid_until > now
+    }
 }
 
 /// Supported secret/session boundary. Implementors alone decide how a session
@@ -37,7 +45,9 @@ pub(crate) trait WisprSessionSource: Send + Sync {
     fn refresh_session(&self) -> Result<WisprSession, ProviderAttemptState>;
 }
 
-struct SessionCache { session: Option<WisprSession> }
+struct SessionCache {
+    session: Option<WisprSession>,
+}
 
 /// Single-flight refresh boundary. A rejected/expired session is discarded,
 /// refreshed once, and then retried exactly once for the current submission.
@@ -48,19 +58,39 @@ pub(crate) struct RefreshingWisprSessionBoundary {
 
 impl RefreshingWisprSessionBoundary {
     pub(crate) fn new(source: Arc<dyn WisprSessionSource>) -> Self {
-        Self { source, cache: Mutex::new(SessionCache { session: None }) }
+        Self {
+            source,
+            cache: Mutex::new(SessionCache { session: None }),
+        }
     }
 
-    fn current_or_refresh<'a>(&self, cache: &'a mut SessionCache) -> Result<&'a WisprSession, ProviderAttemptState> {
-        let stale = cache.session.as_ref().is_none_or(|session| !session.is_current_at(Instant::now()));
-        if stale { cache.session = Some(self.source.refresh_session()?); }
-        Ok(cache.session.as_ref().expect("refresh populated the session"))
+    fn current_or_refresh<'a>(
+        &self,
+        cache: &'a mut SessionCache,
+    ) -> Result<&'a WisprSession, ProviderAttemptState> {
+        let stale = cache
+            .session
+            .as_ref()
+            .is_none_or(|session| !session.is_current_at(Instant::now()));
+        if stale {
+            cache.session = Some(self.source.refresh_session()?);
+        }
+        Ok(cache
+            .session
+            .as_ref()
+            .expect("refresh populated the session"))
     }
 }
 
 impl WisprSessionBoundary for RefreshingWisprSessionBoundary {
-    fn with_session(&self, use_session: &mut dyn FnMut(&str) -> Result<TranscriptText, ProviderAttemptState>) -> Result<TranscriptText, ProviderAttemptState> {
-        let mut cache = self.cache.lock().map_err(|_| ProviderAttemptState::Unavailable)?;
+    fn with_session(
+        &self,
+        use_session: &mut dyn FnMut(&str) -> Result<TranscriptText, ProviderAttemptState>,
+    ) -> Result<TranscriptText, ProviderAttemptState> {
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| ProviderAttemptState::Unavailable)?;
         let first = self.current_or_refresh(&mut cache)?;
         match use_session(&first.value) {
             Err(ProviderAttemptState::AuthenticationExpired) => {
@@ -83,8 +113,16 @@ pub(crate) struct WisprFlowWireRequest {
 }
 
 impl WisprFlowWireRequest {
-    pub(crate) fn new(session: &str, request: ProviderTranscriptRequest, wav_pcm16: Vec<u8>) -> Self {
-        Self { session: session.to_owned(), request, wav_pcm16 }
+    pub(crate) fn new(
+        session: &str,
+        request: ProviderTranscriptRequest,
+        wav_pcm16: Vec<u8>,
+    ) -> Self {
+        Self {
+            session: session.to_owned(),
+            request,
+            wav_pcm16,
+        }
     }
 }
 
@@ -93,7 +131,10 @@ impl WisprFlowWireRequest {
 /// non-final commit followed by PCM16/WAV and final commit, ignore heartbeats,
 /// and select HTML/plain/formatted/raw response text in that order.
 pub(crate) trait WisprFlowWireClient: Send + Sync {
-    fn transcribe_stream(&self, request: WisprFlowWireRequest) -> Result<TranscriptText, ProviderAttemptState>;
+    fn transcribe_stream(
+        &self,
+        request: WisprFlowWireRequest,
+    ) -> Result<TranscriptText, ProviderAttemptState>;
 }
 
 /// Opaque request identity needed by the observed protobuf Init message. The
@@ -112,7 +153,10 @@ pub(crate) struct WisprRequestIdentifiers {
 impl WisprRequestIdentifiers {
     // Exception: Too trivial. The identity boundary constructs opaque identifiers.
     pub(crate) fn new(session_id: String, request_id: String) -> Self {
-        Self { session_id, request_id }
+        Self {
+            session_id,
+            request_id,
+        }
     }
 }
 
@@ -127,10 +171,18 @@ pub(crate) struct WisprGrpcStreamCall {
 }
 
 impl WisprGrpcStreamCall {
-    pub(crate) fn host(&self) -> &'static str { self.host }
-    pub(crate) fn method(&self) -> &'static str { self.method }
-    pub(crate) fn metadata(&self) -> &[(&'static str, String)] { &self.metadata }
-    pub(crate) fn messages(&self) -> &[Vec<u8>] { &self.messages }
+    pub(crate) fn host(&self) -> &'static str {
+        self.host
+    }
+    pub(crate) fn method(&self) -> &'static str {
+        self.method
+    }
+    pub(crate) fn metadata(&self) -> &[(&'static str, String)] {
+        &self.metadata
+    }
+    pub(crate) fn messages(&self) -> &[Vec<u8>] {
+        &self.messages
+    }
 }
 
 /// Production networking is deliberately outside Listener's provider model.
@@ -165,7 +217,10 @@ impl ObservedWisprGrpcClient {
 }
 
 impl WisprFlowWireClient for ObservedWisprGrpcClient {
-    fn transcribe_stream(&self, request: WisprFlowWireRequest) -> Result<TranscriptText, ProviderAttemptState> {
+    fn transcribe_stream(
+        &self,
+        request: WisprFlowWireRequest,
+    ) -> Result<TranscriptText, ProviderAttemptState> {
         let user_id = self.identity.user_id()?;
         let identifiers = self.identity.fresh_request_identifiers()?;
         let call = WisprGrpcStreamCall {
@@ -276,74 +331,129 @@ fn protobuf_bytes(number: u64, value: &[u8]) -> Vec<u8> {
     protobuf_field(number, 2, &payload)
 }
 
-fn protobuf_string(number: u64, value: &str) -> Vec<u8> { protobuf_bytes(number, value.as_bytes()) }
-fn protobuf_message(number: u64, value: &[u8]) -> Vec<u8> { protobuf_bytes(number, value) }
+fn protobuf_string(number: u64, value: &str) -> Vec<u8> {
+    protobuf_bytes(number, value.as_bytes())
+}
+fn protobuf_message(number: u64, value: &[u8]) -> Vec<u8> {
+    protobuf_bytes(number, value)
+}
 fn protobuf_concat(fields: &[Vec<u8>]) -> Vec<u8> {
     let mut joined = Vec::new();
-    for field in fields { joined.extend(field); }
+    for field in fields {
+        joined.extend(field);
+    }
     joined
 }
 
-fn decode_observed_responses(responses: &[Vec<u8>]) -> Result<TranscriptText, ProviderAttemptState> {
+fn decode_observed_responses(
+    responses: &[Vec<u8>],
+) -> Result<TranscriptText, ProviderAttemptState> {
     let mut best = ObservedResponseText::default();
     for response in responses {
-        if response.first() == Some(&0x22) { continue; }
+        if response.first() == Some(&0x22) {
+            continue;
+        }
         best.merge(parse_observed_response(response)?);
     }
-    best.final_text().map(TranscriptText::new).ok_or(ProviderAttemptState::ProtocolFailure)
+    best.final_text()
+        .map(TranscriptText::new)
+        .ok_or(ProviderAttemptState::ProtocolFailure)
 }
 
 #[derive(Default)]
-struct ObservedResponseText { html: Option<String>, plaintext: Option<String>, formatted: Option<String>, raw: Option<String> }
+struct ObservedResponseText {
+    html: Option<String>,
+    plaintext: Option<String>,
+    formatted: Option<String>,
+    raw: Option<String>,
+}
 
 impl ObservedResponseText {
-    fn set_if_nonempty(slot: &mut Option<String>, value: String) { if !value.trim().is_empty() { *slot = Some(clean_observed_text(value)); } }
-    fn merge(&mut self, incoming: Self) {
-        if let Some(value) = incoming.html { Self::set_if_nonempty(&mut self.html, value); }
-        if let Some(value) = incoming.plaintext { Self::set_if_nonempty(&mut self.plaintext, value); }
-        if let Some(value) = incoming.formatted { Self::set_if_nonempty(&mut self.formatted, value); }
-        if let Some(value) = incoming.raw { Self::set_if_nonempty(&mut self.raw, value); }
+    fn set_if_nonempty(slot: &mut Option<String>, value: String) {
+        if !value.trim().is_empty() {
+            *slot = Some(clean_observed_text(value));
+        }
     }
-    fn final_text(self) -> Option<String> { self.html.or(self.plaintext).or(self.formatted).or(self.raw) }
+    fn merge(&mut self, incoming: Self) {
+        if let Some(value) = incoming.html {
+            Self::set_if_nonempty(&mut self.html, value);
+        }
+        if let Some(value) = incoming.plaintext {
+            Self::set_if_nonempty(&mut self.plaintext, value);
+        }
+        if let Some(value) = incoming.formatted {
+            Self::set_if_nonempty(&mut self.formatted, value);
+        }
+        if let Some(value) = incoming.raw {
+            Self::set_if_nonempty(&mut self.raw, value);
+        }
+    }
+    fn final_text(self) -> Option<String> {
+        self.html.or(self.plaintext).or(self.formatted).or(self.raw)
+    }
 }
 
 fn clean_observed_text(value: String) -> String {
-    value.trim_start_matches('\u{fffd}').trim().chars().take_while(|character| !character.is_control() || *character == '\n' || *character == '\t').collect()
+    value
+        .trim_start_matches('\u{fffd}')
+        .trim()
+        .chars()
+        .take_while(|character| !character.is_control() || *character == '\n' || *character == '\t')
+        .collect()
 }
 
 fn parse_observed_response(data: &[u8]) -> Result<ObservedResponseText, ProviderAttemptState> {
     let mut output = ObservedResponseText::default();
     for field in protobuf_fields(data)? {
-        let ProtobufField::Bytes { number, value } = field else { continue; };
+        let ProtobufField::Bytes { number, value } = field else {
+            continue;
+        };
         match number {
-            1 => for field in protobuf_fields(value)? {
-                match field {
-                    ProtobufField::Bytes { number: 1, value } => for field in protobuf_fields(value)? {
-                        if let ProtobufField::Bytes { number: 1, value } = field {
+            1 => {
+                for field in protobuf_fields(value)? {
+                    match field {
+                        ProtobufField::Bytes { number: 1, value } => {
                             for field in protobuf_fields(value)? {
-                                if let ProtobufField::Bytes { number, value } = field {
-                                    if number == 1 { output.html = Some(protobuf_text(value)?); }
-                                    if number == 2 { output.plaintext = Some(protobuf_text(value)?); }
+                                if let ProtobufField::Bytes { number: 1, value } = field {
+                                    for field in protobuf_fields(value)? {
+                                        if let ProtobufField::Bytes { number, value } = field {
+                                            if number == 1 {
+                                                output.html = Some(protobuf_text(value)?);
+                                            }
+                                            if number == 2 {
+                                                output.plaintext = Some(protobuf_text(value)?);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
-                    },
-                    _ => {}
+                        _ => {}
+                    }
                 }
-            },
-            2 => for field in protobuf_fields(value)? {
-                if let ProtobufField::Bytes { number, value } = field {
-                    if number == 2 { output.raw = Some(first_text_field(value)?); }
-                    if number == 3 { output.formatted = Some(first_text_field(value)?); }
+            }
+            2 => {
+                for field in protobuf_fields(value)? {
+                    if let ProtobufField::Bytes { number, value } = field {
+                        if number == 2 {
+                            output.raw = Some(first_text_field(value)?);
+                        }
+                        if number == 3 {
+                            output.formatted = Some(first_text_field(value)?);
+                        }
+                    }
                 }
-            },
+            }
             _ => {}
         }
     }
     Ok(output)
 }
 
-enum ProtobufField<'a> { Integer { number: u64, value: u64 }, Bytes { number: u64, value: &'a [u8] } }
+enum ProtobufField<'a> {
+    Integer { number: u64, value: u64 },
+    Bytes { number: u64, value: &'a [u8] },
+}
 
 fn protobuf_fields(data: &[u8]) -> Result<Vec<ProtobufField<'_>>, ProviderAttemptState> {
     let mut fields = Vec::new();
@@ -352,15 +462,34 @@ fn protobuf_fields(data: &[u8]) -> Result<Vec<ProtobufField<'_>>, ProviderAttemp
         let tag = read_protobuf_varint(data, &mut position)?;
         let number = tag >> 3;
         match tag & 7 {
-            0 => fields.push(ProtobufField::Integer { number, value: read_protobuf_varint(data, &mut position)? }),
+            0 => fields.push(ProtobufField::Integer {
+                number,
+                value: read_protobuf_varint(data, &mut position)?,
+            }),
             2 => {
                 let length = read_protobuf_varint(data, &mut position)? as usize;
-                let end = position.checked_add(length).filter(|end| *end <= data.len()).ok_or(ProviderAttemptState::ProtocolFailure)?;
-                fields.push(ProtobufField::Bytes { number, value: &data[position..end] });
+                let end = position
+                    .checked_add(length)
+                    .filter(|end| *end <= data.len())
+                    .ok_or(ProviderAttemptState::ProtocolFailure)?;
+                fields.push(ProtobufField::Bytes {
+                    number,
+                    value: &data[position..end],
+                });
                 position = end;
             }
-            1 => position = position.checked_add(8).filter(|end| *end <= data.len()).ok_or(ProviderAttemptState::ProtocolFailure)?,
-            5 => position = position.checked_add(4).filter(|end| *end <= data.len()).ok_or(ProviderAttemptState::ProtocolFailure)?,
+            1 => {
+                position = position
+                    .checked_add(8)
+                    .filter(|end| *end <= data.len())
+                    .ok_or(ProviderAttemptState::ProtocolFailure)?
+            }
+            5 => {
+                position = position
+                    .checked_add(4)
+                    .filter(|end| *end <= data.len())
+                    .ok_or(ProviderAttemptState::ProtocolFailure)?
+            }
             _ => return Err(ProviderAttemptState::ProtocolFailure),
         }
     }
@@ -370,17 +499,30 @@ fn protobuf_fields(data: &[u8]) -> Result<Vec<ProtobufField<'_>>, ProviderAttemp
 fn read_protobuf_varint(data: &[u8], position: &mut usize) -> Result<u64, ProviderAttemptState> {
     let mut value = 0_u64;
     for shift in (0..64).step_by(7) {
-        let byte = *data.get(*position).ok_or(ProviderAttemptState::ProtocolFailure)?;
+        let byte = *data
+            .get(*position)
+            .ok_or(ProviderAttemptState::ProtocolFailure)?;
         *position += 1;
         value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 { return Ok(value); }
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
     }
     Err(ProviderAttemptState::ProtocolFailure)
 }
 
-fn protobuf_text(data: &[u8]) -> Result<String, ProviderAttemptState> { String::from_utf8(data.to_vec()).map_err(|_| ProviderAttemptState::ProtocolFailure) }
+fn protobuf_text(data: &[u8]) -> Result<String, ProviderAttemptState> {
+    String::from_utf8(data.to_vec()).map_err(|_| ProviderAttemptState::ProtocolFailure)
+}
 fn first_text_field(data: &[u8]) -> Result<String, ProviderAttemptState> {
-    protobuf_fields(data)?.into_iter().find_map(|field| match field { ProtobufField::Bytes { number: 1, value } => Some(protobuf_text(value)), _ => None }).transpose()?.ok_or(ProviderAttemptState::ProtocolFailure)
+    protobuf_fields(data)?
+        .into_iter()
+        .find_map(|field| match field {
+            ProtobufField::Bytes { number: 1, value } => Some(protobuf_text(value)),
+            _ => None,
+        })
+        .transpose()?
+        .ok_or(ProviderAttemptState::ProtocolFailure)
 }
 
 fn is_wispr_pcm16_wav(wav: &[u8]) -> bool {
@@ -397,7 +539,10 @@ fn is_wispr_pcm16_wav(wav: &[u8]) -> bool {
 /// Provider-specific media adapter: it makes a short PCM16 WAV chunk from the
 /// durable source without changing OpenAI's media behavior.
 pub(crate) trait WisprMediaAdapter: Send + Sync {
-    fn wav_pcm16(&self, artifact: &Path) -> Result<Vec<u8>, ProviderAttemptState>;
+    fn wav_pcm16(
+        &self,
+        request: &ProviderTranscriptRequest,
+    ) -> Result<Vec<u8>, ProviderAttemptState>;
 }
 
 /// Converts Listener's committed recording-log PCM authority directly to the
@@ -406,8 +551,11 @@ pub(crate) trait WisprMediaAdapter: Send + Sync {
 pub(crate) struct RecordingLogWisprMediaAdapter;
 
 impl WisprMediaAdapter for RecordingLogWisprMediaAdapter {
-    fn wav_pcm16(&self, artifact: &Path) -> Result<Vec<u8>, ProviderAttemptState> {
-        let recovered = RecordingLog::new(artifact)
+    fn wav_pcm16(
+        &self,
+        request: &ProviderTranscriptRequest,
+    ) -> Result<Vec<u8>, ProviderAttemptState> {
+        let recovered = RecordingLog::new(request.artifact_path())
             .recover()
             .map_err(|_| ProviderAttemptState::LocalArtifactFailure)?;
         let (format, pcm) = recovered
@@ -420,8 +568,32 @@ impl WisprMediaAdapter for RecordingLogWisprMediaAdapter {
         {
             return Err(ProviderAttemptState::LocalArtifactFailure);
         }
+        let pcm = match request.sample_range() {
+            Some(range) => {
+                let start = usize::try_from(
+                    range
+                        .start()
+                        .checked_mul(2)
+                        .ok_or(ProviderAttemptState::SizeLimit)?,
+                )
+                .map_err(|_| ProviderAttemptState::SizeLimit)?;
+                let end = usize::try_from(
+                    range
+                        .end()
+                        .checked_mul(2)
+                        .ok_or(ProviderAttemptState::SizeLimit)?,
+                )
+                .map_err(|_| ProviderAttemptState::SizeLimit)?;
+                pcm.get(start..end)
+                    .ok_or(ProviderAttemptState::LocalArtifactFailure)?
+                    .to_vec()
+            }
+            None => pcm,
+        };
         let data_length = u32::try_from(pcm.len()).map_err(|_| ProviderAttemptState::SizeLimit)?;
-        let riff_length = data_length.checked_add(36).ok_or(ProviderAttemptState::SizeLimit)?;
+        let riff_length = data_length
+            .checked_add(36)
+            .ok_or(ProviderAttemptState::SizeLimit)?;
         let mut wav = Vec::with_capacity(44 + pcm.len());
         wav.extend_from_slice(b"RIFF");
         wav.extend_from_slice(&riff_length.to_le_bytes());
@@ -446,14 +618,21 @@ pub(crate) struct ProtocolWisprFlowTransport {
 }
 
 impl ProtocolWisprFlowTransport {
-    pub(crate) fn new(media: Arc<dyn WisprMediaAdapter>, wire: Arc<dyn WisprFlowWireClient>) -> Self {
+    pub(crate) fn new(
+        media: Arc<dyn WisprMediaAdapter>,
+        wire: Arc<dyn WisprFlowWireClient>,
+    ) -> Self {
         Self { media, wire }
     }
 }
 
 impl WisprFlowTransport for ProtocolWisprFlowTransport {
-    fn transcribe_wav(&self, session: &str, request: &ProviderTranscriptRequest) -> Result<TranscriptText, ProviderAttemptState> {
-        let wav_pcm16 = self.media.wav_pcm16(request.artifact_path())?;
+    fn transcribe_wav(
+        &self,
+        session: &str,
+        request: &ProviderTranscriptRequest,
+    ) -> Result<TranscriptText, ProviderAttemptState> {
+        let wav_pcm16 = self.media.wav_pcm16(request)?;
         // The WAV header is 44 bytes. A complete maximum duration segment is
         // 11,200,000 PCM bytes; over-limit media is a provider-specific error.
         if !is_wispr_pcm16_wav(&wav_pcm16)
@@ -466,8 +645,12 @@ impl WisprFlowTransport for ProtocolWisprFlowTransport {
             Err(ProviderAttemptState::TransientFailure) => {
                 // A single retry is safe only before the wire layer has marked
                 // the outcome ambiguous; that typed state never retries here.
-                let wav_pcm16 = self.media.wav_pcm16(request.artifact_path())?;
-                self.wire.transcribe_stream(WisprFlowWireRequest::new(session, request.clone(), wav_pcm16))
+                let wav_pcm16 = self.media.wav_pcm16(request)?;
+                self.wire.transcribe_stream(WisprFlowWireRequest::new(
+                    session,
+                    request.clone(),
+                    wav_pcm16,
+                ))
             }
             result => result,
         }
@@ -476,11 +659,16 @@ impl WisprFlowTransport for ProtocolWisprFlowTransport {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::{Arc, Mutex}, time::Duration};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use super::*;
 
-    struct SyntheticSessionSource { calls: Arc<Mutex<u8>> }
+    struct SyntheticSessionSource {
+        calls: Arc<Mutex<u8>>,
+    }
     impl WisprSessionSource for SyntheticSessionSource {
         fn refresh_session(&self) -> Result<WisprSession, ProviderAttemptState> {
             let mut calls = self.calls.lock().unwrap();
@@ -519,10 +707,7 @@ mod tests {
             synthetic_result_response("<p>formatted</p>", "plain text"),
         ]);
         let client_stream: Arc<dyn WisprGrpcStreamingBoundary> = stream.clone();
-        let client = ObservedWisprGrpcClient::new(
-            client_stream,
-            Arc::new(SyntheticWireIdentity),
-        );
+        let client = ObservedWisprGrpcClient::new(client_stream, Arc::new(SyntheticWireIdentity));
         let text = client
             .transcribe_stream(WisprFlowWireRequest::new(
                 "synthetic-session",
@@ -541,18 +726,23 @@ mod tests {
         assert_eq!(calls[0].host(), "inference.wisprflow.com");
         assert_eq!(calls[0].method(), TRANSCRIBE_STREAM_PATH);
         assert_eq!(calls[0].messages().len(), 3);
-        assert!(calls[0]
-            .metadata()
-            .iter()
-            .any(|(name, value)| *name == "authorization" && value == "Bearer synthetic-session"));
+        assert!(
+            calls[0].metadata().iter().any(
+                |(name, value)| *name == "authorization" && value == "Bearer synthetic-session"
+            )
+        );
     }
 
     struct SyntheticWireIdentity;
 
     impl WisprWireIdentity for SyntheticWireIdentity {
-        fn user_id(&self) -> Result<String, ProviderAttemptState> { Ok("synthetic-user".into()) }
+        fn user_id(&self) -> Result<String, ProviderAttemptState> {
+            Ok("synthetic-user".into())
+        }
 
-        fn fresh_request_identifiers(&self) -> Result<WisprRequestIdentifiers, ProviderAttemptState> {
+        fn fresh_request_identifiers(
+            &self,
+        ) -> Result<WisprRequestIdentifiers, ProviderAttemptState> {
             Ok(WisprRequestIdentifiers::new(
                 "00000000-0000-4000-8000-000000000001".into(),
                 "00000000-0000-4000-8000-000000000002".into(),
@@ -560,11 +750,17 @@ mod tests {
         }
     }
 
-    struct SyntheticGrpcStream { calls: Mutex<Vec<WisprGrpcStreamCall>>, responses: Vec<Vec<u8>> }
+    struct SyntheticGrpcStream {
+        calls: Mutex<Vec<WisprGrpcStreamCall>>,
+        responses: Vec<Vec<u8>>,
+    }
 
     impl SyntheticGrpcStream {
         fn with_responses(responses: Vec<Vec<u8>>) -> Arc<Self> {
-            Arc::new(Self { calls: Mutex::new(Vec::new()), responses })
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                responses,
+            })
         }
     }
 
@@ -578,13 +774,7 @@ mod tests {
     fn synthetic_result_response(html: &str, plaintext: &str) -> Vec<u8> {
         let text = protobuf_concat(&[protobuf_string(1, html), protobuf_string(2, plaintext)]);
         let result = protobuf_message(1, &text);
-        protobuf_message(
-            1,
-            &protobuf_message(
-                1,
-                &result,
-            ),
-        )
+        protobuf_message(1, &protobuf_message(1, &result))
     }
 
     fn synthetic_wav() -> Vec<u8> {

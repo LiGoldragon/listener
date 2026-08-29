@@ -18,17 +18,14 @@ use signal_listener::{
 };
 
 use crate::{
-    ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureStore, Configuration, Error,
-    DurableProviderFinalizer, FreedesktopSuccessNotifier, LatencyInstrumentation, OpenAiBatchProvider,
-    OpenAiBatchTranscriptionActor, MetaProviderPolicyService, ProviderJobStore, ProviderPolicy,
-    ProviderRouter,
-    OutputTargetDispatcher, RecoveredCaptureRecordings, Result, SilentSuccessNotifier,
-    SuccessNotifier, TranscriptHistoryStore,
+    ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureStore, Configuration,
+    DurableProviderFinalizer, Error, FreedesktopSuccessNotifier, LatencyInstrumentation,
+    MetaProviderPolicyService, OpenAiBatchProvider, OpenAiBatchTranscriptionActor,
+    OutputTargetDispatcher, ProviderJobStore, ProviderPolicy, ProviderRouter,
+    RecoveredCaptureRecordings, Result, SilentSuccessNotifier, SuccessNotifier,
+    TranscriptHistoryStore,
 };
-use crate::{
-    BatchTranscriber,
-    ProcessAudioCaptureBackend, StatusPublisher,
-};
+use crate::{BatchTranscriber, ProcessAudioCaptureBackend, StatusPublisher};
 
 pub struct ListenerRuntime {
     configuration: Configuration,
@@ -202,7 +199,10 @@ impl ListenerRuntime {
         } = dependencies;
         let capture_store = CaptureStore::from_configuration(&configuration);
         let provider_finalizer = Self::provider_finalizer(
-            &configuration, Arc::from(transcriber), output_target_dispatcher.clone(), history_store.clone(),
+            &configuration,
+            Arc::from(transcriber),
+            output_target_dispatcher.clone(),
+            history_store.clone(),
         );
         Self {
             configuration,
@@ -228,14 +228,18 @@ impl ListenerRuntime {
         history: TranscriptHistoryStore,
     ) -> std::result::Result<DurableProviderFinalizer, String> {
         ProviderJobStore::open(
-            configuration.capture_store_directory().join("transcription-provider-jobs.sema"),
+            configuration
+                .capture_store_directory()
+                .join("transcription-provider-jobs.sema"),
         )
-        .map(|jobs| DurableProviderFinalizer::new(
-            jobs,
-            ProviderRouter::new(vec![Arc::new(OpenAiBatchProvider::new(transcriber))]),
-            dispatcher,
-            history,
-        ))
+        .map(|jobs| {
+            DurableProviderFinalizer::new(
+                jobs,
+                ProviderRouter::new(vec![Arc::new(OpenAiBatchProvider::new(transcriber))]),
+                dispatcher,
+                history,
+            )
+        })
         .map_err(|error| error.to_string())
     }
 
@@ -310,29 +314,28 @@ impl ListenerRuntime {
             stopped_capture.session(),
             crate::TerminalCaptureState::Ready,
         )?;
-        let compact_artifact = match self.compact_artifact_after_stop(&stopped_capture) {
-            Ok(artifact) => artifact,
-            Err(error) => {
-                self.capture_store
-                    .mark_transcription_failed(stopped_capture.session())
-                    .ok();
-                self.status_publisher.publish_error();
-                return Err(error);
-            }
-        };
-        let finalization = match self.finalize_compact_capture(stopped_capture.session(), compact_artifact.clone()) {
-            Ok(finalization) => finalization,
-            Err(error) => {
-                self.capture_store
-                    .mark_transcription_failed(stopped_capture.session())
-                    .ok();
-                self.status_publisher.publish_error();
-                return Err(error);
-            }
-        };
+        let raw_artifact = self.finalization_source_artifact(
+            stopped_capture.session(),
+            stopped_capture.artifact().clone(),
+        );
+        let finalization =
+            match self.finalize_capture(stopped_capture.session(), raw_artifact.clone()) {
+                Ok(finalization) => finalization,
+                Err(error) => {
+                    self.capture_store
+                        .mark_transcription_failed(stopped_capture.session())
+                        .ok();
+                    self.status_publisher.publish_error();
+                    return Err(error);
+                }
+            };
         self.capture_store.mark_terminal_capture(
-            stopped_capture.session(), crate::TerminalCaptureState::Completed,
+            stopped_capture.session(),
+            crate::TerminalCaptureState::Completed,
         )?;
+        let durable_audio_artifact = self
+            .compact_artifact_after_stop(&stopped_capture)
+            .unwrap_or(raw_artifact);
         let transcript_text = finalization.transcript().clone();
         let delivery_outcomes = finalization.delivery_outcomes().clone();
         publish_delivery_feedback(
@@ -344,7 +347,7 @@ impl ListenerRuntime {
 
         Ok(Output::Stopped(CaptureStopped {
             stopped_session: StoppedSession::new(stopped_capture.session().clone()),
-            durable_audio_artifact: compact_artifact,
+            durable_audio_artifact,
             transcript_text,
             delivery_outcomes,
         }))
@@ -409,8 +412,11 @@ impl ListenerRuntime {
 
     pub fn retry_capture(&mut self, request: RetryCapture) -> Result<Output> {
         let session = request.into_payload();
-        let compact_artifact = self.capture_store.compact_audio_for_session(&session)?;
-        let finalization = match self.finalize_compact_capture(&session, compact_artifact) {
+        let raw_artifact = self.finalization_source_artifact(
+            &session,
+            self.capture_store.compact_artifact_for_session(&session),
+        );
+        let finalization = match self.finalize_capture(&session, raw_artifact.clone()) {
             Ok(finalization) => finalization,
             Err(error) => {
                 self.capture_store.mark_transcription_failed(&session).ok();
@@ -419,6 +425,7 @@ impl ListenerRuntime {
         };
         self.capture_store
             .mark_terminal_capture(&session, crate::TerminalCaptureState::Completed)?;
+        let _ = self.capture_store.compact_audio_for_session(&session);
         let transcript_text = finalization.transcript().clone();
         let outcomes = finalization.delivery_outcomes().clone();
         publish_delivery_feedback(
@@ -478,33 +485,83 @@ impl ListenerRuntime {
         }
     }
 
-    fn finalize_compact_capture(
+    fn finalize_capture(
         &self,
         session: &CaptureSession,
-        compact_artifact: signal_listener::DurableAudioArtifact,
+        artifact: signal_listener::DurableAudioArtifact,
     ) -> Result<crate::ProviderFinalizationOutcome> {
         let policy = self.current_provider_policy()?;
-        let finalizer = self.provider_finalizer.as_ref().map_err(|message| Error::ProviderFinalizationUnavailable {
-            message: message.clone(),
+        let finalizer = self.provider_finalizer.as_ref().map_err(|message| {
+            Error::ProviderFinalizationUnavailable {
+                message: message.clone(),
+            }
         })?;
-        let prepared = finalizer.prepare(session, compact_artifact, policy)
-            .map_err(|_| Error::TranscriptionBackendUnavailable { message: "all configured providers unavailable; audio preserved".to_owned() })?;
-        finalizer.record_history(session, prepared.transcript())
-            .map_err(|error| Error::ProviderFinalizationUnavailable { message: error.to_string() })?;
-        let delivery_outcomes = finalizer.deliver(session, self.configuration.output_targets(), prepared.transcript())
-            .map_err(|error| Error::ProviderFinalizationUnavailable { message: error.to_string() })?;
+        let prepared =
+            Self::prepare_artifact(finalizer, session, artifact, policy).map_err(|_| {
+                Error::TranscriptionBackendUnavailable {
+                    message: "all configured providers unavailable; audio preserved".to_owned(),
+                }
+            })?;
+        finalizer
+            .record_history(session, prepared.transcript())
+            .map_err(|error| Error::ProviderFinalizationUnavailable {
+                message: error.to_string(),
+            })?;
+        let delivery_outcomes = finalizer
+            .deliver(
+                session,
+                self.configuration.output_targets(),
+                prepared.transcript(),
+            )
+            .map_err(|error| Error::ProviderFinalizationUnavailable {
+                message: error.to_string(),
+            })?;
         self.capture_store.clear_transcription_failure(session)?;
-        Ok(crate::ProviderFinalizationOutcome::from_prepared(prepared, delivery_outcomes))
+        Ok(crate::ProviderFinalizationOutcome::from_prepared(
+            prepared,
+            delivery_outcomes,
+        ))
+    }
+
+    fn finalization_source_artifact(
+        &self,
+        session: &CaptureSession,
+        fallback: signal_listener::DurableAudioArtifact,
+    ) -> signal_listener::DurableAudioArtifact {
+        let raw = self.capture_store.artifact_for_session(session);
+        std::path::Path::new(raw.path().as_str())
+            .is_file()
+            .then_some(raw)
+            .unwrap_or(fallback)
+    }
+
+    fn prepare_artifact(
+        finalizer: &DurableProviderFinalizer,
+        session: &CaptureSession,
+        artifact: signal_listener::DurableAudioArtifact,
+        policy: ProviderPolicy,
+    ) -> std::result::Result<crate::PreparedProviderFinalization, crate::ProviderFinalizationError>
+    {
+        if artifact.path().as_str().ends_with(".listenerlog") {
+            finalizer.prepare_recording_log_segments(session, artifact, policy)
+        } else {
+            finalizer.prepare(session, artifact, policy)
+        }
     }
 
     fn current_provider_policy(&self) -> Result<ProviderPolicy> {
-        self.provider_policy_service.as_ref()
+        self.provider_policy_service
+            .as_ref()
             .map(|service| service.current())
             .transpose()
-            .map_err(|error| Error::ProviderPolicyUnavailable { message: error.to_string() })?
+            .map_err(|error| Error::ProviderPolicyUnavailable {
+                message: error.to_string(),
+            })?
             .flatten()
             .or_else(|| Some(ProviderPolicy::wispr_then_openai()))
-            .ok_or_else(|| Error::ProviderPolicyUnavailable { message: "no valid provider policy".to_owned() })
+            .ok_or_else(|| Error::ProviderPolicyUnavailable {
+                message: "no valid provider policy".to_owned(),
+            })
     }
 
     /// Return only the runtime-owned active slot. This must remain O(1):
@@ -945,28 +1002,27 @@ impl RuntimeCaptureFinalizationWork {
             completion.status_publisher.publish_error();
             return error.into_stop_reply();
         }
-        let compact_artifact =
-            match Self::compact_artifact_after_stop(&capture_store, &stopped_capture) {
-                Ok(artifact) => artifact,
-                Err(error) => {
-                    capture_store
-                        .mark_transcription_failed(stopped_capture.session())
-                        .ok();
-                    completion.status_publisher.publish_error();
-                    return error.into_stop_reply();
-                }
-            };
+        let raw_artifact = Self::finalization_source_artifact(
+            &capture_store,
+            stopped_capture.session(),
+            stopped_capture.artifact().clone(),
+        );
         if cancellation.is_requested() {
-            return completion.cancelled(stopped_capture.session().clone(), compact_artifact);
+            return completion.cancelled(stopped_capture.session().clone(), raw_artifact);
         }
         let _ = phase_sender.send(CaptureFinalizationPhase::Transcribing);
         let policy = match provider_policy_service
             .as_ref()
             .map(|service| service.current())
             .transpose()
-            .map_err(|error| Error::ProviderPolicyUnavailable { message: error.to_string() })
-            .map(|policy| policy.flatten().unwrap_or_else(ProviderPolicy::wispr_then_openai))
-        {
+            .map_err(|error| Error::ProviderPolicyUnavailable {
+                message: error.to_string(),
+            })
+            .map(|policy| {
+                policy
+                    .flatten()
+                    .unwrap_or_else(ProviderPolicy::wispr_then_openai)
+            }) {
             Ok(policy) => policy,
             Err(error) => {
                 capture_store
@@ -979,47 +1035,66 @@ impl RuntimeCaptureFinalizationWork {
         let finalizer = match provider_finalizer {
             Ok(finalizer) => finalizer,
             Err(message) => {
-                capture_store.mark_transcription_failed(stopped_capture.session()).ok();
+                capture_store
+                    .mark_transcription_failed(stopped_capture.session())
+                    .ok();
                 completion.status_publisher.publish_error();
                 return Error::ProviderFinalizationUnavailable { message }.into_stop_reply();
             }
         };
-        let prepared = match finalizer.prepare(
-            stopped_capture.session(), compact_artifact.clone(), policy,
+        let prepared = match Self::prepare_artifact(
+            &finalizer,
+            stopped_capture.session(),
+            raw_artifact.clone(),
+            policy,
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
-                capture_store.mark_transcription_failed(stopped_capture.session()).ok();
+                capture_store
+                    .mark_transcription_failed(stopped_capture.session())
+                    .ok();
                 completion.status_publisher.publish_error();
                 return Error::TranscriptionBackendUnavailable {
-                    message: format!("all configured providers unavailable; audio preserved ({error})"),
-                }.into_stop_reply();
+                    message: format!(
+                        "all configured providers unavailable; audio preserved ({error})"
+                    ),
+                }
+                .into_stop_reply();
             }
         };
         let transcript_text = prepared.transcript().clone();
         delivery_ownership_admission.await_delivery_ownership();
         if !cancellation.claim_delivery_ownership() {
-            return completion.cancelled(stopped_capture.session().clone(), compact_artifact);
+            return completion.cancelled(stopped_capture.session().clone(), raw_artifact);
         }
         if let Err(error) = finalizer.record_history(stopped_capture.session(), &transcript_text) {
             completion.status_publisher.publish_error();
-            return Error::ProviderFinalizationUnavailable { message: error.to_string() }.into_stop_reply();
-        }
-        let delivery_outcomes = match finalizer.deliver(
-            stopped_capture.session(), &output_targets, &transcript_text,
-        ) {
-            Ok(outcomes) => outcomes,
-            Err(error) => {
-                completion.status_publisher.publish_error();
-                return Error::ProviderFinalizationUnavailable { message: error.to_string() }.into_stop_reply();
+            return Error::ProviderFinalizationUnavailable {
+                message: error.to_string(),
             }
-        };
+            .into_stop_reply();
+        }
+        let delivery_outcomes =
+            match finalizer.deliver(stopped_capture.session(), &output_targets, &transcript_text) {
+                Ok(outcomes) => outcomes,
+                Err(error) => {
+                    completion.status_publisher.publish_error();
+                    return Error::ProviderFinalizationUnavailable {
+                        message: error.to_string(),
+                    }
+                    .into_stop_reply();
+                }
+            };
         if let Err(error) = capture_store.mark_terminal_capture(
-            stopped_capture.session(), crate::TerminalCaptureState::Completed,
+            stopped_capture.session(),
+            crate::TerminalCaptureState::Completed,
         ) {
             completion.status_publisher.publish_error();
             return error.into_stop_reply();
         }
+        let durable_audio_artifact =
+            Self::compact_artifact_after_stop(&capture_store, &stopped_capture)
+                .unwrap_or(raw_artifact);
         publish_delivery_feedback(
             &delivery_outcomes,
             &transcript_text,
@@ -1028,7 +1103,7 @@ impl RuntimeCaptureFinalizationWork {
         );
         Output::Stopped(CaptureStopped {
             stopped_session: StoppedSession::new(stopped_capture.session().clone()),
-            durable_audio_artifact: compact_artifact,
+            durable_audio_artifact,
             transcript_text,
             delivery_outcomes,
         })
@@ -1050,6 +1125,31 @@ impl RuntimeCaptureFinalizationWork {
         }
     }
 
+    fn finalization_source_artifact(
+        capture_store: &CaptureStore,
+        session: &CaptureSession,
+        fallback: signal_listener::DurableAudioArtifact,
+    ) -> signal_listener::DurableAudioArtifact {
+        let raw = capture_store.artifact_for_session(session);
+        std::path::Path::new(raw.path().as_str())
+            .is_file()
+            .then_some(raw)
+            .unwrap_or(fallback)
+    }
+
+    fn prepare_artifact(
+        finalizer: &DurableProviderFinalizer,
+        session: &CaptureSession,
+        artifact: signal_listener::DurableAudioArtifact,
+        policy: ProviderPolicy,
+    ) -> std::result::Result<crate::PreparedProviderFinalization, crate::ProviderFinalizationError>
+    {
+        if artifact.path().as_str().ends_with(".listenerlog") {
+            finalizer.prepare_recording_log_segments(session, artifact, policy)
+        } else {
+            finalizer.prepare(session, artifact, policy)
+        }
+    }
 }
 
 struct RuntimeCancellationCompletion {
