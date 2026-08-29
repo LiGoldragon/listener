@@ -82,7 +82,7 @@
               pname = "listener";
               nativeBuildInputs = [ context.pkgs.makeWrapper ];
               postFixup = ''
-                wrapProgram $out/bin/listener-daemon --prefix PATH : ${context.pkgs.ffmpeg}/bin
+                wrapProgram $out/bin/listener-daemon --prefix PATH : ${context.pkgs.lib.makeBinPath [ context.pkgs.ffmpeg context.pkgs.gopass ]}
               '';
               meta.mainProgram = "listener";
             }

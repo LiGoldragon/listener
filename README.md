@@ -49,11 +49,12 @@ listener 'Retry.87'
 listener 'ListCaptures.{}'
 ```
 
-`Retry.<session>` uses the retained compact artifact (or first recovers and compacts a
-legacy `.listenerlog`), calls the configured OpenAI transcription backend, then
-sends the transcript to configured outputs and appends it to history. A failed
-retry leaves its compact artifact in place and marks it `Failed`; it is not
-lost and can be retried again.
+`Retry.<session>` resumes the durable provider job from its retained raw log
+when it is still present (or a compact artifact after a completed delivery).
+Each completed raw PCM range keeps its provider attempts and transcript before
+the assembled result is delivered. A failed retry leaves the authoritative
+artifact in place and marks it `Failed`; it is not lost and can be retried
+again.
 
 ## Capture and artifact lifecycle
 
@@ -98,11 +99,13 @@ Completed transcript history is an owner-only append-only projection at
 `~/.local/share/listener/history.jsonl`). `listener-recall` reads this history
 newest first and copies a selected transcript to the clipboard.
 
-For long recordings, Listener slices the compact artifact into 600-second Opus
-WebM requests before uploading, joins the returned transcript parts in order,
-and therefore does not rely on a single upload fitting the provider's duration
-or token limit. Each request is also checked against OpenAI's 25 MiB upload
-limit.
+For long recordings, on `Stop` or `Retry` Listener plans committed raw PCM into
+ordered 330–350 second ranges, preferring pauses and retaining one second of
+overlap at hard cuts. It transcribes each range through the durable ordered
+provider policy (Wispr Flow first, OpenAI fallback), stores per-range
+provenance, and joins only conservative overlap seams. The raw log remains
+authoritative until the result, history intent, delivery intent, and delivery
+receipt are durable.
 
 ## Service and configuration
 
@@ -143,6 +146,11 @@ Environment configuration:
 - `LISTENER_CLIPBOARD_PROGRAM`: clipboard command (default `wl-copy`).
 - `LISTENER_TRANSCRIPTION_CUSTOMIZATION_ARCHIVE`: optional vocabulary archive.
 
-The production backend reads the existing OpenAI credential at request time
-and uses `gpt-4o-transcribe`. The development-only
-`LISTENER_DEVELOPMENT_TRANSCRIPTION_PROGRAM` seam is not the production path.
+The production backend resolves secrets only at request time through local
+`gopass`: `openai/api-key`, `wispr-flow/session`, and `wispr-flow/user-id` are
+entry identifiers, never environment values, logs, provider-job state, or test
+fixtures. Wispr Flow is the default first provider; OpenAI (`gpt-4o-transcribe`)
+is its ordered fallback. Provider health pushes are typed and local; desktop
+notifications say only that audio is preserved and fallback is in use. The
+development-only `LISTENER_DEVELOPMENT_TRANSCRIPTION_PROGRAM` seam is not the
+production path.
