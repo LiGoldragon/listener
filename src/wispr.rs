@@ -32,6 +32,9 @@ pub(crate) const TRANSCRIBE_STREAM_PATH: &str =
 pub(crate) const WISPR_GRPC_HOST: &str = "inference.wisprflow.com";
 pub(crate) const WISPR_SAMPLE_RATE: u32 = 16_000;
 pub(crate) const WISPR_MAXIMUM_SAMPLES: u64 = 350 * WISPR_SAMPLE_RATE as u64;
+const WISPR_AUDIO_PACKET_BYTES: usize = 1_280;
+const WISPR_POST_HALF_CLOSE_DEADLINE: Duration = Duration::from_secs(30);
+const WISPR_DIAGNOSTIC_FRAME_LIMIT: usize = 32;
 const WISPR_SESSION_SECRET_NAME: &str = "wispr-flow/session";
 const WISPR_USER_ID_SECRET_NAME: &str = "wispr-flow/user-id";
 const WISPR_SESSION_CACHE_LIFETIME: Duration = Duration::from_secs(300);
@@ -193,24 +196,24 @@ impl WisprSessionBoundary for RefreshingWisprSessionBoundary {
 }
 
 /// A redacted protocol request. Its caller knows the inferred stream path,
-/// fresh session/request identifiers, optional context, WAV payload, and final
+/// fresh session/request identifiers, optional context, raw PCM16LE payload, and final
 /// commit; diagnostics contain only typed state.
 pub(crate) struct WisprFlowWireRequest {
     session: String,
     request: ProviderTranscriptRequest,
-    wav_pcm16: Vec<u8>,
+    pcm16le: Vec<u8>,
 }
 
 impl WisprFlowWireRequest {
     pub(crate) fn new(
         session: &str,
         request: ProviderTranscriptRequest,
-        wav_pcm16: Vec<u8>,
+        pcm16le: Vec<u8>,
     ) -> Self {
         Self {
             session: session.to_owned(),
             request,
-            wav_pcm16,
+            pcm16le,
         }
     }
 }
@@ -516,18 +519,33 @@ pub struct WisprWitnessDiagnostics {
 #[derive(Clone)]
 pub struct WisprWitnessCheckpoint {
     stage: Arc<Mutex<&'static str>>,
+    reporter: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
 }
 
 impl WisprWitnessCheckpoint {
     pub fn new(stage: &'static str) -> Self {
         Self {
             stage: Arc::new(Mutex::new(stage)),
+            reporter: None,
+        }
+    }
+
+    pub fn with_rolling_reporter(
+        stage: &'static str,
+        reporter: impl Fn(&'static str) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            stage: Arc::new(Mutex::new(stage)),
+            reporter: Some(Arc::new(reporter)),
         }
     }
 
     pub fn advance(&self, stage: &'static str) {
         if let Ok(mut current) = self.stage.lock() {
             *current = stage;
+        }
+        if let Some(reporter) = &self.reporter {
+            reporter(stage);
         }
     }
 
@@ -607,10 +625,16 @@ impl WisprWitnessDiagnostics {
             bearer_state,
             permission_category: response.permission_category,
             response_frame_count: response.messages.len(),
-            response_frame_lengths: response.messages.iter().map(Vec::len).collect(),
+            response_frame_lengths: response
+                .messages
+                .iter()
+                .take(WISPR_DIAGNOSTIC_FRAME_LIMIT)
+                .map(Vec::len)
+                .collect(),
             protobuf_top_level_tag_histograms: response
                 .messages
                 .iter()
+                .take(WISPR_DIAGNOSTIC_FRAME_LIMIT)
                 .map(|message| protobuf_top_level_tag_histogram(message))
                 .collect(),
         }
@@ -847,64 +871,74 @@ async fn native_grpc_stream(
         .map_err(|_| ProviderAttemptState::TransientFailure)?;
     checkpoint.advance("http2-body-half-close-completed");
 
-    let response = response
-        .await
-        .map_err(|_| ProviderAttemptState::TransientFailure)?;
-    checkpoint.advance("response-headers");
-    let (head, mut body) = response.into_parts();
-    let http_status = Some(head.status.as_u16());
-    let content_type = head
-        .headers
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let mut grpc_status = head
-        .headers
-        .get("grpc-status")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok());
-    let mut permission_category = grpc_message_permission_category(
-        head.headers
-            .get("grpc-message")
-            .and_then(|value| value.to_str().ok()),
-    );
-    let mut flow_control = body.flow_control().clone();
-    let mut bytes = Vec::new();
-    while let Some(chunk) = body.data().await {
-        let chunk = chunk.map_err(|_| ProviderAttemptState::TransientFailure)?;
-        flow_control
-            .release_capacity(chunk.len())
-            .map_err(|_| ProviderAttemptState::ProtocolFailure)?;
-        bytes.extend_from_slice(&chunk);
-    }
-    checkpoint.advance("response-body");
-    if let Some(trailers) = body
-        .trailers()
-        .await
-        .map_err(|_| ProviderAttemptState::TransientFailure)?
-    {
-        grpc_status = trailers
+    let result = tokio::time::timeout(WISPR_POST_HALF_CLOSE_DEADLINE, async {
+        let response = response
+            .await
+            .map_err(|_| ProviderAttemptState::TransientFailure)?;
+        checkpoint.advance("response-headers");
+        let (head, mut body) = response.into_parts();
+        let http_status = Some(head.status.as_u16());
+        let content_type = head
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let mut grpc_status = head
+            .headers
             .get("grpc-status")
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse().ok())
-            .or(grpc_status);
-        let trailer_permission_category = grpc_message_permission_category(
-            trailers
+            .and_then(|value| value.parse().ok());
+        let mut permission_category = grpc_message_permission_category(
+            head.headers
                 .get("grpc-message")
                 .and_then(|value| value.to_str().ok()),
         );
-        if trailer_permission_category != PermissionCategory::Absent {
-            permission_category = trailer_permission_category;
+        let mut flow_control = body.flow_control().clone();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.map_err(|_| ProviderAttemptState::TransientFailure)?;
+            flow_control
+                .release_capacity(chunk.len())
+                .map_err(|_| ProviderAttemptState::ProtocolFailure)?;
+            bytes.extend_from_slice(&chunk);
+            checkpoint.advance("response-frame");
+        }
+        if let Some(trailers) = body
+            .trailers()
+            .await
+            .map_err(|_| ProviderAttemptState::TransientFailure)?
+        {
+            grpc_status = trailers
+                .get("grpc-status")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok())
+                .or(grpc_status);
+            let trailer_permission_category = grpc_message_permission_category(
+                trailers
+                    .get("grpc-message")
+                    .and_then(|value| value.to_str().ok()),
+            );
+            if trailer_permission_category != PermissionCategory::Absent {
+                permission_category = trailer_permission_category;
+            }
+        }
+        checkpoint.advance("response-trailers");
+        Ok(WisprGrpcStreamResponse {
+            messages: grpc_decode_messages(&bytes)?,
+            http_status,
+            grpc_status,
+            content_type,
+            permission_category,
+        })
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            checkpoint.advance("post-half-close-timeout");
+            Err(ProviderAttemptState::TransientFailure)
         }
     }
-    checkpoint.advance("response-trailers");
-    Ok(WisprGrpcStreamResponse {
-        messages: grpc_decode_messages(&bytes)?,
-        http_status,
-        grpc_status,
-        content_type,
-        permission_category,
-    })
 }
 
 async fn resolve_wispr_addresses(
@@ -996,14 +1030,8 @@ fn wispr_h2_request(
     Ok(request)
 }
 
-fn wispr_outbound_frame_stage(message: &[u8]) -> &'static str {
-    match message.first() {
-        Some(0x0a) => "client-init-frame-sent",
-        Some(0x12) => "client-context-frame-sent",
-        Some(0x1a) => "client-audio-frame-sent",
-        Some(0x20) => "client-commit-frame-sent",
-        _ => "client-unclassified-frame-sent",
-    }
+fn wispr_outbound_frame_stage(_: &[u8]) -> &'static str {
+    "client-one-shot-request-sent"
 }
 
 async fn native_send_grpc_message(
@@ -1743,15 +1771,18 @@ impl WisprFlowWireClient for ObservedWisprGrpcClient {
     }
 }
 
-/// Encodes the observed request queue: Init, optional cursor context, audio,
-/// then Commit=True. Each entry is one independent gRPC message; the caller
-/// alone half-closes the HTTP/2 stream after the commit message.
+/// Encodes one observed one-shot Request: pending Init, optional cursor
+/// context, raw PCM16LE audio packets, and Commit=True share one protobuf
+/// message; its caller half-closes the HTTP/2 stream immediately afterwards.
 fn encode_observed_requests(
     user_id: &str,
     identifiers: WisprRequestIdentifiers,
     request: &WisprFlowWireRequest,
 ) -> Result<Vec<Vec<u8>>, ProviderAttemptState> {
-    if !is_wispr_pcm16_wav(&request.wav_pcm16) {
+    if request.pcm16le.is_empty()
+        || request.pcm16le.len() % 2 != 0
+        || request.pcm16le.len() > WISPR_MAXIMUM_SAMPLES as usize * 2
+    {
         return Err(ProviderAttemptState::ProtocolFailure);
     }
     let version = protobuf_concat(&[
@@ -1795,17 +1826,23 @@ fn encode_observed_requests(
         protobuf_message(1, &metadata),
         protobuf_message(2, &preferences),
     ]);
-    let mut messages = vec![protobuf_message(1, &init_body)];
+    let mut fields = vec![protobuf_message(1, &init_body)];
     if !request.request.preceding_transcript_tail().is_empty() {
         let textbox = protobuf_string(2, request.request.preceding_transcript_tail());
         let context = protobuf_message(2, &protobuf_message(2, &textbox));
-        messages.push(context);
+        fields.push(context);
     }
-    let payload = protobuf_bytes(1, &request.wav_pcm16);
-    let audio_file = protobuf_message(2, &payload);
-    messages.push(protobuf_message(3, &audio_file));
-    messages.push(protobuf_integer(4, 1));
-    Ok(messages)
+    let packets = request
+        .pcm16le
+        .chunks(WISPR_AUDIO_PACKET_BYTES)
+        .fold(Vec::new(), |mut fields, packet| {
+            fields.extend(protobuf_bytes(1, packet));
+            fields
+        });
+    let audio_packets = protobuf_message(2, &packets);
+    fields.push(protobuf_message(3, &audio_packets));
+    fields.push(protobuf_integer(4, 1));
+    Ok(vec![protobuf_concat(&fields)])
 }
 
 fn protobuf_varint(mut value: u64) -> Vec<u8> {
@@ -2028,33 +2065,22 @@ fn first_text_field(data: &[u8]) -> Result<String, ProviderAttemptState> {
         .ok_or(ProviderAttemptState::ProtocolFailure)
 }
 
-fn is_wispr_pcm16_wav(wav: &[u8]) -> bool {
-    wav.len() >= 44
-        && &wav[..4] == b"RIFF"
-        && &wav[8..12] == b"WAVE"
-        && &wav[12..16] == b"fmt "
-        && u16::from_le_bytes([wav[20], wav[21]]) == 1
-        && u16::from_le_bytes([wav[22], wav[23]]) == 1
-        && u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]) == WISPR_SAMPLE_RATE
-        && u16::from_le_bytes([wav[34], wav[35]]) == 16
-}
-
-/// Provider-specific media adapter: it makes a short PCM16 WAV chunk from the
+/// Provider-specific media adapter: it exposes committed raw PCM16LE from the
 /// durable source without changing OpenAI's media behavior.
 pub(crate) trait WisprMediaAdapter: Send + Sync {
-    fn wav_pcm16(
+    fn pcm16le(
         &self,
         request: &ProviderTranscriptRequest,
     ) -> Result<Vec<u8>, ProviderAttemptState>;
 }
 
 /// Converts Listener's committed recording-log PCM authority directly to the
-/// observed provider's 16 kHz mono signed-16-bit WAV. It has no network or
+/// observed provider's 16 kHz mono signed-16-bit little-endian packets. It has no network or
 /// credential access and rejects any incompatible recording before encoding.
 pub(crate) struct RecordingLogWisprMediaAdapter;
 
 impl WisprMediaAdapter for RecordingLogWisprMediaAdapter {
-    fn wav_pcm16(
+    fn pcm16le(
         &self,
         request: &ProviderTranscriptRequest,
     ) -> Result<Vec<u8>, ProviderAttemptState> {
@@ -2093,25 +2119,7 @@ impl WisprMediaAdapter for RecordingLogWisprMediaAdapter {
             }
             None => pcm,
         };
-        let data_length = u32::try_from(pcm.len()).map_err(|_| ProviderAttemptState::SizeLimit)?;
-        let riff_length = data_length
-            .checked_add(36)
-            .ok_or(ProviderAttemptState::SizeLimit)?;
-        let mut wav = Vec::with_capacity(44 + pcm.len());
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&riff_length.to_le_bytes());
-        wav.extend_from_slice(b"WAVEfmt ");
-        wav.extend_from_slice(&16_u32.to_le_bytes());
-        wav.extend_from_slice(&1_u16.to_le_bytes());
-        wav.extend_from_slice(&1_u16.to_le_bytes());
-        wav.extend_from_slice(&WISPR_SAMPLE_RATE.to_le_bytes());
-        wav.extend_from_slice(&(WISPR_SAMPLE_RATE * 2).to_le_bytes());
-        wav.extend_from_slice(&2_u16.to_le_bytes());
-        wav.extend_from_slice(&16_u16.to_le_bytes());
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_length.to_le_bytes());
-        wav.extend_from_slice(&pcm);
-        Ok(wav)
+        Ok(pcm)
     }
 }
 
@@ -2135,24 +2143,23 @@ impl WisprFlowTransport for ProtocolWisprFlowTransport {
         session: &str,
         request: &ProviderTranscriptRequest,
     ) -> Result<TranscriptText, ProviderAttemptState> {
-        let wav_pcm16 = self.media.wav_pcm16(request)?;
-        // The WAV header is 44 bytes. A complete maximum duration segment is
-        // 11,200,000 PCM bytes; over-limit media is a provider-specific error.
-        if !is_wispr_pcm16_wav(&wav_pcm16)
-            || wav_pcm16.len() > 44 + (WISPR_MAXIMUM_SAMPLES as usize * 2)
+        let pcm16le = self.media.pcm16le(request)?;
+        if pcm16le.is_empty()
+            || pcm16le.len() % 2 != 0
+            || pcm16le.len() > WISPR_MAXIMUM_SAMPLES as usize * 2
         {
             return Err(ProviderAttemptState::SizeLimit);
         }
-        let wire_request = WisprFlowWireRequest::new(session, request.clone(), wav_pcm16);
+        let wire_request = WisprFlowWireRequest::new(session, request.clone(), pcm16le);
         match self.wire.transcribe_stream(wire_request) {
             Err(ProviderAttemptState::TransientFailure) => {
                 // A single retry is safe only before the wire layer has marked
                 // the outcome ambiguous; that typed state never retries here.
-                let wav_pcm16 = self.media.wav_pcm16(request)?;
+                let pcm16le = self.media.pcm16le(request)?;
                 self.wire.transcribe_stream(WisprFlowWireRequest::new(
                     session,
                     request.clone(),
-                    wav_pcm16,
+                    pcm16le,
                 ))
             }
             result => result,
@@ -2260,15 +2267,16 @@ pub fn sandbox_wispr_witness_checkpointed(
     };
     checkpoint.advance("session");
     let request = ProviderTranscriptRequest::for_test(artifact_path);
-    let wav_pcm16 = match RecordingLogWisprMediaAdapter.wav_pcm16(&request) {
-        Ok(wav_pcm16) => wav_pcm16,
+    let pcm16le = match RecordingLogWisprMediaAdapter.pcm16le(&request) {
+        Ok(pcm16le) => pcm16le,
         Err(_) => {
             return WisprWitnessDiagnostics::at("recording", route, auth_probe, model_variant);
         }
     };
     checkpoint.advance("request-recording");
-    if !is_wispr_pcm16_wav(&wav_pcm16)
-        || wav_pcm16.len() > 44 + (WISPR_MAXIMUM_SAMPLES as usize * 2)
+    if pcm16le.is_empty()
+        || pcm16le.len() % 2 != 0
+        || pcm16le.len() > WISPR_MAXIMUM_SAMPLES as usize * 2
     {
         return WisprWitnessDiagnostics::at("audio-validation", route, auth_probe, model_variant);
     }
@@ -2307,7 +2315,7 @@ pub fn sandbox_wispr_witness_checkpointed(
     let messages = match encode_observed_requests(
         &user_id,
         identifiers,
-        &WisprFlowWireRequest::new(&access_token, request, wav_pcm16),
+        &WisprFlowWireRequest::new(&access_token, request, pcm16le),
     ) {
         Ok(messages) => messages,
         Err(_) => {
@@ -2410,7 +2418,7 @@ mod tests {
                     "before cursor".into(),
                     vec!["project-name".into()],
                 ),
-                synthetic_wav(),
+                synthetic_pcm16le(),
             ))
             .expect("synthetic protocol transcript");
 
@@ -2419,7 +2427,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].host(), "inference.wisprflow.com");
         assert_eq!(calls[0].method(), TRANSCRIBE_STREAM_PATH);
-        assert_eq!(calls[0].messages().len(), 4);
+        assert_eq!(calls[0].messages().len(), 1);
         assert!(calls[0]
             .metadata()
             .iter()
@@ -2427,7 +2435,7 @@ mod tests {
     }
 
     #[test]
-    fn observed_wire_queues_init_context_audio_and_commit_as_distinct_messages() {
+    fn observed_one_shot_request_combines_init_context_packets_and_commit_before_half_close() {
         let request = WisprFlowWireRequest::new(
             "synthetic-session",
             ProviderTranscriptRequest::new(
@@ -2435,7 +2443,7 @@ mod tests {
                 "synthetic cursor context".into(),
                 vec!["synthetic-vocabulary".into()],
             ),
-            synthetic_wav(),
+            vec![0_u8; 13 * 1280],
         );
 
         let messages = encode_observed_requests(
@@ -2446,22 +2454,27 @@ mod tests {
             ),
             &request,
         )
-        .expect("synthetic request should encode");
+        .expect("synthetic one-shot request should encode");
 
-        assert_eq!(messages.len(), 4);
-        assert!(matches!(
-            protobuf_fields(&messages[0]).unwrap().as_slice(),
-            [ProtobufField::Bytes { number: 1, .. }]
-        ));
-        assert!(matches!(
-            protobuf_fields(&messages[1]).unwrap().as_slice(),
-            [ProtobufField::Bytes { number: 2, .. }]
-        ));
-        assert!(matches!(
-            protobuf_fields(&messages[2]).unwrap().as_slice(),
-            [ProtobufField::Bytes { number: 3, .. }]
-        ));
-        assert_eq!(messages[3], protobuf_integer(4, 1));
+        assert_eq!(messages.len(), 1);
+        let fields = protobuf_fields(&messages[0]).expect("combined request fields");
+        assert!(matches!(fields[0], ProtobufField::Bytes { number: 1, .. }));
+        assert!(matches!(fields[1], ProtobufField::Bytes { number: 2, .. }));
+        let ProtobufField::Bytes { number: 3, value } = fields[2] else {
+            panic!("combined request payload");
+        };
+        let ProtobufField::Bytes { number: 2, value } =
+            protobuf_fields(value).expect("audio-file fields")[0]
+        else {
+            panic!("audio packet container");
+        };
+        let packets = protobuf_fields(value).expect("audio packets");
+        assert_eq!(packets.len(), 13);
+        assert!(packets.iter().all(|packet| matches!(
+            packet,
+            ProtobufField::Bytes { number: 1, value } if value.len() == 1280 && value.iter().all(|sample| *sample == 0)
+        )));
+        assert!(matches!(fields[3], ProtobufField::Integer { number: 4 }));
     }
 
     #[test]
@@ -2721,7 +2734,9 @@ mod tests {
     #[test]
     fn witness_tls_configuration_does_not_depend_on_process_default_provider() {
         let checkpoint = WisprWitnessCheckpoint::new("tcp-dial-connected");
-        let result = std::panic::catch_unwind(|| wispr_tls_connector(&checkpoint));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wispr_tls_connector(&checkpoint)
+        }));
 
         assert!(result.is_ok());
         assert!(result.expect("explicit provider configuration").is_ok());
@@ -2739,7 +2754,7 @@ mod tests {
     }
 
     #[test]
-    fn loopback_h2_accepts_the_real_four_message_witness_request() {
+    fn loopback_h2_sends_one_request_then_half_closes() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .build()
@@ -2749,21 +2764,33 @@ mod tests {
                 .await
                 .expect("offline loopback listener");
             let address = listener.local_addr().expect("loopback listener address");
+            let (half_closed, half_close_observed) = tokio::sync::oneshot::channel();
             let server = tokio::spawn(async move {
                 let (socket, _) = listener.accept().await.expect("loopback accept");
                 let mut connection = h2::server::handshake(socket).await.expect("h2 server");
-                let (_request, mut respond) = connection
+                let (request, _respond) = connection
                     .accept()
                     .await
                     .expect("h2 request")
                     .expect("one request");
-                respond
-                    .send_response(
-                        http::Response::builder().status(200).body(()).unwrap(),
-                        true,
-                    )
-                    .expect("h2 response");
-                while connection.accept().await.is_some() {}
+                let reader = tokio::spawn(async move {
+                    let mut body = request.into_body();
+                    let mut encoded = Vec::new();
+                    while let Some(chunk) = body.data().await {
+                        encoded.extend_from_slice(&chunk.expect("h2 request data"));
+                    }
+                    half_closed
+                        .send(
+                            grpc_decode_messages(&encoded)
+                                .expect("combined grpc request")
+                                .len(),
+                        )
+                        .expect("half-close observer still waits");
+                });
+                tokio::select! {
+                    result = reader => result.expect("loopback request reader"),
+                    _ = connection.accept() => panic!("unexpected second h2 request"),
+                }
             });
             let socket = tokio::net::TcpStream::connect(address)
                 .await
@@ -2779,7 +2806,7 @@ mod tests {
                     "synthetic context".into(),
                     Vec::new(),
                 ),
-                synthetic_wav(),
+                vec![0_u8; 13 * WISPR_AUDIO_PACKET_BYTES],
             );
             let messages = encode_observed_requests(
                 "synthetic-user",
@@ -2789,8 +2816,8 @@ mod tests {
                 ),
                 &request,
             )
-            .expect("four synthetic messages");
-            assert_eq!(messages.len(), 4);
+            .expect("one synthetic message");
+            assert_eq!(messages.len(), 1);
             let call = WisprGrpcStreamCall {
                 host: "offline.wispr.test".into(),
                 method: TRANSCRIBE_STREAM_PATH,
@@ -2809,9 +2836,11 @@ mod tests {
                 checkpoint.advance(wispr_outbound_frame_stage(message));
             }
             upload.send_data(Bytes::new(), true).expect("h2 half close");
-            assert_eq!(response.await.expect("h2 response").status(), 200);
-            server.abort();
-            assert_eq!(checkpoint.stage(), "client-commit-frame-sent");
+            assert_eq!(half_close_observed.await.expect("server observed half close"), 1);
+            drop(response);
+            drop(sender);
+            server.await.expect("loopback server");
+            assert_eq!(checkpoint.stage(), "client-one-shot-request-sent");
         });
     }
 
@@ -3078,20 +3107,7 @@ mod tests {
         protobuf_message(1, &protobuf_message(1, &result))
     }
 
-    fn synthetic_wav() -> Vec<u8> {
-        let mut wav = vec![0_u8; 46];
-        wav[..4].copy_from_slice(b"RIFF");
-        wav[8..12].copy_from_slice(b"WAVE");
-        wav[12..16].copy_from_slice(b"fmt ");
-        wav[16..20].copy_from_slice(&16_u32.to_le_bytes());
-        wav[20..22].copy_from_slice(&1_u16.to_le_bytes());
-        wav[22..24].copy_from_slice(&1_u16.to_le_bytes());
-        wav[24..28].copy_from_slice(&WISPR_SAMPLE_RATE.to_le_bytes());
-        wav[28..32].copy_from_slice(&(WISPR_SAMPLE_RATE * 2).to_le_bytes());
-        wav[32..34].copy_from_slice(&2_u16.to_le_bytes());
-        wav[34..36].copy_from_slice(&16_u16.to_le_bytes());
-        wav[36..40].copy_from_slice(b"data");
-        wav[40..44].copy_from_slice(&2_u32.to_le_bytes());
-        wav
+    fn synthetic_pcm16le() -> Vec<u8> {
+        vec![0_u8; WISPR_AUDIO_PACKET_BYTES]
     }
 }

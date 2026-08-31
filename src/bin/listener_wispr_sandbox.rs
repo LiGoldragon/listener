@@ -195,10 +195,26 @@ fn write_diagnostics_atomically(path: &Path, contents: &[u8]) -> Result<(), &'st
         .as_file()
         .sync_all()
         .map_err(|_| "diagnostics-sync")?;
-    temporary
-        .persist_noclobber(path)
-        .map_err(|_| "diagnostics-persist")?;
+    temporary.persist(path).map_err(|_| "diagnostics-persist")?;
     Ok(())
+}
+
+fn persist_rolling_diagnostics(
+    path: &Path,
+    stage: &'static str,
+    route: WisprWitnessRoute,
+    auth_probe: WisprWitnessAuthProbe,
+    model_variant: WisprWitnessModelVariant,
+) {
+    let diagnostics = WisprWitnessDiagnostics::setup_failure(
+        stage,
+        route,
+        auth_probe,
+        model_variant,
+    );
+    if let Ok(contents) = serde_json::to_vec(&diagnostics) {
+        let _ = write_diagnostics_atomically(path, &contents);
+    }
 }
 
 fn main() -> ExitCode {
@@ -259,6 +275,19 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let rolling_diagnostics_path = diagnostics_path.clone();
+    let checkpoint = WisprWitnessCheckpoint::with_rolling_reporter(
+        "validated-output",
+        move |stage| {
+            persist_rolling_diagnostics(
+                &rolling_diagnostics_path,
+                stage,
+                route,
+                auth_probe,
+                model_variant,
+            );
+        },
+    );
     let result = if offline_bundle_probe_requested() {
         finish_with_diagnostics(
             &diagnostics_path,
@@ -375,6 +404,39 @@ mod tests {
         assert_eq!(diagnostics["route"], "edge-proxy");
         assert_eq!(diagnostics["auth_probe"], "omit-bearer");
         assert_eq!(diagnostics["model_variant"], "packaged-default");
+    }
+
+    #[test]
+    fn rolling_checkpoint_persists_only_static_structural_diagnostics() {
+        let directory = tempfile::tempdir().expect("temporary diagnostics directory");
+        let path = directory.path().join("diagnostics.json");
+        let reporter_path = path.clone();
+        let checkpoint = WisprWitnessCheckpoint::with_rolling_reporter(
+            "http2-body-half-close-completed",
+            move |stage| {
+                persist_rolling_diagnostics(
+                    &reporter_path,
+                    stage,
+                    WisprWitnessRoute::EdgeProxy,
+                    WisprWitnessAuthProbe::Full,
+                    WisprWitnessModelVariant::PackagedDefault,
+                );
+            },
+        );
+
+        for stage in ["response-headers", "response-frame", "response-trailers"] {
+            checkpoint.advance(stage);
+            let diagnostics: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&path).expect("rolling diagnostics artifact"),
+            )
+            .expect("rolling diagnostics JSON");
+            assert_eq!(diagnostics["local_stage"], stage);
+            assert_eq!(diagnostics["route"], "edge-proxy");
+            assert_eq!(diagnostics["auth_probe"], "full");
+            assert_eq!(diagnostics["response_frame_count"], 0);
+            assert!(diagnostics.get("payload").is_none());
+            assert!(diagnostics.get("text").is_none());
+        }
     }
 
     #[test]
