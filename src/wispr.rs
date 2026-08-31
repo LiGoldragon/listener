@@ -40,6 +40,16 @@ static NEXT_WISPR_REQUEST_IDENTIFIER: AtomicU64 = AtomicU64::new(1);
 const DESKTOP_BUNDLE_MAXIMUM_BYTES: u64 = 384 * 1024 * 1024;
 const DESKTOP_SESSION_MAXIMUM_BYTES: u64 = 256 * 1024;
 
+/// The only non-secret destination choices accepted by the isolated witness.
+/// A route is reported as this closed enum, never as a host or header value.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WisprWitnessRoute {
+    #[default]
+    DefaultDirect,
+    EdgeProxy,
+}
+
 /// An opaque, expiring session. It deliberately exposes no value accessor and
 /// does not implement Debug, Serialize, or Clone.
 pub(crate) struct WisprSession {
@@ -375,9 +385,10 @@ impl WisprGrpcStreamResponse {
     fn diagnostics(
         &self,
         stage: &'static str,
+        route: WisprWitnessRoute,
         bearer_state: BearerState,
     ) -> WisprWitnessDiagnostics {
-        WisprWitnessDiagnostics::from_response(stage, bearer_state, self)
+        WisprWitnessDiagnostics::from_response(stage, route, bearer_state, self)
     }
 }
 
@@ -410,6 +421,7 @@ enum PermissionCategory {
 #[derive(Serialize)]
 pub struct WisprWitnessDiagnostics {
     local_stage: &'static str,
+    route: WisprWitnessRoute,
     http_status: Option<u16>,
     grpc_status: Option<u32>,
     content_type: Option<String>,
@@ -460,8 +472,8 @@ impl WisprWitnessDiagnostics {
     ///
     /// Callers must use a static local-stage label; no error value belongs in
     /// the sandbox's durable diagnostics boundary.
-    pub fn setup_failure(stage: &'static str) -> Self {
-        Self::at(stage)
+    pub fn setup_failure(stage: &'static str, route: WisprWitnessRoute) -> Self {
+        Self::at(stage, route)
     }
 
     /// Whether the witness reached response headers. This is intentionally a
@@ -471,9 +483,10 @@ impl WisprWitnessDiagnostics {
         self.http_status.is_some()
     }
 
-    fn at(stage: &'static str) -> Self {
+    fn at(stage: &'static str, route: WisprWitnessRoute) -> Self {
         Self {
             local_stage: stage,
+            route,
             http_status: None,
             grpc_status: None,
             content_type: None,
@@ -487,11 +500,13 @@ impl WisprWitnessDiagnostics {
 
     fn from_response(
         stage: &'static str,
+        route: WisprWitnessRoute,
         bearer_state: BearerState,
         response: &WisprGrpcStreamResponse,
     ) -> Self {
         Self {
             local_stage: stage,
+            route,
             http_status: response.http_status,
             grpc_status: response.grpc_status,
             content_type: response.content_type.clone(),
@@ -1248,7 +1263,10 @@ struct DesktopWisprBackendSource {
 }
 
 impl DesktopWisprBackendSource {
-    fn new(descriptor: i32) -> Result<Self, ProviderAttemptState> {
+    fn new(
+        descriptor: i32,
+        route: WisprWitnessRoute,
+    ) -> Result<Self, ProviderAttemptState> {
         if descriptor < 3 {
             return Err(ProviderAttemptState::Unavailable);
         }
@@ -1256,7 +1274,7 @@ impl DesktopWisprBackendSource {
             backend: desktop_backend_from_bundle(&inherited_descriptor_bytes(
                 descriptor,
                 DESKTOP_BUNDLE_MAXIMUM_BYTES,
-            )?)?,
+            )?, route)?,
         })
     }
 }
@@ -1272,16 +1290,27 @@ impl WisprGrpcBackendSource for DesktopWisprBackendSource {
     }
 }
 
-fn desktop_backend_from_bundle(bytes: &[u8]) -> Result<WisprGrpcBackend, ProviderAttemptState> {
+fn desktop_backend_from_bundle(
+    bytes: &[u8],
+    route: WisprWitnessRoute,
+) -> Result<WisprGrpcBackend, ProviderAttemptState> {
     let source = String::from_utf8_lossy(bytes);
     let model_id = bundled_default_model_id(&source)?;
-    let property = bundled_baseten_property(&source)?;
-    let key = bundled_exported_string(&source, property)?;
-    Ok(WisprGrpcBackend {
-        host: format!("model-{model_id}.grpc.api.baseten.co"),
-        model_id: format!("model-{model_id}"),
-        environment: "production".into(),
-        baseten_authorization: Some(format!("Api-Key {key}")),
+    let key = verified_bundled_baseten_key(&source)?;
+    let baseten_authorization = Some(format!("Api-Key {key}"));
+    Ok(match route {
+        WisprWitnessRoute::DefaultDirect => WisprGrpcBackend {
+            host: format!("model-{model_id}.grpc.api.baseten.co"),
+            model_id: format!("model-{model_id}"),
+            environment: "production".into(),
+            baseten_authorization,
+        },
+        WisprWitnessRoute::EdgeProxy => WisprGrpcBackend {
+            host: WISPR_GRPC_HOST.into(),
+            model_id: "model-".into(),
+            environment: String::new(),
+            baseten_authorization,
+        },
     })
 }
 
@@ -1310,6 +1339,68 @@ fn bundled_baseten_property(source: &str) -> Result<&str, ProviderAttemptState> 
         .ok_or(ProviderAttemptState::ProtocolFailure)
 }
 
+/// Confirms the opaque generic export lookup against the independently
+/// delimited desktop module. Neither extraction crosses this private boundary.
+fn verified_bundled_baseten_key(source: &str) -> Result<String, ProviderAttemptState> {
+    let property = bundled_baseten_property(source)?;
+    let extracted = bundled_exported_string(source, property)?;
+    let structural = bundled_module_47708_fo(source)?;
+    if property == "Fo" && extracted == structural {
+        Ok(extracted)
+    } else {
+        Err(ProviderAttemptState::ProtocolFailure)
+    }
+}
+
+fn bundled_module_47708_fo(source: &str) -> Result<String, ProviderAttemptState> {
+    let (_, remaining) = source
+        .split_once("47708:")
+        .ok_or(ProviderAttemptState::ProtocolFailure)?;
+    let open = remaining
+        .find('{')
+        .ok_or(ProviderAttemptState::ProtocolFailure)?;
+    let module = balanced_braced_source(&remaining[open..])?;
+    let (_, remaining) = module
+        .split_once("Fo:()=>")
+        .ok_or(ProviderAttemptState::ProtocolFailure)?;
+    let identifier: String = remaining
+        .chars()
+        .take_while(|character| {
+            character.is_ascii_alphanumeric() || *character == '_' || *character == '$'
+        })
+        .collect();
+    if identifier.is_empty() {
+        return Err(ProviderAttemptState::ProtocolFailure);
+    }
+    for declaration in ["const", "let", "var"] {
+        let binding = format!("{declaration} {identifier}=\"");
+        if let Some((_, value)) = module.split_once(&binding)
+            && let Some((key, _)) = value.split_once('"')
+            && !key.is_empty()
+        {
+            return Ok(key.to_owned());
+        }
+    }
+    Err(ProviderAttemptState::ProtocolFailure)
+}
+
+fn balanced_braced_source(source: &str) -> Result<&str, ProviderAttemptState> {
+    let mut depth = 0_u32;
+    for (index, character) in source.char_indices() {
+        match character {
+            '{' => depth = depth.checked_add(1).ok_or(ProviderAttemptState::ProtocolFailure)?,
+            '}' => {
+                depth = depth.checked_sub(1).ok_or(ProviderAttemptState::ProtocolFailure)?;
+                if depth == 0 {
+                    return Ok(&source[..=index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(ProviderAttemptState::ProtocolFailure)
+}
+
 fn bundled_exported_string(source: &str, property: &str) -> Result<String, ProviderAttemptState> {
     let export = format!("{property}:()=>");
     let (_, remaining) = source
@@ -1326,12 +1417,11 @@ fn bundled_exported_string(source: &str, property: &str) -> Result<String, Provi
     }
     for declaration in ["const", "let", "var"] {
         let binding = format!("{declaration} {identifier}=\"");
-        if let Some((_, value)) = source.split_once(&binding) {
-            if let Some((key, _)) = value.split_once('"') {
-                if !key.is_empty() {
-                    return Ok(key.to_owned());
-                }
-            }
+        if let Some((_, value)) = source.split_once(&binding)
+            && let Some((key, _)) = value.split_once('"')
+            && !key.is_empty()
+        {
+            return Ok(key.to_owned());
         }
     }
     Err(ProviderAttemptState::ProtocolFailure)
@@ -1838,12 +1928,14 @@ pub fn sandbox_wispr_witness(
     session_descriptor: i32,
     desktop_bundle_descriptor: i32,
     artifact_path: &Path,
+    route: WisprWitnessRoute,
 ) -> WisprWitnessDiagnostics {
     let checkpoint = WisprWitnessCheckpoint::new("witness");
     sandbox_wispr_witness_checkpointed(
         session_descriptor,
         desktop_bundle_descriptor,
         artifact_path,
+        route,
         &checkpoint,
     )
 }
@@ -1856,47 +1948,48 @@ pub fn sandbox_wispr_witness_checkpointed(
     session_descriptor: i32,
     desktop_bundle_descriptor: i32,
     artifact_path: &Path,
+    route: WisprWitnessRoute,
     checkpoint: &WisprWitnessCheckpoint,
 ) -> WisprWitnessDiagnostics {
     let session = match InheritedFdDesktopWisprSession::new(session_descriptor) {
         Ok(session) => Arc::new(session),
-        Err(_) => return WisprWitnessDiagnostics::at("session-descriptor"),
+        Err(_) => return WisprWitnessDiagnostics::at("session-descriptor", route),
     };
     checkpoint.advance("session-descriptor");
-    let backend = match DesktopWisprBackendSource::new(desktop_bundle_descriptor) {
+    let backend = match DesktopWisprBackendSource::new(desktop_bundle_descriptor, route) {
         Ok(backend) => Arc::new(backend),
-        Err(_) => return WisprWitnessDiagnostics::at("bundle-descriptor"),
+        Err(_) => return WisprWitnessDiagnostics::at("bundle-descriptor", route),
     };
     checkpoint.advance("bundle-descriptor");
     let (access_token, _, bearer_state) = match session.session() {
         Ok(session) => session,
-        Err(_) => return WisprWitnessDiagnostics::at("session"),
+        Err(_) => return WisprWitnessDiagnostics::at("session", route),
     };
     checkpoint.advance("session");
     let request = ProviderTranscriptRequest::for_test(artifact_path);
     let wav_pcm16 = match RecordingLogWisprMediaAdapter.wav_pcm16(&request) {
         Ok(wav_pcm16) => wav_pcm16,
-        Err(_) => return WisprWitnessDiagnostics::at("recording"),
+        Err(_) => return WisprWitnessDiagnostics::at("recording", route),
     };
     checkpoint.advance("request-recording");
     if !is_wispr_pcm16_wav(&wav_pcm16)
         || wav_pcm16.len() > 44 + (WISPR_MAXIMUM_SAMPLES as usize * 2)
     {
-        return WisprWitnessDiagnostics::at("audio-validation");
+        return WisprWitnessDiagnostics::at("audio-validation", route);
     }
     checkpoint.advance("audio-validation");
     let user_id = match session.user_id() {
         Ok(user_id) => user_id,
-        Err(_) => return WisprWitnessDiagnostics::at("session"),
+        Err(_) => return WisprWitnessDiagnostics::at("session", route),
     };
     let identifiers = match session.fresh_request_identifiers() {
         Ok(identifiers) => identifiers,
-        Err(_) => return WisprWitnessDiagnostics::at("request-identifiers"),
+        Err(_) => return WisprWitnessDiagnostics::at("request-identifiers", route),
     };
     checkpoint.advance("request-identifiers");
     let backend = match backend.backend() {
         Ok(backend) => backend,
-        Err(_) => return WisprWitnessDiagnostics::at("bundle-descriptor"),
+        Err(_) => return WisprWitnessDiagnostics::at("bundle-descriptor", route),
     };
     checkpoint.advance("backend-metadata");
     let mut metadata = backend.metadata();
@@ -1907,7 +2000,7 @@ pub fn sandbox_wispr_witness_checkpointed(
         &WisprFlowWireRequest::new(&access_token, request, wav_pcm16),
     ) {
         Ok(messages) => messages,
-        Err(_) => return WisprWitnessDiagnostics::at("request-encoding"),
+        Err(_) => return WisprWitnessDiagnostics::at("request-encoding", route),
     };
     checkpoint.advance("request-encoding");
     let call = WisprGrpcStreamCall {
@@ -1923,9 +2016,10 @@ pub fn sandbox_wispr_witness_checkpointed(
             } else {
                 "response"
             },
+            route,
             bearer_state,
         ),
-        Err(_) => WisprWitnessDiagnostics::at(checkpoint.stage()),
+        Err(_) => WisprWitnessDiagnostics::at(checkpoint.stage(), route),
     }
 }
 
@@ -2059,8 +2153,12 @@ mod tests {
             permission_category: PermissionCategory::Absent,
         };
 
-        let value = serde_json::to_value(response.diagnostics("complete", BearerState::Unknown))
-            .expect("diagnostics serialize");
+        let value = serde_json::to_value(response.diagnostics(
+            "complete",
+            WisprWitnessRoute::EdgeProxy,
+            BearerState::Unknown,
+        ))
+        .expect("diagnostics serialize");
         let object = value.as_object().expect("diagnostics are an object");
         assert_eq!(
             object.keys().map(String::as_str).collect::<Vec<_>>(),
@@ -2074,8 +2172,10 @@ mod tests {
                 "protobuf_top_level_tag_histograms",
                 "response_frame_count",
                 "response_frame_lengths",
+                "route",
             ],
         );
+        assert_eq!(object["route"], "edge-proxy");
         let rendered = value.to_string();
         assert!(!rendered.contains("response text must not cross"));
         assert!(!rendered.contains("alternate transcript text"));
@@ -2163,6 +2263,7 @@ mod tests {
         };
         let diagnostics = serde_json::to_value(response.diagnostics(
             "response",
+            WisprWitnessRoute::DefaultDirect,
             desktop_bearer_state(&workos_session, "synthetic", observed_at),
         ))
         .expect("diagnostics serialize");
@@ -2179,6 +2280,7 @@ mod tests {
                 "protobuf_top_level_tag_histograms",
                 "response_frame_count",
                 "response_frame_lengths",
+                "route",
             ],
         );
         assert_eq!(object["bearer_state"], "near-expiry");
@@ -2382,14 +2484,100 @@ mod tests {
     #[test]
     fn desktop_backend_descriptor_selects_the_packaged_default_without_exposing_its_key() {
         let descriptor = desktop_backend_from_bundle(
-            br#"const RT="v31pl413";const basetenApiKey="synthetic-client-key";const Rt={Fo:()=>basetenApiKey};class G{static ASR_VARIANT_BASETEN_MODEL_IDS={[xt.eW.QwenHttp]:"q049l843"};static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#,
+            br#"47708:()=>{const basetenApiKey="synthetic-client-key";const Rt={Fo:()=>basetenApiKey};};const RT="v31pl413";class G{static ASR_VARIANT_BASETEN_MODEL_IDS={[xt.eW.QwenHttp]:"q049l843"};static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#,
+            WisprWitnessRoute::DefaultDirect,
         )
         .expect("synthetic desktop bundle descriptor");
 
         assert_eq!(descriptor.host, "model-v31pl413.grpc.api.baseten.co");
         assert_eq!(descriptor.model_id, "model-v31pl413");
         assert_eq!(descriptor.environment, "production");
-        assert!(descriptor.baseten_authorization.is_some());
+        let metadata = descriptor.metadata();
+        assert_eq!(
+            metadata
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            vec![
+                "flow-debug",
+                "disable-formatting",
+                "content-type",
+                "te",
+                "baseten-authorization",
+                "baseten-model-id",
+                "x-baseten-environment",
+            ],
+        );
+        assert_eq!(
+            metadata
+                .iter()
+                .find(|(name, _)| *name == "baseten-model-id")
+                .map(|(_, value)| value.as_str()),
+            Some("model-v31pl413")
+        );
+        assert_eq!(
+            metadata
+                .iter()
+                .find(|(name, _)| *name == "x-baseten-environment")
+                .map(|(_, value)| value.as_str()),
+            Some("production")
+        );
+        assert!(metadata
+            .iter()
+            .any(|(name, value)| *name == "baseten-authorization" && value.starts_with("Api-Key ")));
+    }
+
+    #[test]
+    fn edge_proxy_backend_keeps_static_authorization_with_empty_model_routing() {
+        let descriptor = desktop_backend_from_bundle(
+            br#"47708:()=>{const basetenApiKey="synthetic-client-key";const Rt={Fo:()=>basetenApiKey};};const RT="v31pl413";class G{static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#,
+            WisprWitnessRoute::EdgeProxy,
+        )
+        .expect("synthetic edge proxy descriptor");
+
+        assert_eq!(descriptor.host, WISPR_GRPC_HOST);
+        assert_eq!(descriptor.model_id, "model-");
+        assert_eq!(descriptor.environment, "");
+        let metadata = descriptor.metadata();
+        assert_eq!(
+            metadata
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            vec![
+                "flow-debug",
+                "disable-formatting",
+                "content-type",
+                "te",
+                "baseten-authorization",
+                "baseten-model-id",
+                "x-baseten-environment",
+            ],
+        );
+        assert_eq!(
+            metadata
+                .iter()
+                .find(|(name, _)| *name == "baseten-model-id")
+                .map(|(_, value)| value.as_str()),
+            Some("model-")
+        );
+        assert_eq!(
+            metadata
+                .iter()
+                .find(|(name, _)| *name == "x-baseten-environment")
+                .map(|(_, value)| value.as_str()),
+            Some("")
+        );
+        assert!(metadata
+            .iter()
+            .any(|(name, value)| *name == "baseten-authorization" && value.starts_with("Api-Key ")));
+    }
+
+    #[test]
+    fn opaque_static_key_lookup_agrees_with_module_47708_fo_without_rendering_the_value() {
+        let source = r#"47708:()=>{const basetenApiKey="synthetic-client-key";const Rt={Fo:()=>basetenApiKey};};class G{static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#;
+
+        assert!(verified_bundled_baseten_key(source).is_ok());
     }
 
     #[test]
