@@ -200,7 +200,7 @@ impl WisprSessionBoundary for RefreshingWisprSessionBoundary {
 /// commit; diagnostics contain only typed state.
 pub(crate) struct WisprFlowWireRequest {
     session: String,
-    request: ProviderTranscriptRequest,
+    _request: ProviderTranscriptRequest,
     pcm16le: Vec<u8>,
 }
 
@@ -212,7 +212,7 @@ impl WisprFlowWireRequest {
     ) -> Self {
         Self {
             session: session.to_owned(),
-            request,
+            _request: request,
             pcm16le,
         }
     }
@@ -1803,35 +1803,32 @@ fn encode_observed_requests(
         protobuf_integer(5, 1),
         protobuf_message(6, &client),
     ]);
-    let vocabulary = request
-        .request
-        .vocabulary()
-        .iter()
-        .fold(Vec::new(), |mut fields, word| {
-            fields.extend(protobuf_string(1, word));
-            fields
-        });
+    // These are the fresh Wispr 1.6.7 defaults. Dynamic user vocabulary is
+    // deliberately represented by the empty Context wrapper below rather
+    // than leaking request-local values into the static Preferences message.
     let tagging = protobuf_message(3, &protobuf_integer(1, 0));
     let signature = protobuf_message(
         4,
         &protobuf_concat(&[protobuf_integer(2, 0), protobuf_integer(3, 0)]),
     );
-    let style = protobuf_concat(&[tagging, signature, protobuf_integer(5, 1)]);
-    let preferences = protobuf_concat(&[
+    let style = protobuf_concat(&[
         protobuf_message(1, &[]),
-        protobuf_message(3, &vocabulary),
+        tagging,
+        signature,
+        protobuf_integer(5, 2),
+    ]);
+    let preferences = protobuf_concat(&[
+        protobuf_bytes(2, &[1]),
+        protobuf_message(3, &[]),
+        protobuf_message(4, &[]),
         protobuf_message(5, &style),
     ]);
     let init_body = protobuf_concat(&[
         protobuf_message(1, &metadata),
         protobuf_message(2, &preferences),
     ]);
-    let mut fields = vec![protobuf_message(1, &init_body)];
-    if !request.request.preceding_transcript_tail().is_empty() {
-        let textbox = protobuf_string(2, request.request.preceding_transcript_tail());
-        let context = protobuf_message(2, &protobuf_message(2, &textbox));
-        fields.push(context);
-    }
+    let context = protobuf_concat(&[protobuf_message(1, &[]), protobuf_message(3, &[])]);
+    let mut fields = vec![protobuf_message(1, &init_body), protobuf_message(2, &context)];
     let packets = request
         .pcm16le
         .chunks(WISPR_AUDIO_PACKET_BYTES)
@@ -2475,6 +2472,49 @@ mod tests {
             ProtobufField::Bytes { number: 1, value } if value.len() == 1280 && value.iter().all(|sample| *sample == 0)
         )));
         assert!(matches!(fields[3], ProtobufField::Integer { number: 4 }));
+    }
+
+    #[test]
+    fn fresh_one_shot_uses_the_packaged_preferences_and_context_bytes() {
+        let request = WisprFlowWireRequest::new(
+            "synthetic-session",
+            ProviderTranscriptRequest::new("/durable/audio.wav".into(), String::new(), Vec::new()),
+            synthetic_pcm16le(),
+        );
+        let messages = encode_observed_requests(
+            "synthetic-user",
+            WisprRequestIdentifiers::new(
+                "synthetic-session-id".into(),
+                "synthetic-request-id".into(),
+            ),
+            &request,
+        )
+        .expect("sanitized one-shot request");
+        let root = protobuf_fields(&messages[0]).expect("root request fields");
+        let ProtobufField::Bytes { value: init, .. } = &root[0] else {
+            panic!("init field");
+        };
+        let init = protobuf_fields(init).expect("init fields");
+        let preferences = init
+            .iter()
+            .find_map(|field| match field {
+                ProtobufField::Bytes { number: 2, value } => Some(value),
+                _ => None,
+            })
+            .expect("preference field");
+        assert_eq!(
+            preferences,
+            &[0x12, 0x01, 0x01, 0x1a, 0x00, 0x22, 0x00, 0x2a, 0x0e, 0x0a, 0x00,
+                0x1a, 0x02, 0x08, 0x00, 0x22, 0x04, 0x10, 0x00, 0x18, 0x00, 0x28, 0x02]
+        );
+        let context = root
+            .iter()
+            .find_map(|field| match field {
+                ProtobufField::Bytes { number: 2, value } => Some(value),
+                _ => None,
+            })
+            .expect("fresh context field");
+        assert_eq!(context, &[0x0a, 0x00, 0x1a, 0x00]);
     }
 
     #[test]
