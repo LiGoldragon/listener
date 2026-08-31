@@ -1296,7 +1296,8 @@ fn desktop_backend_from_bundle(
 ) -> Result<WisprGrpcBackend, ProviderAttemptState> {
     let source = String::from_utf8_lossy(bytes);
     let model_id = bundled_default_model_id(&source)?;
-    let key = verified_bundled_baseten_key(&source)?;
+    let property = bundled_baseten_property(&source)?;
+    let key = bundled_exported_string(&source, property)?;
     let baseten_authorization = Some(format!("Api-Key {key}"));
     Ok(match route {
         WisprWitnessRoute::DefaultDirect => WisprGrpcBackend {
@@ -1339,11 +1340,9 @@ fn bundled_baseten_property(source: &str) -> Result<&str, ProviderAttemptState> 
         .ok_or(ProviderAttemptState::ProtocolFailure)
 }
 
-/// Confirms the opaque generic export lookup against the independently
-/// delimited `Fo` export identified in module 47708. The installed archive
-/// omits numeric module labels, so the verification uses the export's local
-/// declaration rather than treating a bundler label as wire material. Neither
-/// extraction crosses this private boundary.
+/// Offline-only confidence check for the evidence that module 47708 exports
+/// `Fo`. It never participates in runtime bundle construction.
+#[cfg(test)]
 fn verified_bundled_baseten_key(source: &str) -> Result<String, ProviderAttemptState> {
     let property = bundled_baseten_property(source)?;
     let extracted = bundled_exported_string(source, property)?;
@@ -1355,6 +1354,7 @@ fn verified_bundled_baseten_key(source: &str) -> Result<String, ProviderAttemptS
     }
 }
 
+#[cfg(test)]
 fn bundled_structural_fo_export(source: &str) -> Result<String, ProviderAttemptState> {
     let export = source
         .split_once("Fo:()=>")
@@ -1922,6 +1922,18 @@ pub fn sandbox_wispr_witness(
         route,
         &checkpoint,
     )
+}
+
+/// Parses an inherited desktop bundle into the selected backend without
+/// reading a session, encoding audio, or constructing a transport call.
+pub fn sandbox_wispr_backend_probe(
+    desktop_bundle_descriptor: i32,
+    route: WisprWitnessRoute,
+) -> WisprWitnessDiagnostics {
+    match DesktopWisprBackendSource::new(desktop_bundle_descriptor, route) {
+        Ok(_) => WisprWitnessDiagnostics::at("backend-metadata", route),
+        Err(_) => WisprWitnessDiagnostics::at("bundle-descriptor", route),
+    }
 }
 
 /// Runs the isolated witness while advancing a caller-owned, static progress
@@ -2569,6 +2581,17 @@ mod tests {
         let source = r#"const basetenApiKey="synthetic-client-key";const Rt={Fo:()=>basetenApiKey};class G{static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#;
 
         assert!(verified_bundled_baseten_key(source).is_ok());
+    }
+
+    #[test]
+    fn offline_edge_proxy_backend_probe_stops_before_any_session_or_transport() {
+        let diagnostics = sandbox_wispr_backend_probe(-1, WisprWitnessRoute::EdgeProxy);
+        let value = serde_json::to_value(diagnostics).expect("diagnostics serialize");
+
+        assert_eq!(value["route"], "edge-proxy");
+        assert_eq!(value["local_stage"], "bundle-descriptor");
+        assert_eq!(value["http_status"], serde_json::Value::Null);
+        assert_eq!(value["bearer_state"], "unknown");
     }
 
     #[test]

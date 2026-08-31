@@ -7,7 +7,7 @@ use std::{
 };
 
 use listener::{
-    sandbox_wispr_witness_checkpointed, RecordingAudioFormat, RecordingInputSource,
+    sandbox_wispr_backend_probe, sandbox_wispr_witness_checkpointed, RecordingAudioFormat, RecordingInputSource,
     RecordingLogHeader, RecordingLogWriter, RecordingStartTime, WisprWitnessCheckpoint,
     WisprWitnessDiagnostics, WisprWitnessRoute,
 };
@@ -59,6 +59,13 @@ fn route_from_selector(selector: Option<&str>) -> Result<WisprWitnessRoute, &'st
         Some("edge-proxy") => Ok(WisprWitnessRoute::EdgeProxy),
         Some(_) => Err("route-selector"),
     }
+}
+
+fn offline_bundle_probe_requested() -> bool {
+    matches!(
+        env::var("LISTENER_WISPR_OFFLINE_BUNDLE_PROBE").ok().as_deref(),
+        Some("1")
+    )
 }
 
 fn create_synthetic_recording(path: &PathBuf) -> Result<(), &'static str> {
@@ -173,11 +180,19 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let result = finish_with_diagnostics(&diagnostics_path, &checkpoint, route, |checkpoint| {
-        let witness = SandboxWitness::from_environment(route)?;
-        checkpoint.advance("preflight");
-        witness.run(checkpoint)
-    });
+    let result = if offline_bundle_probe_requested() {
+        finish_with_diagnostics(&diagnostics_path, &checkpoint, route, |_| {
+            let descriptor = required_descriptor("LISTENER_WISPR_DESKTOP_BUNDLE_FD")
+                .map_err(|_| "bundle-descriptor")?;
+            Ok(sandbox_wispr_backend_probe(descriptor, route))
+        })
+    } else {
+        finish_with_diagnostics(&diagnostics_path, &checkpoint, route, |checkpoint| {
+            let witness = SandboxWitness::from_environment(route)?;
+            checkpoint.advance("preflight");
+            witness.run(checkpoint)
+        })
+    };
     match result {
         Ok(()) => {
             println!("wispr-sandbox: diagnostics-written");
