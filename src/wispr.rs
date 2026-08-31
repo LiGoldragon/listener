@@ -1340,11 +1340,14 @@ fn bundled_baseten_property(source: &str) -> Result<&str, ProviderAttemptState> 
 }
 
 /// Confirms the opaque generic export lookup against the independently
-/// delimited desktop module. Neither extraction crosses this private boundary.
+/// delimited `Fo` export identified in module 47708. The installed archive
+/// omits numeric module labels, so the verification uses the export's local
+/// declaration rather than treating a bundler label as wire material. Neither
+/// extraction crosses this private boundary.
 fn verified_bundled_baseten_key(source: &str) -> Result<String, ProviderAttemptState> {
     let property = bundled_baseten_property(source)?;
     let extracted = bundled_exported_string(source, property)?;
-    let structural = bundled_module_47708_fo(source)?;
+    let structural = bundled_structural_fo_export(source)?;
     if property == "Fo" && extracted == structural {
         Ok(extracted)
     } else {
@@ -1352,17 +1355,15 @@ fn verified_bundled_baseten_key(source: &str) -> Result<String, ProviderAttemptS
     }
 }
 
-fn bundled_module_47708_fo(source: &str) -> Result<String, ProviderAttemptState> {
-    let (_, remaining) = source
-        .split_once("47708:")
-        .ok_or(ProviderAttemptState::ProtocolFailure)?;
-    let open = remaining
-        .find('{')
-        .ok_or(ProviderAttemptState::ProtocolFailure)?;
-    let module = balanced_braced_source(&remaining[open..])?;
-    let (_, remaining) = module
+fn bundled_structural_fo_export(source: &str) -> Result<String, ProviderAttemptState> {
+    let export = source
         .split_once("Fo:()=>")
         .ok_or(ProviderAttemptState::ProtocolFailure)?;
+    let export_offset = source.len() - export.1.len() - "Fo:()=>".len();
+    let declaration_scope = source
+        .get(..export_offset)
+        .ok_or(ProviderAttemptState::ProtocolFailure)?;
+    let remaining = export.1;
     let identifier: String = remaining
         .chars()
         .take_while(|character| {
@@ -1374,28 +1375,11 @@ fn bundled_module_47708_fo(source: &str) -> Result<String, ProviderAttemptState>
     }
     for declaration in ["const", "let", "var"] {
         let binding = format!("{declaration} {identifier}=\"");
-        if let Some((_, value)) = module.split_once(&binding)
+        if let Some((_, value)) = declaration_scope.rsplit_once(&binding)
             && let Some((key, _)) = value.split_once('"')
             && !key.is_empty()
         {
             return Ok(key.to_owned());
-        }
-    }
-    Err(ProviderAttemptState::ProtocolFailure)
-}
-
-fn balanced_braced_source(source: &str) -> Result<&str, ProviderAttemptState> {
-    let mut depth = 0_u32;
-    for (index, character) in source.char_indices() {
-        match character {
-            '{' => depth = depth.checked_add(1).ok_or(ProviderAttemptState::ProtocolFailure)?,
-            '}' => {
-                depth = depth.checked_sub(1).ok_or(ProviderAttemptState::ProtocolFailure)?;
-                if depth == 0 {
-                    return Ok(&source[..=index]);
-                }
-            }
-            _ => {}
         }
     }
     Err(ProviderAttemptState::ProtocolFailure)
@@ -2576,6 +2560,13 @@ mod tests {
     #[test]
     fn opaque_static_key_lookup_agrees_with_module_47708_fo_without_rendering_the_value() {
         let source = r#"47708:()=>{const basetenApiKey="synthetic-client-key";const Rt={Fo:()=>basetenApiKey};};class G{static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#;
+
+        assert!(verified_bundled_baseten_key(source).is_ok());
+    }
+
+    #[test]
+    fn opaque_static_key_lookup_accepts_the_installed_bundle_shape_without_a_module_label() {
+        let source = r#"const basetenApiKey="synthetic-client-key";const Rt={Fo:()=>basetenApiKey};class G{static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#;
 
         assert!(verified_bundled_baseten_key(source).is_ok());
     }
