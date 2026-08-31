@@ -8,7 +8,9 @@
 use std::{
     collections::BTreeMap,
     fs::File,
+    future::Future,
     io::Read,
+    net::SocketAddr,
     path::Path,
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
@@ -388,6 +390,35 @@ pub struct WisprWitnessDiagnostics {
     protobuf_top_level_tag_histograms: Vec<Vec<WisprProtobufTagCount>>,
 }
 
+/// A shared, static-only progress marker for the isolated witness. It is
+/// deliberately unable to accept dynamic text, so it can cross the owned
+/// runtime thread without widening the diagnostics boundary.
+#[derive(Clone)]
+pub struct WisprWitnessCheckpoint {
+    stage: Arc<Mutex<&'static str>>,
+}
+
+impl WisprWitnessCheckpoint {
+    pub fn new(stage: &'static str) -> Self {
+        Self {
+            stage: Arc::new(Mutex::new(stage)),
+        }
+    }
+
+    pub fn advance(&self, stage: &'static str) {
+        if let Ok(mut current) = self.stage.lock() {
+            *current = stage;
+        }
+    }
+
+    pub fn stage(&self) -> &'static str {
+        self.stage
+            .lock()
+            .map(|current| *current)
+            .unwrap_or("checkpoint-unavailable")
+    }
+}
+
 #[derive(Serialize)]
 struct WisprProtobufTagCount {
     tag: u64,
@@ -395,6 +426,21 @@ struct WisprProtobufTagCount {
 }
 
 impl WisprWitnessDiagnostics {
+    /// Produces a structural-only outcome before any response can exist.
+    ///
+    /// Callers must use a static local-stage label; no error value belongs in
+    /// the sandbox's durable diagnostics boundary.
+    pub fn setup_failure(stage: &'static str) -> Self {
+        Self::at(stage)
+    }
+
+    /// Whether the witness reached response headers. This is intentionally a
+    /// boolean so the sandbox runner can select its exit status without
+    /// inspecting or retaining any response value.
+    pub fn has_completed_response(&self) -> bool {
+        self.http_status.is_some()
+    }
+
     fn at(stage: &'static str) -> Self {
         Self {
             local_stage: stage,
@@ -515,56 +561,90 @@ impl WisprGrpcStreamingBoundary for ReqwestWisprGrpcStreamingBoundary {
 /// request stream is open, so server frames are not coupled to HTTP/1 buffering.
 struct NativeWisprGrpcStreamingBoundary;
 
+fn run_wispr_runtime<T: Send + 'static>(
+    checkpoint: &WisprWitnessCheckpoint,
+    future: impl Future<Output = Result<T, ProviderAttemptState>> + Send + 'static,
+) -> Result<T, ProviderAttemptState> {
+    checkpoint.advance("runtime-thread-spawn");
+    let child_checkpoint = checkpoint.clone();
+    std::thread::Builder::new()
+        .name("listener-wispr-runtime".into())
+        .spawn(move || {
+            child_checkpoint.advance("runtime-child-entry");
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .map_err(|_| ProviderAttemptState::Unavailable)?;
+            child_checkpoint.advance("runtime-build");
+            runtime.block_on(future)
+        })
+        .map_err(|_| ProviderAttemptState::Unavailable)?
+        .join()
+        .map_err(|_| ProviderAttemptState::Unavailable)?
+}
+
+impl NativeWisprGrpcStreamingBoundary {
+    fn stream_checkpointed(
+        &self,
+        call: WisprGrpcStreamCall,
+        checkpoint: &WisprWitnessCheckpoint,
+    ) -> Result<WisprGrpcStreamResponse, ProviderAttemptState> {
+        let child_checkpoint = checkpoint.clone();
+        run_wispr_runtime(checkpoint, async move {
+            tokio::time::timeout(
+                WISPR_REQUEST_TIMEOUT,
+                native_grpc_stream(call, child_checkpoint),
+            )
+            .await
+            .map_err(|_| ProviderAttemptState::TransientFailure)?
+        })
+    }
+}
+
 impl WisprGrpcStreamingBoundary for NativeWisprGrpcStreamingBoundary {
     fn stream(
         &self,
         call: WisprGrpcStreamCall,
     ) -> Result<WisprGrpcStreamResponse, ProviderAttemptState> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .map_err(|_| ProviderAttemptState::Unavailable)?
-            .block_on(tokio::time::timeout(
-                WISPR_REQUEST_TIMEOUT,
-                native_grpc_stream(call),
-            ))
-            .map_err(|_| ProviderAttemptState::TransientFailure)?
+        let checkpoint = WisprWitnessCheckpoint::new("request-encoding");
+        self.stream_checkpointed(call, &checkpoint)
     }
 }
 
 async fn native_grpc_stream(
     call: WisprGrpcStreamCall,
+    checkpoint: WisprWitnessCheckpoint,
 ) -> Result<WisprGrpcStreamResponse, ProviderAttemptState> {
+    checkpoint.advance("future-enter");
+    tokio::task::yield_now().await;
+    checkpoint.advance("future-first-poll");
     if (call.host != WISPR_GRPC_HOST && !call.host.ends_with(".grpc.api.baseten.co"))
         || call.method != TRANSCRIBE_STREAM_PATH
     {
         return Err(ProviderAttemptState::ProtocolFailure);
     }
 
-    let tcp = tokio::net::TcpStream::connect((call.host.as_str(), 443))
-        .await
-        .map_err(|_| ProviderAttemptState::TransientFailure)?;
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut configuration = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    configuration.alpn_protocols = vec![b"h2".to_vec()];
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(configuration));
-    let server_name = rustls::pki_types::ServerName::try_from(call.host.clone())
-        .map_err(|_| ProviderAttemptState::ProtocolFailure)?;
+    let addresses = resolve_wispr_addresses(&call.host, &checkpoint).await?;
+    let tcp = dial_wispr_addresses(&addresses, &checkpoint).await?;
+    let connector = wispr_tls_connector(&checkpoint)?;
+    let server_name = wispr_server_name(call.host.clone(), &checkpoint)?;
+    checkpoint.advance("tls-handshake-attempted");
     let tls = connector
         .connect(server_name, tcp)
         .await
         .map_err(|_| ProviderAttemptState::TransientFailure)?;
+    checkpoint.advance("tls-handshake-completed");
+    checkpoint.advance("tls-alpn-verification-attempted");
     if tls.get_ref().1.alpn_protocol() != Some(b"h2") {
         return Err(ProviderAttemptState::ProtocolFailure);
     }
+    checkpoint.advance("tls-alpn-verified");
 
     let (sender, connection) = h2::client::handshake(tls)
         .await
         .map_err(|_| ProviderAttemptState::TransientFailure)?;
+    checkpoint.advance("http2-handshake");
     tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -572,31 +652,28 @@ async fn native_grpc_stream(
         .ready()
         .await
         .map_err(|_| ProviderAttemptState::TransientFailure)?;
-    let mut builder = http::Request::builder()
-        .method(http::Method::POST)
-        .uri(call.method)
-        .version(http::Version::HTTP_2)
-        .header("content-type", "application/grpc")
-        .header("te", "trailers");
-    for (name, value) in &call.metadata {
-        builder = builder.header(*name, value);
-    }
-    let request = builder
-        .body(())
-        .map_err(|_| ProviderAttemptState::ProtocolFailure)?;
+    checkpoint.advance("http2-ready");
+    let request = wispr_h2_request(&call, &checkpoint)?;
+    checkpoint.advance("http2-send-request-attempted");
     let (response, mut upload) = sender
         .send_request(request, false)
         .map_err(|_| ProviderAttemptState::TransientFailure)?;
+    checkpoint.advance("http2-send-request-completed");
+    checkpoint.advance("http2-body-stream-opened");
     for message in &call.messages {
         native_send_grpc_message(&mut upload, message).await?;
+        checkpoint.advance(wispr_outbound_frame_stage(message));
     }
+    checkpoint.advance("http2-body-half-close-attempted");
     upload
         .send_data(Bytes::new(), true)
         .map_err(|_| ProviderAttemptState::TransientFailure)?;
+    checkpoint.advance("http2-body-half-close-completed");
 
     let response = response
         .await
         .map_err(|_| ProviderAttemptState::TransientFailure)?;
+    checkpoint.advance("response-headers");
     let (head, mut body) = response.into_parts();
     let http_status = Some(head.status.as_u16());
     let content_type = head
@@ -618,6 +695,7 @@ async fn native_grpc_stream(
             .map_err(|_| ProviderAttemptState::ProtocolFailure)?;
         bytes.extend_from_slice(&chunk);
     }
+    checkpoint.advance("response-body");
     if let Some(trailers) = body
         .trailers()
         .await
@@ -629,12 +707,112 @@ async fn native_grpc_stream(
             .and_then(|value| value.parse().ok())
             .or(grpc_status);
     }
+    checkpoint.advance("response-trailers");
     Ok(WisprGrpcStreamResponse {
         messages: grpc_decode_messages(&bytes)?,
         http_status,
         grpc_status,
         content_type,
     })
+}
+
+async fn resolve_wispr_addresses(
+    host: &str,
+    checkpoint: &WisprWitnessCheckpoint,
+) -> Result<Vec<SocketAddr>, ProviderAttemptState> {
+    checkpoint.advance("dns-resolution-attempted");
+    let addresses = tokio::net::lookup_host((host, 443))
+        .await
+        .map_err(|_| ProviderAttemptState::TransientFailure)?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(ProviderAttemptState::TransientFailure);
+    }
+    checkpoint.advance("dns-resolution-completed");
+    Ok(addresses)
+}
+
+async fn dial_wispr_addresses(
+    addresses: &[SocketAddr],
+    checkpoint: &WisprWitnessCheckpoint,
+) -> Result<tokio::net::TcpStream, ProviderAttemptState> {
+    checkpoint.advance("tcp-dial-attempted");
+    let tcp = tokio::net::TcpStream::connect(addresses)
+        .await
+        .map_err(|_| ProviderAttemptState::TransientFailure)?;
+    checkpoint.advance("tcp-dial-connected");
+    Ok(tcp)
+}
+
+fn wispr_tls_connector(
+    checkpoint: &WisprWitnessCheckpoint,
+) -> Result<tokio_rustls::TlsConnector, ProviderAttemptState> {
+    checkpoint.advance("tls-configuration-attempted");
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut configuration = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|_| ProviderAttemptState::ProtocolFailure)?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    configuration.alpn_protocols = vec![b"h2".to_vec()];
+    checkpoint.advance("tls-configuration-completed");
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(configuration));
+    checkpoint.advance("tls-connector-ready");
+    Ok(connector)
+}
+
+fn wispr_server_name(
+    host: String,
+    checkpoint: &WisprWitnessCheckpoint,
+) -> Result<rustls::pki_types::ServerName<'static>, ProviderAttemptState> {
+    checkpoint.advance("tls-server-name-attempted");
+    let server_name = rustls::pki_types::ServerName::try_from(host)
+        .map_err(|_| ProviderAttemptState::ProtocolFailure)?;
+    checkpoint.advance("tls-server-name-completed");
+    Ok(server_name)
+}
+
+fn wispr_h2_request(
+    call: &WisprGrpcStreamCall,
+    checkpoint: &WisprWitnessCheckpoint,
+) -> Result<http::Request<()>, ProviderAttemptState> {
+    checkpoint.advance("http2-request-uri-attempted");
+    let uri = http::Uri::builder()
+        .scheme("https")
+        .authority(call.host.as_str())
+        .path_and_query(call.method)
+        .build()
+        .map_err(|_| ProviderAttemptState::ProtocolFailure)?;
+    checkpoint.advance("http2-request-uri-completed");
+    checkpoint.advance("http2-request-headers-attempted");
+    let mut builder = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(uri)
+        .version(http::Version::HTTP_2)
+        .header("content-type", "application/grpc")
+        .header("te", "trailers");
+    for (name, value) in &call.metadata {
+        builder = builder.header(*name, value);
+    }
+    checkpoint.advance("http2-request-headers-completed");
+    let request = builder
+        .body(())
+        .map_err(|_| ProviderAttemptState::ProtocolFailure)?;
+    checkpoint.advance("http2-request-built");
+    Ok(request)
+}
+
+fn wispr_outbound_frame_stage(message: &[u8]) -> &'static str {
+    match message.first() {
+        Some(0x0a) => "client-init-frame-sent",
+        Some(0x12) => "client-context-frame-sent",
+        Some(0x1a) => "client-audio-frame-sent",
+        Some(0x20) => "client-commit-frame-sent",
+        _ => "client-unclassified-frame-sent",
+    }
 }
 
 async fn native_send_grpc_message(
@@ -908,7 +1086,7 @@ impl WisprGrpcBackendSource for DesktopWisprBackendSource {
 
 fn desktop_backend_from_bundle(bytes: &[u8]) -> Result<WisprGrpcBackend, ProviderAttemptState> {
     let source = String::from_utf8_lossy(bytes);
-    let model_id = bundled_qwen_model_id(&source)?;
+    let model_id = bundled_default_model_id(&source)?;
     let property = bundled_baseten_property(&source)?;
     let key = bundled_exported_string(&source, property)?;
     Ok(WisprGrpcBackend {
@@ -919,14 +1097,9 @@ fn desktop_backend_from_bundle(bytes: &[u8]) -> Result<WisprGrpcBackend, Provide
     })
 }
 
-fn bundled_qwen_model_id(source: &str) -> Result<String, ProviderAttemptState> {
-    let mappings = source
-        .split_once("ASR_VARIANT_BASETEN_MODEL_IDS={")
-        .and_then(|(_, remaining)| remaining.split_once("};"))
-        .map(|(mappings, _)| mappings)
-        .ok_or(ProviderAttemptState::ProtocolFailure)?;
-    let (_, value) = mappings
-        .split_once("QwenHttp]:\"")
+fn bundled_default_model_id(source: &str) -> Result<String, ProviderAttemptState> {
+    let (_, value) = source
+        .split_once("RT=\"")
         .ok_or(ProviderAttemptState::ProtocolFailure)?;
     value
         .split_once('"')
@@ -1478,41 +1651,90 @@ pub fn sandbox_wispr_witness(
     desktop_bundle_descriptor: i32,
     artifact_path: &Path,
 ) -> WisprWitnessDiagnostics {
+    let checkpoint = WisprWitnessCheckpoint::new("witness");
+    sandbox_wispr_witness_checkpointed(
+        session_descriptor,
+        desktop_bundle_descriptor,
+        artifact_path,
+        &checkpoint,
+    )
+}
+
+/// Runs the isolated witness while advancing a caller-owned, static progress
+/// checkpoint only after each private operation completes. The checkpoint is
+/// suitable for redacted crash diagnostics; it never receives request,
+/// session, bundle, or response values.
+pub fn sandbox_wispr_witness_checkpointed(
+    session_descriptor: i32,
+    desktop_bundle_descriptor: i32,
+    artifact_path: &Path,
+    checkpoint: &WisprWitnessCheckpoint,
+) -> WisprWitnessDiagnostics {
     let session = match InheritedFdDesktopWisprSession::new(session_descriptor) {
         Ok(session) => Arc::new(session),
         Err(_) => return WisprWitnessDiagnostics::at("session-descriptor"),
     };
+    checkpoint.advance("session-descriptor");
     let backend = match DesktopWisprBackendSource::new(desktop_bundle_descriptor) {
         Ok(backend) => Arc::new(backend),
         Err(_) => return WisprWitnessDiagnostics::at("bundle-descriptor"),
     };
+    checkpoint.advance("bundle-descriptor");
     let (access_token, _) = match session.session() {
         Ok(session) => session,
         Err(_) => return WisprWitnessDiagnostics::at("session"),
     };
+    checkpoint.advance("session");
     let request = ProviderTranscriptRequest::for_test(artifact_path);
     let wav_pcm16 = match RecordingLogWisprMediaAdapter.wav_pcm16(&request) {
         Ok(wav_pcm16) => wav_pcm16,
         Err(_) => return WisprWitnessDiagnostics::at("recording"),
     };
+    checkpoint.advance("request-recording");
     if !is_wispr_pcm16_wav(&wav_pcm16)
         || wav_pcm16.len() > 44 + (WISPR_MAXIMUM_SAMPLES as usize * 2)
     {
         return WisprWitnessDiagnostics::at("audio-validation");
     }
-    let identity: Arc<dyn WisprWireIdentity> = session;
-    let wire = Arc::new(ObservedWisprGrpcClient::new(
-        Arc::new(NativeWisprGrpcStreamingBoundary),
-        identity,
-        backend,
-    ));
-    match wire.submit(WisprFlowWireRequest::new(&access_token, request, wav_pcm16)) {
+    checkpoint.advance("audio-validation");
+    let user_id = match session.user_id() {
+        Ok(user_id) => user_id,
+        Err(_) => return WisprWitnessDiagnostics::at("session"),
+    };
+    let identifiers = match session.fresh_request_identifiers() {
+        Ok(identifiers) => identifiers,
+        Err(_) => return WisprWitnessDiagnostics::at("request-identifiers"),
+    };
+    checkpoint.advance("request-identifiers");
+    let backend = match backend.backend() {
+        Ok(backend) => backend,
+        Err(_) => return WisprWitnessDiagnostics::at("bundle-descriptor"),
+    };
+    checkpoint.advance("backend-metadata");
+    let mut metadata = backend.metadata();
+    metadata.push(("authorization", format!("Bearer {access_token}")));
+    let messages = match encode_observed_requests(
+        &user_id,
+        identifiers,
+        &WisprFlowWireRequest::new(&access_token, request, wav_pcm16),
+    ) {
+        Ok(messages) => messages,
+        Err(_) => return WisprWitnessDiagnostics::at("request-encoding"),
+    };
+    checkpoint.advance("request-encoding");
+    let call = WisprGrpcStreamCall {
+        host: backend.host,
+        method: TRANSCRIBE_STREAM_PATH,
+        metadata,
+        messages,
+    };
+    match NativeWisprGrpcStreamingBoundary.stream_checkpointed(call, checkpoint) {
         Ok(response) => response.diagnostics(if response.provider_state().is_ok() {
             "complete"
         } else {
             "response"
         }),
-        Err(_) => WisprWitnessDiagnostics::at("stream"),
+        Err(_) => WisprWitnessDiagnostics::at(checkpoint.stage()),
     }
 }
 
@@ -1589,10 +1811,11 @@ mod tests {
         assert_eq!(calls[0].host(), "inference.wisprflow.com");
         assert_eq!(calls[0].method(), TRANSCRIBE_STREAM_PATH);
         assert_eq!(calls[0].messages().len(), 4);
-        assert!(calls[0]
-            .metadata()
-            .iter()
-            .any(|(name, value)| *name == "authorization" && value == "Bearer synthetic-session"));
+        assert!(
+            calls[0].metadata().iter().any(
+                |(name, value)| *name == "authorization" && value == "Bearer synthetic-session"
+            )
+        );
     }
 
     #[test]
@@ -1672,15 +1895,198 @@ mod tests {
     }
 
     #[test]
+    fn nested_runtime_uses_an_owned_runtime_thread() {
+        let outer_thread = std::thread::current().id();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("synthetic outer runtime");
+        let checkpoint = WisprWitnessCheckpoint::new("request-encoding");
+        let outcome = runtime.block_on(async {
+            run_wispr_runtime(&checkpoint, async {
+                Ok::<_, ProviderAttemptState>(std::thread::current().id())
+            })
+        });
+        assert_ne!(outcome.expect("owned runtime result"), outer_thread);
+    }
+
+    #[test]
+    fn child_runtime_panic_preserves_its_shared_static_checkpoint() {
+        let checkpoint = WisprWitnessCheckpoint::new("runtime");
+        let child_checkpoint = checkpoint.clone();
+        let outer = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("synthetic outer runtime");
+        let runtime_checkpoint = checkpoint.clone();
+        let outcome = outer.block_on(async move {
+            run_wispr_runtime::<()>(&runtime_checkpoint, async move {
+                child_checkpoint.advance("tcp-connect");
+                panic!("synthetic child panic")
+            })
+        });
+
+        assert_eq!(outcome, Err(ProviderAttemptState::Unavailable));
+        assert_eq!(checkpoint.stage(), "tcp-connect");
+    }
+
+    #[test]
+    fn owned_runtime_marks_first_future_poll_before_a_child_unwind() {
+        let checkpoint = WisprWitnessCheckpoint::new("request-encoding");
+        let child_checkpoint = checkpoint.clone();
+        let outcome = run_wispr_runtime::<()>(&checkpoint, async move {
+            child_checkpoint.advance("future-first-poll");
+            panic!("synthetic first-poll panic")
+        });
+
+        assert_eq!(outcome, Err(ProviderAttemptState::Unavailable));
+        assert_eq!(checkpoint.stage(), "future-first-poll");
+    }
+
+    #[test]
+    fn loopback_resolution_reaches_the_static_dns_completed_checkpoint() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("synthetic resolver runtime");
+        let checkpoint = WisprWitnessCheckpoint::new("future-first-poll");
+
+        let addresses = runtime
+            .block_on(resolve_wispr_addresses("127.0.0.1", &checkpoint))
+            .expect("numeric loopback resolves without a network lookup");
+
+        assert!(!addresses.is_empty());
+        assert_eq!(checkpoint.stage(), "dns-resolution-completed");
+    }
+
+    #[test]
+    fn refused_local_dial_retains_the_static_attempted_checkpoint() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("synthetic dial runtime");
+        let checkpoint = WisprWitnessCheckpoint::new("dns-resolution-completed");
+        let address = "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("synthetic reserved port");
+
+        let result = runtime.block_on(dial_wispr_addresses(&[address], &checkpoint));
+
+        assert!(matches!(
+            result,
+            Err(ProviderAttemptState::TransientFailure)
+        ));
+        assert_eq!(checkpoint.stage(), "tcp-dial-attempted");
+    }
+
+    #[test]
+    fn witness_tls_configuration_does_not_depend_on_process_default_provider() {
+        let checkpoint = WisprWitnessCheckpoint::new("tcp-dial-connected");
+        let result = std::panic::catch_unwind(|| wispr_tls_connector(&checkpoint));
+
+        assert!(result.is_ok());
+        assert!(result.expect("explicit provider configuration").is_ok());
+        assert_eq!(checkpoint.stage(), "tls-connector-ready");
+    }
+
+    #[test]
+    fn witness_tls_server_name_is_a_static_completed_checkpoint() {
+        let checkpoint = WisprWitnessCheckpoint::new("tls-connector-ready");
+
+        let server_name = wispr_server_name(WISPR_GRPC_HOST.to_owned(), &checkpoint);
+
+        assert!(server_name.is_ok());
+        assert_eq!(checkpoint.stage(), "tls-server-name-completed");
+    }
+
+    #[test]
+    fn loopback_h2_accepts_the_real_four_message_witness_request() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("offline h2 runtime");
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("offline loopback listener");
+            let address = listener.local_addr().expect("loopback listener address");
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.expect("loopback accept");
+                let mut connection = h2::server::handshake(socket).await.expect("h2 server");
+                let (_request, mut respond) = connection
+                    .accept()
+                    .await
+                    .expect("h2 request")
+                    .expect("one request");
+                respond
+                    .send_response(
+                        http::Response::builder().status(200).body(()).unwrap(),
+                        true,
+                    )
+                    .expect("h2 response");
+                while connection.accept().await.is_some() {}
+            });
+            let socket = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("loopback client connect");
+            let (mut sender, connection) = h2::client::handshake(socket).await.expect("h2 client");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let request = WisprFlowWireRequest::new(
+                "synthetic-session",
+                ProviderTranscriptRequest::new(
+                    "/synthetic.wav".into(),
+                    "synthetic context".into(),
+                    Vec::new(),
+                ),
+                synthetic_wav(),
+            );
+            let messages = encode_observed_requests(
+                "synthetic-user",
+                WisprRequestIdentifiers::new(
+                    "synthetic-session-id".into(),
+                    "synthetic-request-id".into(),
+                ),
+                &request,
+            )
+            .expect("four synthetic messages");
+            assert_eq!(messages.len(), 4);
+            let call = WisprGrpcStreamCall {
+                host: "offline.wispr.test".into(),
+                method: TRANSCRIBE_STREAM_PATH,
+                metadata: vec![("x-wispr-synthetic", "offline".into())],
+                messages: messages.clone(),
+            };
+            let checkpoint = WisprWitnessCheckpoint::new("http2-ready");
+            let request = wispr_h2_request(&call, &checkpoint).expect("synthetic request");
+            let (response, mut upload) = sender
+                .send_request(request, false)
+                .expect("h2 request has scheme and authority");
+            for message in &messages {
+                native_send_grpc_message(&mut upload, message)
+                    .await
+                    .expect("synthetic grpc frame");
+                checkpoint.advance(wispr_outbound_frame_stage(message));
+            }
+            upload.send_data(Bytes::new(), true).expect("h2 half close");
+            assert_eq!(response.await.expect("h2 response").status(), 200);
+            server.abort();
+            assert_eq!(checkpoint.stage(), "client-commit-frame-sent");
+        });
+    }
+
+    #[test]
     fn desktop_backend_descriptor_selects_the_packaged_default_without_exposing_its_key() {
         let descriptor = desktop_backend_from_bundle(
-            br#"const basetenApiKey="synthetic-client-key";const Rt={Fo:()=>basetenApiKey};class G{static ASR_VARIANT_BASETEN_MODEL_IDS={[xt.eW.QwenHttp]:"synthetic-model"};static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#,
+            br#"const RT="v31pl413";const basetenApiKey="synthetic-client-key";const Rt={Fo:()=>basetenApiKey};class G{static ASR_VARIANT_BASETEN_MODEL_IDS={[xt.eW.QwenHttp]:"q049l843"};static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#,
         )
         .expect("synthetic desktop bundle descriptor");
 
-        assert_eq!(descriptor.host, "model-synthetic-model.grpc.api.baseten.co");
-        assert_eq!(descriptor.model_id, "model-synthetic-model");
+        assert_eq!(descriptor.host, "model-v31pl413.grpc.api.baseten.co");
+        assert_eq!(descriptor.model_id, "model-v31pl413");
         assert_eq!(descriptor.environment, "production");
+        assert!(descriptor.baseten_authorization.is_some());
     }
 
     #[test]
