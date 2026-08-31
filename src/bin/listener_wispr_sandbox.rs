@@ -9,7 +9,7 @@ use std::{
 use listener::{
     sandbox_wispr_backend_probe, sandbox_wispr_witness_checkpointed, RecordingAudioFormat, RecordingInputSource,
     RecordingLogHeader, RecordingLogWriter, RecordingStartTime, WisprWitnessCheckpoint,
-    WisprWitnessAuthProbe, WisprWitnessDiagnostics, WisprWitnessRoute,
+    WisprWitnessAuthProbe, WisprWitnessDiagnostics, WisprWitnessModelVariant, WisprWitnessRoute,
 };
 use signal_listener::CaptureSession;
 
@@ -19,12 +19,14 @@ struct SandboxWitness {
     artifact_path: PathBuf,
     route: WisprWitnessRoute,
     auth_probe: WisprWitnessAuthProbe,
+    model_variant: WisprWitnessModelVariant,
 }
 
 impl SandboxWitness {
     fn from_environment(
         route: WisprWitnessRoute,
         auth_probe: WisprWitnessAuthProbe,
+        model_variant: WisprWitnessModelVariant,
     ) -> Result<Self, &'static str> {
         Ok(Self {
             session_descriptor: required_descriptor("LISTENER_WISPR_SESSION_FD")
@@ -35,6 +37,7 @@ impl SandboxWitness {
                 .map_err(|_| "artifact-path")?,
             route,
             auth_probe,
+            model_variant,
         })
     }
 
@@ -50,6 +53,7 @@ impl SandboxWitness {
             &self.artifact_path,
             self.route,
             self.auth_probe,
+            self.model_variant,
             checkpoint,
         ))
     }
@@ -77,6 +81,23 @@ fn auth_probe_from_selector(selector: Option<&str>) -> Result<WisprWitnessAuthPr
         Some("omit-bearer") => Ok(WisprWitnessAuthProbe::OmitBearer),
         Some("omit-baseten-authorization") => Ok(WisprWitnessAuthProbe::OmitBasetenAuthorization),
         Some(_) => Err("auth-probe-selector"),
+    }
+}
+
+fn model_variant_from_environment() -> Result<WisprWitnessModelVariant, &'static str> {
+    model_variant_from_selector(env::var("LISTENER_WISPR_MODEL_VARIANT").ok().as_deref())
+}
+
+fn model_variant_from_selector(
+    selector: Option<&str>,
+) -> Result<WisprWitnessModelVariant, &'static str> {
+    match selector {
+        None | Some("packaged-default") => Ok(WisprWitnessModelVariant::PackagedDefault),
+        Some("ensemble") => Ok(WisprWitnessModelVariant::Ensemble),
+        Some("qwen-http") => Ok(WisprWitnessModelVariant::QwenHttp),
+        Some("qwen-one-beam-vllm") => Ok(WisprWitnessModelVariant::QwenOneBeamVllm),
+        Some("voxtral-http") => Ok(WisprWitnessModelVariant::VoxtralHttp),
+        Some(_) => Err("model-variant-selector"),
     }
 }
 
@@ -132,6 +153,7 @@ fn finish_with_diagnostics(
     checkpoint: &WisprWitnessCheckpoint,
     route: WisprWitnessRoute,
     auth_probe: WisprWitnessAuthProbe,
+    model_variant: WisprWitnessModelVariant,
     operation: impl FnOnce(&WisprWitnessCheckpoint) -> Result<WisprWitnessDiagnostics, &'static str>,
 ) -> Result<(), &'static str> {
     let (diagnostics, outcome) = match catch_unwind(AssertUnwindSafe(|| operation(checkpoint))) {
@@ -143,16 +165,21 @@ fn finish_with_diagnostics(
             (diagnostics, outcome)
         }
         Ok(Err(stage)) => (
-            WisprWitnessDiagnostics::setup_failure(stage, route, auth_probe),
+            WisprWitnessDiagnostics::setup_failure(stage, route, auth_probe, model_variant),
             Err("witness-failed"),
         ),
         Err(_) => (
-            WisprWitnessDiagnostics::setup_failure(checkpoint.stage(), route, auth_probe),
+            WisprWitnessDiagnostics::setup_failure(
+                checkpoint.stage(),
+                route,
+                auth_probe,
+                model_variant,
+            ),
             Err("witness-failed"),
         ),
     };
     let contents = serde_json::to_vec(&diagnostics).unwrap_or_else(|_| {
-        br#"{"local_stage":"diagnostics","route":"default-direct","auth_probe":"full","http_status":null,"grpc_status":null,"content_type":null,"bearer_state":"unknown","permission_category":"absent","response_frame_count":0,"response_frame_lengths":[],"protobuf_top_level_tag_histograms":[]}"#.to_vec()
+        br#"{"local_stage":"diagnostics","route":"default-direct","auth_probe":"full","model_variant":"packaged-default","http_status":null,"grpc_status":null,"content_type":null,"bearer_state":"unknown","permission_category":"absent","response_frame_count":0,"response_frame_lengths":[],"protobuf_top_level_tag_histograms":[]}"#.to_vec()
     });
     write_diagnostics_atomically(diagnostics_path, &contents)?;
     outcome
@@ -195,6 +222,7 @@ fn main() -> ExitCode {
                 &checkpoint,
                 WisprWitnessRoute::DefaultDirect,
                 WisprWitnessAuthProbe::Full,
+                WisprWitnessModelVariant::PackagedDefault,
                 |_| Err(stage),
             );
             eprintln!("wispr-sandbox: witness-failed");
@@ -209,6 +237,22 @@ fn main() -> ExitCode {
                 &checkpoint,
                 route,
                 WisprWitnessAuthProbe::Full,
+                WisprWitnessModelVariant::PackagedDefault,
+                |_| Err(stage),
+            );
+            eprintln!("wispr-sandbox: witness-failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let model_variant = match model_variant_from_environment() {
+        Ok(model_variant) => model_variant,
+        Err(stage) => {
+            let _ = finish_with_diagnostics(
+                &diagnostics_path,
+                &checkpoint,
+                route,
+                auth_probe,
+                WisprWitnessModelVariant::PackagedDefault,
                 |_| Err(stage),
             );
             eprintln!("wispr-sandbox: witness-failed");
@@ -216,17 +260,36 @@ fn main() -> ExitCode {
         }
     };
     let result = if offline_bundle_probe_requested() {
-        finish_with_diagnostics(&diagnostics_path, &checkpoint, route, auth_probe, |_| {
+        finish_with_diagnostics(
+            &diagnostics_path,
+            &checkpoint,
+            route,
+            auth_probe,
+            model_variant,
+            |_| {
             let descriptor = required_descriptor("LISTENER_WISPR_DESKTOP_BUNDLE_FD")
                 .map_err(|_| "bundle-descriptor")?;
-            Ok(sandbox_wispr_backend_probe(descriptor, route, auth_probe))
-        })
+            Ok(sandbox_wispr_backend_probe(
+                descriptor,
+                route,
+                auth_probe,
+                model_variant,
+            ))
+        },
+        )
     } else {
-        finish_with_diagnostics(&diagnostics_path, &checkpoint, route, auth_probe, |checkpoint| {
-            let witness = SandboxWitness::from_environment(route, auth_probe)?;
+        finish_with_diagnostics(
+            &diagnostics_path,
+            &checkpoint,
+            route,
+            auth_probe,
+            model_variant,
+            |checkpoint| {
+            let witness = SandboxWitness::from_environment(route, auth_probe, model_variant)?;
             checkpoint.advance("preflight");
             witness.run(checkpoint)
-        })
+        },
+        )
     };
     match result {
         Ok(()) => {
@@ -255,6 +318,7 @@ mod tests {
             &checkpoint,
             WisprWitnessRoute::DefaultDirect,
             WisprWitnessAuthProbe::Full,
+            WisprWitnessModelVariant::PackagedDefault,
             |_| -> Result<WisprWitnessDiagnostics, _> { panic!("synthetic setup panic") },
         );
         assert_eq!(outcome, Err("witness-failed"));
@@ -266,12 +330,13 @@ mod tests {
         assert_eq!(diagnostics["local_stage"], "synthetic-audio");
         assert_eq!(
             diagnostics.as_object().expect("diagnostics object").len(),
-            11
+            12
         );
         assert_eq!(diagnostics["bearer_state"], "unknown");
         assert_eq!(diagnostics["permission_category"], "absent");
         assert_eq!(diagnostics["route"], "default-direct");
         assert_eq!(diagnostics["auth_probe"], "full");
+        assert_eq!(diagnostics["model_variant"], "packaged-default");
         assert!(diagnostics.get("error").is_none());
         assert!(diagnostics.get("message").is_none());
     }
@@ -287,11 +352,13 @@ mod tests {
             &checkpoint,
             WisprWitnessRoute::EdgeProxy,
             WisprWitnessAuthProbe::OmitBearer,
+            WisprWitnessModelVariant::PackagedDefault,
             |_| {
                 Ok(WisprWitnessDiagnostics::setup_failure(
                     "tcp-dial-attempted",
                     WisprWitnessRoute::EdgeProxy,
                     WisprWitnessAuthProbe::OmitBearer,
+                    WisprWitnessModelVariant::PackagedDefault,
                 ))
             },
         );
@@ -307,6 +374,7 @@ mod tests {
         assert_eq!(diagnostics["permission_category"], "absent");
         assert_eq!(diagnostics["route"], "edge-proxy");
         assert_eq!(diagnostics["auth_probe"], "omit-bearer");
+        assert_eq!(diagnostics["model_variant"], "packaged-default");
     }
 
     #[test]
@@ -336,6 +404,22 @@ mod tests {
         assert_eq!(
             auth_probe_from_selector(Some("unexpected")),
             Err("auth-probe-selector")
+        );
+    }
+
+    #[test]
+    fn model_variant_selector_is_closed_and_defaults_to_packaged_default() {
+        assert_eq!(
+            model_variant_from_selector(None),
+            Ok(WisprWitnessModelVariant::PackagedDefault)
+        );
+        assert_eq!(
+            model_variant_from_selector(Some("qwen-one-beam-vllm")),
+            Ok(WisprWitnessModelVariant::QwenOneBeamVllm)
+        );
+        assert_eq!(
+            model_variant_from_selector(Some("unexpected")),
+            Err("model-variant-selector")
         );
     }
 }

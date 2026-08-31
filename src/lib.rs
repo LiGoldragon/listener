@@ -106,5 +106,5 @@ pub use transport::{ContractFrameCodec, ContractFrameStream, MaximumFrameLength}
 pub use wispr::{
     WisprWitnessCheckpoint, WisprWitnessDiagnostics, sandbox_wispr_witness,
     sandbox_wispr_witness_checkpointed, sandbox_wispr_backend_probe, WisprWitnessAuthProbe,
-    WisprWitnessRoute,
+    WisprWitnessModelVariant, WisprWitnessRoute,
 };

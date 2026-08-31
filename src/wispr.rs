@@ -61,6 +61,32 @@ pub enum WisprWitnessAuthProbe {
     OmitBasetenAuthorization,
 }
 
+/// The direct-model variants observed in the installed Wispr 1.6.7 bundle.
+/// They are available only to the isolated witness and serialize as closed
+/// names, never as model or header values.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WisprWitnessModelVariant {
+    #[default]
+    PackagedDefault,
+    Ensemble,
+    QwenHttp,
+    QwenOneBeamVllm,
+    VoxtralHttp,
+}
+
+impl WisprWitnessModelVariant {
+    fn direct_model_id(self) -> &'static str {
+        match self {
+            Self::PackagedDefault => "v31pl413",
+            Self::Ensemble => "qkl9pl83",
+            Self::QwenHttp => "q049l843",
+            Self::QwenOneBeamVllm => "qvv19meq",
+            Self::VoxtralHttp => "qzk0548q",
+        }
+    }
+}
+
 /// An opaque, expiring session. It deliberately exposes no value accessor and
 /// does not implement Debug, Serialize, or Clone.
 pub(crate) struct WisprSession {
@@ -428,9 +454,17 @@ impl WisprGrpcStreamResponse {
         stage: &'static str,
         route: WisprWitnessRoute,
         auth_probe: WisprWitnessAuthProbe,
+        model_variant: WisprWitnessModelVariant,
         bearer_state: BearerState,
     ) -> WisprWitnessDiagnostics {
-        WisprWitnessDiagnostics::from_response(stage, route, auth_probe, bearer_state, self)
+        WisprWitnessDiagnostics::from_response(
+            stage,
+            route,
+            auth_probe,
+            model_variant,
+            bearer_state,
+            self,
+        )
     }
 }
 
@@ -465,6 +499,7 @@ pub struct WisprWitnessDiagnostics {
     local_stage: &'static str,
     route: WisprWitnessRoute,
     auth_probe: WisprWitnessAuthProbe,
+    model_variant: WisprWitnessModelVariant,
     http_status: Option<u16>,
     grpc_status: Option<u32>,
     content_type: Option<String>,
@@ -519,8 +554,9 @@ impl WisprWitnessDiagnostics {
         stage: &'static str,
         route: WisprWitnessRoute,
         auth_probe: WisprWitnessAuthProbe,
+        model_variant: WisprWitnessModelVariant,
     ) -> Self {
-        Self::at(stage, route, auth_probe)
+        Self::at(stage, route, auth_probe, model_variant)
     }
 
     /// Whether the witness reached response headers. This is intentionally a
@@ -534,11 +570,13 @@ impl WisprWitnessDiagnostics {
         stage: &'static str,
         route: WisprWitnessRoute,
         auth_probe: WisprWitnessAuthProbe,
+        model_variant: WisprWitnessModelVariant,
     ) -> Self {
         Self {
             local_stage: stage,
             route,
             auth_probe,
+            model_variant,
             http_status: None,
             grpc_status: None,
             content_type: None,
@@ -554,6 +592,7 @@ impl WisprWitnessDiagnostics {
         stage: &'static str,
         route: WisprWitnessRoute,
         auth_probe: WisprWitnessAuthProbe,
+        model_variant: WisprWitnessModelVariant,
         bearer_state: BearerState,
         response: &WisprGrpcStreamResponse,
     ) -> Self {
@@ -561,6 +600,7 @@ impl WisprWitnessDiagnostics {
             local_stage: stage,
             route,
             auth_probe,
+            model_variant,
             http_status: response.http_status,
             grpc_status: response.grpc_status,
             content_type: response.content_type.clone(),
@@ -1331,6 +1371,26 @@ impl DesktopWisprBackendSource {
             )?, route)?,
         })
     }
+
+    fn new_for_isolated_witness(
+        descriptor: i32,
+        route: WisprWitnessRoute,
+        model_variant: WisprWitnessModelVariant,
+    ) -> Result<Self, ProviderAttemptState> {
+        if descriptor < 3 {
+            return Err(ProviderAttemptState::Unavailable);
+        }
+        if model_variant == WisprWitnessModelVariant::PackagedDefault {
+            return Self::new(descriptor, route);
+        }
+        Ok(Self {
+            backend: isolated_witness_backend_from_bundle(
+                &inherited_descriptor_bytes(descriptor, DESKTOP_BUNDLE_MAXIMUM_BYTES)?,
+                route,
+                model_variant,
+            )?,
+        })
+    }
 }
 
 impl WisprGrpcBackendSource for DesktopWisprBackendSource {
@@ -1366,6 +1426,22 @@ fn desktop_backend_from_bundle(
             baseten_authorization,
         },
     })
+}
+
+/// Applies a non-secret direct-model choice only for the isolated witness.
+/// Production backend construction remains bound to the packaged descriptor.
+fn isolated_witness_backend_from_bundle(
+    bytes: &[u8],
+    route: WisprWitnessRoute,
+    model_variant: WisprWitnessModelVariant,
+) -> Result<WisprGrpcBackend, ProviderAttemptState> {
+    let mut backend = desktop_backend_from_bundle(bytes, route)?;
+    if route == WisprWitnessRoute::DefaultDirect {
+        let model_id = model_variant.direct_model_id();
+        backend.host = format!("model-{model_id}.grpc.api.baseten.co");
+        backend.model_id = format!("model-{model_id}");
+    }
+    Ok(backend)
 }
 
 fn bundled_default_model_id(source: &str) -> Result<String, ProviderAttemptState> {
@@ -2093,6 +2169,7 @@ pub fn sandbox_wispr_witness(
     artifact_path: &Path,
     route: WisprWitnessRoute,
     auth_probe: WisprWitnessAuthProbe,
+    model_variant: WisprWitnessModelVariant,
 ) -> WisprWitnessDiagnostics {
     let checkpoint = WisprWitnessCheckpoint::new("witness");
     sandbox_wispr_witness_checkpointed(
@@ -2101,6 +2178,7 @@ pub fn sandbox_wispr_witness(
         artifact_path,
         route,
         auth_probe,
+        model_variant,
         &checkpoint,
     )
 }
@@ -2111,10 +2189,25 @@ pub fn sandbox_wispr_backend_probe(
     desktop_bundle_descriptor: i32,
     route: WisprWitnessRoute,
     auth_probe: WisprWitnessAuthProbe,
+    model_variant: WisprWitnessModelVariant,
 ) -> WisprWitnessDiagnostics {
-    match DesktopWisprBackendSource::new(desktop_bundle_descriptor, route) {
-        Ok(_) => WisprWitnessDiagnostics::at("backend-metadata", route, auth_probe),
-        Err(_) => WisprWitnessDiagnostics::at("bundle-descriptor", route, auth_probe),
+    match DesktopWisprBackendSource::new_for_isolated_witness(
+        desktop_bundle_descriptor,
+        route,
+        model_variant,
+    ) {
+        Ok(_) => WisprWitnessDiagnostics::at(
+            "backend-metadata",
+            route,
+            auth_probe,
+            model_variant,
+        ),
+        Err(_) => WisprWitnessDiagnostics::at(
+            "bundle-descriptor",
+            route,
+            auth_probe,
+            model_variant,
+        ),
     }
 }
 
@@ -2128,47 +2221,86 @@ pub fn sandbox_wispr_witness_checkpointed(
     artifact_path: &Path,
     route: WisprWitnessRoute,
     auth_probe: WisprWitnessAuthProbe,
+    model_variant: WisprWitnessModelVariant,
     checkpoint: &WisprWitnessCheckpoint,
 ) -> WisprWitnessDiagnostics {
     let session = match InheritedFdDesktopWisprSession::new(session_descriptor) {
         Ok(session) => Arc::new(session),
-        Err(_) => return WisprWitnessDiagnostics::at("session-descriptor", route, auth_probe),
+        Err(_) => {
+            return WisprWitnessDiagnostics::at(
+                "session-descriptor",
+                route,
+                auth_probe,
+                model_variant,
+            );
+        }
     };
     checkpoint.advance("session-descriptor");
-    let backend = match DesktopWisprBackendSource::new(desktop_bundle_descriptor, route) {
+    let backend = match DesktopWisprBackendSource::new_for_isolated_witness(
+        desktop_bundle_descriptor,
+        route,
+        model_variant,
+    ) {
         Ok(backend) => Arc::new(backend),
-        Err(_) => return WisprWitnessDiagnostics::at("bundle-descriptor", route, auth_probe),
+        Err(_) => {
+            return WisprWitnessDiagnostics::at(
+                "bundle-descriptor",
+                route,
+                auth_probe,
+                model_variant,
+            );
+        }
     };
     checkpoint.advance("bundle-descriptor");
     let (access_token, _, bearer_state) = match session.session() {
         Ok(session) => session,
-        Err(_) => return WisprWitnessDiagnostics::at("session", route, auth_probe),
+        Err(_) => {
+            return WisprWitnessDiagnostics::at("session", route, auth_probe, model_variant);
+        }
     };
     checkpoint.advance("session");
     let request = ProviderTranscriptRequest::for_test(artifact_path);
     let wav_pcm16 = match RecordingLogWisprMediaAdapter.wav_pcm16(&request) {
         Ok(wav_pcm16) => wav_pcm16,
-        Err(_) => return WisprWitnessDiagnostics::at("recording", route, auth_probe),
+        Err(_) => {
+            return WisprWitnessDiagnostics::at("recording", route, auth_probe, model_variant);
+        }
     };
     checkpoint.advance("request-recording");
     if !is_wispr_pcm16_wav(&wav_pcm16)
         || wav_pcm16.len() > 44 + (WISPR_MAXIMUM_SAMPLES as usize * 2)
     {
-        return WisprWitnessDiagnostics::at("audio-validation", route, auth_probe);
+        return WisprWitnessDiagnostics::at("audio-validation", route, auth_probe, model_variant);
     }
     checkpoint.advance("audio-validation");
     let user_id = match session.user_id() {
         Ok(user_id) => user_id,
-        Err(_) => return WisprWitnessDiagnostics::at("session", route, auth_probe),
+        Err(_) => {
+            return WisprWitnessDiagnostics::at("session", route, auth_probe, model_variant);
+        }
     };
     let identifiers = match session.fresh_request_identifiers() {
         Ok(identifiers) => identifiers,
-        Err(_) => return WisprWitnessDiagnostics::at("request-identifiers", route, auth_probe),
+        Err(_) => {
+            return WisprWitnessDiagnostics::at(
+                "request-identifiers",
+                route,
+                auth_probe,
+                model_variant,
+            );
+        }
     };
     checkpoint.advance("request-identifiers");
     let backend = match backend.backend() {
         Ok(backend) => backend,
-        Err(_) => return WisprWitnessDiagnostics::at("bundle-descriptor", route, auth_probe),
+        Err(_) => {
+            return WisprWitnessDiagnostics::at(
+                "bundle-descriptor",
+                route,
+                auth_probe,
+                model_variant,
+            );
+        }
     };
     checkpoint.advance("backend-metadata");
     let metadata = isolated_witness_metadata(&backend, &access_token, auth_probe);
@@ -2178,7 +2310,14 @@ pub fn sandbox_wispr_witness_checkpointed(
         &WisprFlowWireRequest::new(&access_token, request, wav_pcm16),
     ) {
         Ok(messages) => messages,
-        Err(_) => return WisprWitnessDiagnostics::at("request-encoding", route, auth_probe),
+        Err(_) => {
+            return WisprWitnessDiagnostics::at(
+                "request-encoding",
+                route,
+                auth_probe,
+                model_variant,
+            );
+        }
     };
     checkpoint.advance("request-encoding");
     let call = WisprGrpcStreamCall {
@@ -2196,9 +2335,15 @@ pub fn sandbox_wispr_witness_checkpointed(
             },
             route,
             auth_probe,
+            model_variant,
             bearer_state,
         ),
-        Err(_) => WisprWitnessDiagnostics::at(checkpoint.stage(), route, auth_probe),
+        Err(_) => WisprWitnessDiagnostics::at(
+            checkpoint.stage(),
+            route,
+            auth_probe,
+            model_variant,
+        ),
     }
 }
 
@@ -2336,6 +2481,7 @@ mod tests {
             "complete",
             WisprWitnessRoute::EdgeProxy,
             WisprWitnessAuthProbe::OmitBasetenAuthorization,
+            WisprWitnessModelVariant::VoxtralHttp,
             BearerState::Unknown,
         ))
         .expect("diagnostics serialize");
@@ -2349,6 +2495,7 @@ mod tests {
                 "grpc_status",
                 "http_status",
                 "local_stage",
+                "model_variant",
                 "permission_category",
                 "protobuf_top_level_tag_histograms",
                 "response_frame_count",
@@ -2357,6 +2504,7 @@ mod tests {
             ],
         );
         assert_eq!(object["auth_probe"], "omit-baseten-authorization");
+        assert_eq!(object["model_variant"], "voxtral-http");
         assert_eq!(object["route"], "edge-proxy");
         let rendered = value.to_string();
         assert!(!rendered.contains("response text must not cross"));
@@ -2447,6 +2595,7 @@ mod tests {
             "response",
             WisprWitnessRoute::DefaultDirect,
             WisprWitnessAuthProbe::Full,
+            WisprWitnessModelVariant::PackagedDefault,
             desktop_bearer_state(&workos_session, "synthetic", observed_at),
         ))
         .expect("diagnostics serialize");
@@ -2460,6 +2609,7 @@ mod tests {
                 "grpc_status",
                 "http_status",
                 "local_stage",
+                "model_variant",
                 "permission_category",
                 "protobuf_top_level_tag_histograms",
                 "response_frame_count",
@@ -2788,16 +2938,50 @@ mod tests {
     }
 
     #[test]
+    fn isolated_direct_model_variants_keep_host_and_model_header_in_lockstep() {
+        let bundle = br#"47708(e,t,n){const basetenApiKey="synthetic-client-key";const Rt={Fo:()=>basetenApiKey};};const RT="v31pl413";class G{static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#;
+        for (variant, model) in [
+            (WisprWitnessModelVariant::PackagedDefault, "v31pl413"),
+            (WisprWitnessModelVariant::Ensemble, "qkl9pl83"),
+            (WisprWitnessModelVariant::QwenHttp, "q049l843"),
+            (WisprWitnessModelVariant::QwenOneBeamVllm, "qvv19meq"),
+            (WisprWitnessModelVariant::VoxtralHttp, "qzk0548q"),
+        ] {
+            let backend = isolated_witness_backend_from_bundle(
+                bundle,
+                WisprWitnessRoute::DefaultDirect,
+                variant,
+            )
+            .expect("synthetic direct backend");
+            assert_eq!(backend.host, format!("model-{model}.grpc.api.baseten.co"));
+            assert_eq!(backend.model_id, format!("model-{model}"));
+            assert_eq!(backend.environment, "production");
+        }
+
+        let edge = isolated_witness_backend_from_bundle(
+            bundle,
+            WisprWitnessRoute::EdgeProxy,
+            WisprWitnessModelVariant::VoxtralHttp,
+        )
+        .expect("synthetic edge backend");
+        assert_eq!(edge.host, WISPR_GRPC_HOST);
+        assert_eq!(edge.model_id, "model-");
+        assert_eq!(edge.environment, "");
+    }
+
+    #[test]
     fn offline_edge_proxy_backend_probe_stops_before_any_session_or_transport() {
         let diagnostics = sandbox_wispr_backend_probe(
             -1,
             WisprWitnessRoute::EdgeProxy,
             WisprWitnessAuthProbe::Full,
+            WisprWitnessModelVariant::PackagedDefault,
         );
         let value = serde_json::to_value(diagnostics).expect("diagnostics serialize");
 
         assert_eq!(value["route"], "edge-proxy");
         assert_eq!(value["local_stage"], "bundle-descriptor");
+        assert_eq!(value["model_variant"], "packaged-default");
         assert_eq!(value["http_status"], serde_json::Value::Null);
         assert_eq!(value["bearer_state"], "unknown");
     }
