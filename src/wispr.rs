@@ -50,6 +50,17 @@ pub enum WisprWitnessRoute {
     EdgeProxy,
 }
 
+/// The witness-only authorization variants. These affect request header
+/// presence, never authorization values or production transport behavior.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WisprWitnessAuthProbe {
+    #[default]
+    Full,
+    OmitBearer,
+    OmitBasetenAuthorization,
+}
+
 /// An opaque, expiring session. It deliberately exposes no value accessor and
 /// does not implement Debug, Serialize, or Clone.
 pub(crate) struct WisprSession {
@@ -235,6 +246,36 @@ impl WisprGrpcBackend {
     }
 }
 
+fn isolated_witness_metadata(
+    backend: &WisprGrpcBackend,
+    bearer: &str,
+    auth_probe: WisprWitnessAuthProbe,
+) -> Vec<(&'static str, String)> {
+    let mut metadata = backend.metadata();
+    if auth_probe == WisprWitnessAuthProbe::OmitBasetenAuthorization {
+        metadata.retain(|(name, _)| *name != "baseten-authorization");
+    }
+    if auth_probe != WisprWitnessAuthProbe::OmitBearer {
+        metadata.push(("authorization", format!("Bearer {bearer}")));
+    }
+    metadata
+}
+
+#[cfg(test)]
+fn isolated_witness_credential_header_names(
+    backend: &WisprGrpcBackend,
+    auth_probe: WisprWitnessAuthProbe,
+) -> Vec<&'static str> {
+    isolated_witness_metadata(backend, "synthetic-bearer", auth_probe)
+        .into_iter()
+        .filter_map(|(name, _)| {
+            ["authorization", "baseten-authorization"]
+                .contains(&name)
+                .then_some(name)
+        })
+        .collect()
+}
+
 pub(crate) trait WisprGrpcBackendSource: Send + Sync {
     fn backend(&self) -> Result<WisprGrpcBackend, ProviderAttemptState>;
 }
@@ -386,9 +427,10 @@ impl WisprGrpcStreamResponse {
         &self,
         stage: &'static str,
         route: WisprWitnessRoute,
+        auth_probe: WisprWitnessAuthProbe,
         bearer_state: BearerState,
     ) -> WisprWitnessDiagnostics {
-        WisprWitnessDiagnostics::from_response(stage, route, bearer_state, self)
+        WisprWitnessDiagnostics::from_response(stage, route, auth_probe, bearer_state, self)
     }
 }
 
@@ -422,6 +464,7 @@ enum PermissionCategory {
 pub struct WisprWitnessDiagnostics {
     local_stage: &'static str,
     route: WisprWitnessRoute,
+    auth_probe: WisprWitnessAuthProbe,
     http_status: Option<u16>,
     grpc_status: Option<u32>,
     content_type: Option<String>,
@@ -472,8 +515,12 @@ impl WisprWitnessDiagnostics {
     ///
     /// Callers must use a static local-stage label; no error value belongs in
     /// the sandbox's durable diagnostics boundary.
-    pub fn setup_failure(stage: &'static str, route: WisprWitnessRoute) -> Self {
-        Self::at(stage, route)
+    pub fn setup_failure(
+        stage: &'static str,
+        route: WisprWitnessRoute,
+        auth_probe: WisprWitnessAuthProbe,
+    ) -> Self {
+        Self::at(stage, route, auth_probe)
     }
 
     /// Whether the witness reached response headers. This is intentionally a
@@ -483,10 +530,15 @@ impl WisprWitnessDiagnostics {
         self.http_status.is_some()
     }
 
-    fn at(stage: &'static str, route: WisprWitnessRoute) -> Self {
+    fn at(
+        stage: &'static str,
+        route: WisprWitnessRoute,
+        auth_probe: WisprWitnessAuthProbe,
+    ) -> Self {
         Self {
             local_stage: stage,
             route,
+            auth_probe,
             http_status: None,
             grpc_status: None,
             content_type: None,
@@ -501,12 +553,14 @@ impl WisprWitnessDiagnostics {
     fn from_response(
         stage: &'static str,
         route: WisprWitnessRoute,
+        auth_probe: WisprWitnessAuthProbe,
         bearer_state: BearerState,
         response: &WisprGrpcStreamResponse,
     ) -> Self {
         Self {
             local_stage: stage,
             route,
+            auth_probe,
             http_status: response.http_status,
             grpc_status: response.grpc_status,
             content_type: response.content_type.clone(),
@@ -1913,6 +1967,7 @@ pub fn sandbox_wispr_witness(
     desktop_bundle_descriptor: i32,
     artifact_path: &Path,
     route: WisprWitnessRoute,
+    auth_probe: WisprWitnessAuthProbe,
 ) -> WisprWitnessDiagnostics {
     let checkpoint = WisprWitnessCheckpoint::new("witness");
     sandbox_wispr_witness_checkpointed(
@@ -1920,6 +1975,7 @@ pub fn sandbox_wispr_witness(
         desktop_bundle_descriptor,
         artifact_path,
         route,
+        auth_probe,
         &checkpoint,
     )
 }
@@ -1929,10 +1985,11 @@ pub fn sandbox_wispr_witness(
 pub fn sandbox_wispr_backend_probe(
     desktop_bundle_descriptor: i32,
     route: WisprWitnessRoute,
+    auth_probe: WisprWitnessAuthProbe,
 ) -> WisprWitnessDiagnostics {
     match DesktopWisprBackendSource::new(desktop_bundle_descriptor, route) {
-        Ok(_) => WisprWitnessDiagnostics::at("backend-metadata", route),
-        Err(_) => WisprWitnessDiagnostics::at("bundle-descriptor", route),
+        Ok(_) => WisprWitnessDiagnostics::at("backend-metadata", route, auth_probe),
+        Err(_) => WisprWitnessDiagnostics::at("bundle-descriptor", route, auth_probe),
     }
 }
 
@@ -1945,58 +2002,58 @@ pub fn sandbox_wispr_witness_checkpointed(
     desktop_bundle_descriptor: i32,
     artifact_path: &Path,
     route: WisprWitnessRoute,
+    auth_probe: WisprWitnessAuthProbe,
     checkpoint: &WisprWitnessCheckpoint,
 ) -> WisprWitnessDiagnostics {
     let session = match InheritedFdDesktopWisprSession::new(session_descriptor) {
         Ok(session) => Arc::new(session),
-        Err(_) => return WisprWitnessDiagnostics::at("session-descriptor", route),
+        Err(_) => return WisprWitnessDiagnostics::at("session-descriptor", route, auth_probe),
     };
     checkpoint.advance("session-descriptor");
     let backend = match DesktopWisprBackendSource::new(desktop_bundle_descriptor, route) {
         Ok(backend) => Arc::new(backend),
-        Err(_) => return WisprWitnessDiagnostics::at("bundle-descriptor", route),
+        Err(_) => return WisprWitnessDiagnostics::at("bundle-descriptor", route, auth_probe),
     };
     checkpoint.advance("bundle-descriptor");
     let (access_token, _, bearer_state) = match session.session() {
         Ok(session) => session,
-        Err(_) => return WisprWitnessDiagnostics::at("session", route),
+        Err(_) => return WisprWitnessDiagnostics::at("session", route, auth_probe),
     };
     checkpoint.advance("session");
     let request = ProviderTranscriptRequest::for_test(artifact_path);
     let wav_pcm16 = match RecordingLogWisprMediaAdapter.wav_pcm16(&request) {
         Ok(wav_pcm16) => wav_pcm16,
-        Err(_) => return WisprWitnessDiagnostics::at("recording", route),
+        Err(_) => return WisprWitnessDiagnostics::at("recording", route, auth_probe),
     };
     checkpoint.advance("request-recording");
     if !is_wispr_pcm16_wav(&wav_pcm16)
         || wav_pcm16.len() > 44 + (WISPR_MAXIMUM_SAMPLES as usize * 2)
     {
-        return WisprWitnessDiagnostics::at("audio-validation", route);
+        return WisprWitnessDiagnostics::at("audio-validation", route, auth_probe);
     }
     checkpoint.advance("audio-validation");
     let user_id = match session.user_id() {
         Ok(user_id) => user_id,
-        Err(_) => return WisprWitnessDiagnostics::at("session", route),
+        Err(_) => return WisprWitnessDiagnostics::at("session", route, auth_probe),
     };
     let identifiers = match session.fresh_request_identifiers() {
         Ok(identifiers) => identifiers,
-        Err(_) => return WisprWitnessDiagnostics::at("request-identifiers", route),
+        Err(_) => return WisprWitnessDiagnostics::at("request-identifiers", route, auth_probe),
     };
     checkpoint.advance("request-identifiers");
     let backend = match backend.backend() {
         Ok(backend) => backend,
-        Err(_) => return WisprWitnessDiagnostics::at("bundle-descriptor", route),
+        Err(_) => return WisprWitnessDiagnostics::at("bundle-descriptor", route, auth_probe),
     };
     checkpoint.advance("backend-metadata");
-    let mut metadata = backend.metadata();
-    metadata.push(("authorization", format!("Bearer {access_token}")));
+    let metadata = isolated_witness_metadata(&backend, &access_token, auth_probe);
     let messages = match encode_observed_requests(
         &user_id,
         identifiers,
         &WisprFlowWireRequest::new(&access_token, request, wav_pcm16),
     ) {
         Ok(messages) => messages,
-        Err(_) => return WisprWitnessDiagnostics::at("request-encoding", route),
+        Err(_) => return WisprWitnessDiagnostics::at("request-encoding", route, auth_probe),
     };
     checkpoint.advance("request-encoding");
     let call = WisprGrpcStreamCall {
@@ -2013,9 +2070,10 @@ pub fn sandbox_wispr_witness_checkpointed(
                 "response"
             },
             route,
+            auth_probe,
             bearer_state,
         ),
-        Err(_) => WisprWitnessDiagnostics::at(checkpoint.stage(), route),
+        Err(_) => WisprWitnessDiagnostics::at(checkpoint.stage(), route, auth_probe),
     }
 }
 
@@ -2152,6 +2210,7 @@ mod tests {
         let value = serde_json::to_value(response.diagnostics(
             "complete",
             WisprWitnessRoute::EdgeProxy,
+            WisprWitnessAuthProbe::OmitBasetenAuthorization,
             BearerState::Unknown,
         ))
         .expect("diagnostics serialize");
@@ -2159,6 +2218,7 @@ mod tests {
         assert_eq!(
             object.keys().map(String::as_str).collect::<Vec<_>>(),
             vec![
+                "auth_probe",
                 "bearer_state",
                 "content_type",
                 "grpc_status",
@@ -2171,6 +2231,7 @@ mod tests {
                 "route",
             ],
         );
+        assert_eq!(object["auth_probe"], "omit-baseten-authorization");
         assert_eq!(object["route"], "edge-proxy");
         let rendered = value.to_string();
         assert!(!rendered.contains("response text must not cross"));
@@ -2260,6 +2321,7 @@ mod tests {
         let diagnostics = serde_json::to_value(response.diagnostics(
             "response",
             WisprWitnessRoute::DefaultDirect,
+            WisprWitnessAuthProbe::Full,
             desktop_bearer_state(&workos_session, "synthetic", observed_at),
         ))
         .expect("diagnostics serialize");
@@ -2267,6 +2329,7 @@ mod tests {
         assert_eq!(
             object.keys().map(String::as_str).collect::<Vec<_>>(),
             vec![
+                "auth_probe",
                 "bearer_state",
                 "content_type",
                 "grpc_status",
@@ -2585,13 +2648,43 @@ mod tests {
 
     #[test]
     fn offline_edge_proxy_backend_probe_stops_before_any_session_or_transport() {
-        let diagnostics = sandbox_wispr_backend_probe(-1, WisprWitnessRoute::EdgeProxy);
+        let diagnostics = sandbox_wispr_backend_probe(
+            -1,
+            WisprWitnessRoute::EdgeProxy,
+            WisprWitnessAuthProbe::Full,
+        );
         let value = serde_json::to_value(diagnostics).expect("diagnostics serialize");
 
         assert_eq!(value["route"], "edge-proxy");
         assert_eq!(value["local_stage"], "bundle-descriptor");
         assert_eq!(value["http_status"], serde_json::Value::Null);
         assert_eq!(value["bearer_state"], "unknown");
+    }
+
+    #[test]
+    fn isolated_auth_probe_omits_only_the_selected_credential_header() {
+        let backend = WisprGrpcBackend {
+            host: WISPR_GRPC_HOST.into(),
+            model_id: "model-".into(),
+            environment: String::new(),
+            baseten_authorization: Some("Api-Key synthetic-client-key".into()),
+        };
+
+        assert_eq!(
+            isolated_witness_credential_header_names(&backend, WisprWitnessAuthProbe::Full),
+            vec!["baseten-authorization", "authorization"],
+        );
+        assert_eq!(
+            isolated_witness_credential_header_names(&backend, WisprWitnessAuthProbe::OmitBearer),
+            vec!["baseten-authorization"],
+        );
+        assert_eq!(
+            isolated_witness_credential_header_names(
+                &backend,
+                WisprWitnessAuthProbe::OmitBasetenAuthorization,
+            ),
+            vec!["authorization"],
+        );
     }
 
     #[test]
