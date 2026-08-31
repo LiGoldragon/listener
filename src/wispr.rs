@@ -355,6 +355,7 @@ pub(crate) struct WisprGrpcStreamResponse {
     http_status: Option<u16>,
     grpc_status: Option<u32>,
     content_type: Option<String>,
+    permission_category: PermissionCategory,
 }
 
 impl WisprGrpcStreamResponse {
@@ -371,9 +372,36 @@ impl WisprGrpcStreamResponse {
         }
     }
 
-    fn diagnostics(&self, stage: &'static str) -> WisprWitnessDiagnostics {
-        WisprWitnessDiagnostics::from_response(stage, self)
+    fn diagnostics(
+        &self,
+        stage: &'static str,
+        bearer_state: BearerState,
+    ) -> WisprWitnessDiagnostics {
+        WisprWitnessDiagnostics::from_response(stage, bearer_state, self)
     }
+}
+
+/// The only bearer-lifetime classification allowed to cross the sandbox
+/// boundary. Numeric expiry and provider evidence are consumed locally.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum BearerState {
+    Fresh,
+    NearExpiry,
+    Expired,
+    Unknown,
+}
+
+/// The only authorization-message classification allowed to cross the sandbox
+/// boundary. The original gRPC message is consumed locally and discarded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PermissionCategory {
+    Absent,
+    BearerAuth,
+    BasetenApiKey,
+    ModelEntitlement,
+    GenericPermission,
 }
 
 /// The sandbox's sole durable/output shape. It deliberately excludes every
@@ -385,6 +413,8 @@ pub struct WisprWitnessDiagnostics {
     http_status: Option<u16>,
     grpc_status: Option<u32>,
     content_type: Option<String>,
+    bearer_state: BearerState,
+    permission_category: PermissionCategory,
     response_frame_count: usize,
     response_frame_lengths: Vec<usize>,
     protobuf_top_level_tag_histograms: Vec<Vec<WisprProtobufTagCount>>,
@@ -447,18 +477,26 @@ impl WisprWitnessDiagnostics {
             http_status: None,
             grpc_status: None,
             content_type: None,
+            bearer_state: BearerState::Unknown,
+            permission_category: PermissionCategory::Absent,
             response_frame_count: 0,
             response_frame_lengths: Vec::new(),
             protobuf_top_level_tag_histograms: Vec::new(),
         }
     }
 
-    fn from_response(stage: &'static str, response: &WisprGrpcStreamResponse) -> Self {
+    fn from_response(
+        stage: &'static str,
+        bearer_state: BearerState,
+        response: &WisprGrpcStreamResponse,
+    ) -> Self {
         Self {
             local_stage: stage,
             http_status: response.http_status,
             grpc_status: response.grpc_status,
             content_type: response.content_type.clone(),
+            bearer_state,
+            permission_category: response.permission_category,
             response_frame_count: response.messages.len(),
             response_frame_lengths: response.messages.iter().map(Vec::len).collect(),
             protobuf_top_level_tag_histograms: response
@@ -467,6 +505,29 @@ impl WisprWitnessDiagnostics {
                 .map(|message| protobuf_top_level_tag_histogram(message))
                 .collect(),
         }
+    }
+}
+
+fn grpc_message_permission_category(value: Option<&str>) -> PermissionCategory {
+    let Some(value) = value else {
+        return PermissionCategory::Absent;
+    };
+    let value = value.to_ascii_lowercase();
+    if value.contains("baseten")
+        && (value.contains("api-key") || value.contains("api key") || value.contains("apikey"))
+    {
+        PermissionCategory::BasetenApiKey
+    } else if value.contains("model") && value.contains("entitlement") {
+        PermissionCategory::ModelEntitlement
+    } else if value.contains("bearer") {
+        PermissionCategory::BearerAuth
+    } else if ["permission", "unauthorized", "forbidden", "denied"]
+        .into_iter()
+        .any(|indicator| value.contains(indicator))
+    {
+        PermissionCategory::GenericPermission
+    } else {
+        PermissionCategory::Absent
     }
 }
 
@@ -543,6 +604,12 @@ impl WisprGrpcStreamingBoundary for ReqwestWisprGrpcStreamingBoundary {
             .get("grpc-status")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse().ok());
+        let permission_category = grpc_message_permission_category(
+            response
+                .headers()
+                .get("grpc-message")
+                .and_then(|value| value.to_str().ok()),
+        );
         let bytes = response
             .bytes()
             .map_err(|_| ProviderAttemptState::TransientFailure)?;
@@ -551,6 +618,7 @@ impl WisprGrpcStreamingBoundary for ReqwestWisprGrpcStreamingBoundary {
             http_status,
             grpc_status,
             content_type,
+            permission_category,
         })
     }
 }
@@ -686,6 +754,11 @@ async fn native_grpc_stream(
         .get("grpc-status")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse().ok());
+    let mut permission_category = grpc_message_permission_category(
+        head.headers
+            .get("grpc-message")
+            .and_then(|value| value.to_str().ok()),
+    );
     let mut flow_control = body.flow_control().clone();
     let mut bytes = Vec::new();
     while let Some(chunk) = body.data().await {
@@ -706,6 +779,14 @@ async fn native_grpc_stream(
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse().ok())
             .or(grpc_status);
+        let trailer_permission_category = grpc_message_permission_category(
+            trailers
+                .get("grpc-message")
+                .and_then(|value| value.to_str().ok()),
+        );
+        if trailer_permission_category != PermissionCategory::Absent {
+            permission_category = trailer_permission_category;
+        }
     }
     checkpoint.advance("response-trailers");
     Ok(WisprGrpcStreamResponse {
@@ -713,6 +794,7 @@ async fn native_grpc_stream(
         http_status,
         grpc_status,
         content_type,
+        permission_category,
     })
 }
 
@@ -910,6 +992,7 @@ fn local_secret(secret_name: &str) -> Result<String, ProviderAttemptState> {
 struct DesktopWisprSession {
     access_token: String,
     user_id: String,
+    bearer_state: BearerState,
 }
 
 /// Reads the authenticated desktop session through an already-open descriptor.
@@ -931,7 +1014,7 @@ impl InheritedFdDesktopWisprSession {
         })
     }
 
-    fn session(&self) -> Result<(String, String), ProviderAttemptState> {
+    fn session(&self) -> Result<(String, String, BearerState), ProviderAttemptState> {
         let mut cached = self
             .session
             .lock()
@@ -941,13 +1024,17 @@ impl InheritedFdDesktopWisprSession {
             *cached = Some(desktop_session_from_json(&bytes)?);
         }
         let session = cached.as_ref().expect("desktop session was populated");
-        Ok((session.access_token.clone(), session.user_id.clone()))
+        Ok((
+            session.access_token.clone(),
+            session.user_id.clone(),
+            session.bearer_state,
+        ))
     }
 }
 
 impl WisprSessionSource for InheritedFdDesktopWisprSession {
     fn refresh_session(&self) -> Result<WisprSession, ProviderAttemptState> {
-        let (access_token, _) = self.session()?;
+        let (access_token, _, _) = self.session()?;
         Ok(WisprSession::new(
             access_token,
             Instant::now() + WISPR_SESSION_CACHE_LIFETIME,
@@ -957,7 +1044,7 @@ impl WisprSessionSource for InheritedFdDesktopWisprSession {
 
 impl WisprWireIdentity for InheritedFdDesktopWisprSession {
     fn user_id(&self) -> Result<String, ProviderAttemptState> {
-        let (_, user_id) = self.session()?;
+        let (_, user_id, _) = self.session()?;
         Ok(user_id)
     }
 
@@ -995,10 +1082,80 @@ fn desktop_session_from_json(bytes: &[u8]) -> Result<DesktopWisprSession, Provid
     if access_token.is_empty() || user_id.is_empty() {
         return Err(ProviderAttemptState::Unavailable);
     }
+    let bearer_state = desktop_bearer_state(&document, &access_token, SystemTime::now());
+    drop(document);
     Ok(DesktopWisprSession {
         access_token,
         user_id,
+        bearer_state,
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DesktopAuthProvider {
+    Supabase,
+    Workos,
+}
+
+fn desktop_bearer_state(
+    document: &serde_json::Value,
+    access_token: &str,
+    observed_at: SystemTime,
+) -> BearerState {
+    let provider = desktop_auth_provider(document, access_token);
+    let Some(expiry_milliseconds) = desktop_expiry_milliseconds(document, access_token, provider)
+    else {
+        return BearerState::Unknown;
+    };
+    let Ok(now_milliseconds) = observed_at.duration_since(UNIX_EPOCH) else {
+        return BearerState::Unknown;
+    };
+    let now_milliseconds = now_milliseconds.as_millis();
+    if expiry_milliseconds <= now_milliseconds {
+        return BearerState::Expired;
+    }
+    let refresh_window_milliseconds = match provider {
+        DesktopAuthProvider::Supabase => 90_000,
+        DesktopAuthProvider::Workos => 120_000,
+    };
+    if expiry_milliseconds - now_milliseconds <= refresh_window_milliseconds {
+        BearerState::NearExpiry
+    } else {
+        BearerState::Fresh
+    }
+}
+
+fn desktop_auth_provider(document: &serde_json::Value, access_token: &str) -> DesktopAuthProvider {
+    if first_json_string(document, "authProviderId")
+        .is_some_and(|provider| provider.eq_ignore_ascii_case("workos"))
+        || jwt_issuer_is_workos(access_token)
+    {
+        DesktopAuthProvider::Workos
+    } else {
+        DesktopAuthProvider::Supabase
+    }
+}
+
+fn desktop_expiry_milliseconds(
+    document: &serde_json::Value,
+    access_token: &str,
+    provider: DesktopAuthProvider,
+) -> Option<u128> {
+    let session_expiry = match provider {
+        DesktopAuthProvider::Supabase => first_json_u64(document, "expires_at")
+            .and_then(seconds_to_milliseconds)
+            .or_else(|| jwt_claim_u64(access_token, "exp").and_then(seconds_to_milliseconds))
+            .or_else(|| first_json_u64(document, "expiresAt").map(u128::from)),
+        DesktopAuthProvider::Workos => first_json_u64(document, "expiresAt")
+            .map(u128::from)
+            .or_else(|| first_json_u64(document, "expires_at").and_then(seconds_to_milliseconds))
+            .or_else(|| jwt_claim_u64(access_token, "exp").and_then(seconds_to_milliseconds)),
+    };
+    session_expiry
+}
+
+fn seconds_to_milliseconds(seconds: u64) -> Option<u128> {
+    u128::from(seconds).checked_mul(1_000)
 }
 
 fn desktop_user_identifier(document: &serde_json::Value) -> Option<String> {
@@ -1037,7 +1194,39 @@ fn first_json_string(document: &serde_json::Value, key: &str) -> Option<String> 
     }
 }
 
+fn first_json_u64(document: &serde_json::Value, key: &str) -> Option<u64> {
+    match document {
+        serde_json::Value::Object(fields) => fields
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| fields.values().find_map(|value| first_json_u64(value, key))),
+        serde_json::Value::Array(values) => {
+            values.iter().find_map(|value| first_json_u64(value, key))
+        }
+        _ => None,
+    }
+}
+
 fn jwt_subject(token: &str) -> Option<String> {
+    jwt_claim_string(token, "sub")
+}
+
+fn jwt_issuer_is_workos(token: &str) -> bool {
+    jwt_claim_string(token, "iss").is_some_and(|issuer| {
+        let issuer = issuer.to_ascii_lowercase();
+        issuer.contains("workos") || issuer.contains("authkit")
+    })
+}
+
+fn jwt_claim_string(token: &str, claim: &str) -> Option<String> {
+    jwt_payload(token)?.get(claim)?.as_str().map(str::to_owned)
+}
+
+fn jwt_claim_u64(token: &str, claim: &str) -> Option<u64> {
+    jwt_payload(token)?.get(claim)?.as_u64()
+}
+
+fn jwt_payload(token: &str) -> Option<serde_json::Value> {
     use base64::{
         engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
         Engine as _,
@@ -1048,8 +1237,7 @@ fn jwt_subject(token: &str) -> Option<String> {
         .decode(encoded_payload)
         .or_else(|_| URL_SAFE.decode(encoded_payload))
         .ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-    value.get("sub")?.as_str().map(str::to_owned)
+    serde_json::from_slice(&payload).ok()
 }
 
 /// Non-user desktop backend material selected from a packaged app bundle. The
@@ -1680,7 +1868,7 @@ pub fn sandbox_wispr_witness_checkpointed(
         Err(_) => return WisprWitnessDiagnostics::at("bundle-descriptor"),
     };
     checkpoint.advance("bundle-descriptor");
-    let (access_token, _) = match session.session() {
+    let (access_token, _, bearer_state) = match session.session() {
         Ok(session) => session,
         Err(_) => return WisprWitnessDiagnostics::at("session"),
     };
@@ -1729,11 +1917,14 @@ pub fn sandbox_wispr_witness_checkpointed(
         messages,
     };
     match NativeWisprGrpcStreamingBoundary.stream_checkpointed(call, checkpoint) {
-        Ok(response) => response.diagnostics(if response.provider_state().is_ok() {
-            "complete"
-        } else {
-            "response"
-        }),
+        Ok(response) => response.diagnostics(
+            if response.provider_state().is_ok() {
+                "complete"
+            } else {
+                "response"
+            },
+            bearer_state,
+        ),
         Err(_) => WisprWitnessDiagnostics::at(checkpoint.stage()),
     }
 }
@@ -1811,11 +2002,10 @@ mod tests {
         assert_eq!(calls[0].host(), "inference.wisprflow.com");
         assert_eq!(calls[0].method(), TRANSCRIBE_STREAM_PATH);
         assert_eq!(calls[0].messages().len(), 4);
-        assert!(
-            calls[0].metadata().iter().any(
-                |(name, value)| *name == "authorization" && value == "Bearer synthetic-session"
-            )
-        );
+        assert!(calls[0]
+            .metadata()
+            .iter()
+            .any(|(name, value)| *name == "authorization" && value == "Bearer synthetic-session"));
     }
 
     #[test]
@@ -1866,18 +2056,21 @@ mod tests {
             http_status: Some(200),
             grpc_status: Some(0),
             content_type: Some("application/grpc".into()),
+            permission_category: PermissionCategory::Absent,
         };
 
-        let value =
-            serde_json::to_value(response.diagnostics("complete")).expect("diagnostics serialize");
+        let value = serde_json::to_value(response.diagnostics("complete", BearerState::Unknown))
+            .expect("diagnostics serialize");
         let object = value.as_object().expect("diagnostics are an object");
         assert_eq!(
             object.keys().map(String::as_str).collect::<Vec<_>>(),
             vec![
+                "bearer_state",
                 "content_type",
                 "grpc_status",
                 "http_status",
                 "local_stage",
+                "permission_category",
                 "protobuf_top_level_tag_histograms",
                 "response_frame_count",
                 "response_frame_lengths",
@@ -1892,6 +2085,116 @@ mod tests {
             object["protobuf_top_level_tag_histograms"],
             serde_json::json!([[{"tag": 1, "count": 1}]]),
         );
+    }
+
+    #[test]
+    fn sandbox_diagnostics_reduce_authorization_evidence_to_closed_categories() {
+        let observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let workos_session = serde_json::json!({
+            "authProviderId": "workos",
+            "expiresAt": 2_000_090_000_u64,
+        });
+        let supabase_session = serde_json::json!({
+            "expires_at": 2_000_089_u64,
+        });
+
+        assert_eq!(
+            desktop_bearer_state(&workos_session, "synthetic", observed_at),
+            BearerState::NearExpiry,
+        );
+        assert_eq!(
+            desktop_bearer_state(&supabase_session, "synthetic", observed_at),
+            BearerState::NearExpiry,
+        );
+        assert_eq!(
+            desktop_bearer_state(
+                &serde_json::json!({"expires_at": 2_000_091_u64}),
+                "synthetic",
+                observed_at,
+            ),
+            BearerState::Fresh,
+        );
+        assert_eq!(
+            desktop_bearer_state(
+                &serde_json::json!({"authProviderId": "workos", "expiresAt": 2_000_000_000_u64}),
+                "synthetic",
+                observed_at,
+            ),
+            BearerState::Expired,
+        );
+        assert_eq!(
+            desktop_bearer_state(&serde_json::json!({}), "synthetic", observed_at),
+            BearerState::Unknown,
+        );
+        assert_eq!(
+            desktop_auth_provider(
+                &serde_json::json!({}),
+                &synthetic_jwt_with_issuer("https://authkit.example.invalid"),
+            ),
+            DesktopAuthProvider::Workos,
+        );
+        assert_eq!(
+            desktop_auth_provider(&serde_json::json!({}), "synthetic"),
+            DesktopAuthProvider::Supabase,
+        );
+        assert_eq!(
+            grpc_message_permission_category(Some("BASEten API-Key rejected")),
+            PermissionCategory::BasetenApiKey,
+        );
+        assert_eq!(
+            grpc_message_permission_category(Some("model entitlement denied")),
+            PermissionCategory::ModelEntitlement,
+        );
+        assert_eq!(
+            grpc_message_permission_category(Some("permission denied")),
+            PermissionCategory::GenericPermission,
+        );
+        assert_eq!(
+            grpc_message_permission_category(None),
+            PermissionCategory::Absent,
+        );
+
+        let response = WisprGrpcStreamResponse {
+            messages: Vec::new(),
+            http_status: Some(403),
+            grpc_status: Some(7),
+            content_type: Some("application/grpc".into()),
+            permission_category: grpc_message_permission_category(Some("Bearer rejected")),
+        };
+        let diagnostics = serde_json::to_value(response.diagnostics(
+            "response",
+            desktop_bearer_state(&workos_session, "synthetic", observed_at),
+        ))
+        .expect("diagnostics serialize");
+        let object = diagnostics.as_object().expect("diagnostics are an object");
+        assert_eq!(
+            object.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "bearer_state",
+                "content_type",
+                "grpc_status",
+                "http_status",
+                "local_stage",
+                "permission_category",
+                "protobuf_top_level_tag_histograms",
+                "response_frame_count",
+                "response_frame_lengths",
+            ],
+        );
+        assert_eq!(object["bearer_state"], "near-expiry");
+        assert_eq!(object["permission_category"], "bearer-auth");
+        assert!(diagnostics.get("grpc_message").is_none());
+        assert!(!diagnostics.to_string().contains("Bearer rejected"));
+    }
+
+    fn synthetic_jwt_with_issuer(issuer: &str) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let payload = serde_json::json!({"iss": issuer});
+        format!(
+            "synthetic.{}.signature",
+            URL_SAFE_NO_PAD.encode(payload.to_string())
+        )
     }
 
     #[test]
@@ -2144,6 +2447,7 @@ mod tests {
                 http_status: Some(200),
                 grpc_status: Some(0),
                 content_type: Some("application/grpc".into()),
+                permission_category: PermissionCategory::Absent,
             })
         }
     }

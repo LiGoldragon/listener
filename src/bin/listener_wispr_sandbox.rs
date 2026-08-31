@@ -1,15 +1,15 @@
 use std::{
     env,
     io::Write,
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{catch_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     process::ExitCode,
 };
 
 use listener::{
-    RecordingAudioFormat, RecordingInputSource, RecordingLogHeader, RecordingLogWriter,
-    RecordingStartTime, WisprWitnessCheckpoint, WisprWitnessDiagnostics,
-    sandbox_wispr_witness_checkpointed,
+    sandbox_wispr_witness_checkpointed, RecordingAudioFormat, RecordingInputSource,
+    RecordingLogHeader, RecordingLogWriter, RecordingStartTime, WisprWitnessCheckpoint,
+    WisprWitnessDiagnostics,
 };
 use signal_listener::CaptureSession;
 
@@ -109,7 +109,7 @@ fn finish_with_diagnostics(
         ),
     };
     let contents = serde_json::to_vec(&diagnostics).unwrap_or_else(|_| {
-        br#"{"local_stage":"diagnostics","http_status":null,"grpc_status":null,"content_type":null,"response_frame_count":0,"response_frame_lengths":[],"protobuf_top_level_tag_histograms":[]}"#.to_vec()
+        br#"{"local_stage":"diagnostics","http_status":null,"grpc_status":null,"content_type":null,"bearer_state":"unknown","permission_category":"absent","response_frame_count":0,"response_frame_lengths":[],"protobuf_top_level_tag_histograms":[]}"#.to_vec()
     });
     write_diagnostics_atomically(diagnostics_path, &contents)?;
     outcome
@@ -185,8 +185,10 @@ mod tests {
         assert_eq!(diagnostics["local_stage"], "synthetic-audio");
         assert_eq!(
             diagnostics.as_object().expect("diagnostics object").len(),
-            7
+            9
         );
+        assert_eq!(diagnostics["bearer_state"], "unknown");
+        assert_eq!(diagnostics["permission_category"], "absent");
         assert!(diagnostics.get("error").is_none());
         assert!(diagnostics.get("message").is_none());
     }
@@ -208,5 +210,7 @@ mod tests {
         .expect("diagnostics are valid JSON");
         assert_eq!(diagnostics["local_stage"], "tcp-dial-attempted");
         assert_eq!(diagnostics["http_status"], serde_json::Value::Null);
+        assert_eq!(diagnostics["bearer_state"], "unknown");
+        assert_eq!(diagnostics["permission_category"], "absent");
     }
 }
