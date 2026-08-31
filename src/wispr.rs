@@ -338,15 +338,7 @@ impl WisprWireIdentity for GopassWisprWireIdentity {
     }
 
     fn fresh_request_identifiers(&self) -> Result<WisprRequestIdentifiers, ProviderAttemptState> {
-        let sequence = NEXT_WISPR_REQUEST_IDENTIFIER.fetch_add(1, Ordering::Relaxed);
-        let epoch_nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| ProviderAttemptState::Unavailable)?
-            .as_nanos();
-        Ok(WisprRequestIdentifiers::new(
-            format!("listener-{epoch_nanos}-{sequence}"),
-            format!("listener-request-{epoch_nanos}-{sequence}"),
-        ))
+        WisprRequestIdentifiers::desktop()
     }
 }
 
@@ -377,8 +369,31 @@ fn uuid_from_entropy(first: u128, second: u128) -> String {
         (value >> 80) as u16,
         ((value >> 64) & 0x0fff) as u16,
         ((value >> 48) & 0x0fff) as u16,
-        value & 0x0000_0000_0000_ffff_ffff_ffff_ffff
+        value & 0x0000_0000_0000_0000_0000_ffff_ffff_ffff
     )
+}
+
+fn is_uuid_shape(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23) && byte == b'-'
+                || !matches!(index, 8 | 13 | 18 | 23) && byte.is_ascii_hexdigit()
+        })
+}
+
+fn metadata_uuid_state(
+    user_id: Option<&str>,
+    identifiers: &WisprRequestIdentifiers,
+) -> MetadataUuidState {
+    if !user_id.is_some_and(is_uuid_shape) {
+        MetadataUuidState::UserInvalid
+    } else if !is_uuid_shape(&identifiers.session_id) {
+        MetadataUuidState::SessionInvalid
+    } else if !is_uuid_shape(&identifiers.request_id) {
+        MetadataUuidState::RequestInvalid
+    } else {
+        MetadataUuidState::AllValid
+    }
 }
 
 impl WisprRequestIdentifiers {
@@ -482,6 +497,26 @@ enum BearerState {
     Unknown,
 }
 
+/// The only session-identity provenance allowed to cross the isolated
+/// witness boundary. It never carries an identifier value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum MetadataUserSource {
+    SupabaseUserId,
+    WorkosExternalId,
+    Unknown,
+}
+
+/// A closed validation result for the Init metadata identifiers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum MetadataUuidState {
+    AllValid,
+    UserInvalid,
+    SessionInvalid,
+    RequestInvalid,
+}
+
 /// The only authorization-message classification allowed to cross the sandbox
 /// boundary. The original gRPC message is consumed locally and discarded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -507,6 +542,8 @@ pub struct WisprWitnessDiagnostics {
     grpc_status: Option<u32>,
     content_type: Option<String>,
     bearer_state: BearerState,
+    metadata_user_source: MetadataUserSource,
+    metadata_uuid_state: MetadataUuidState,
     permission_category: PermissionCategory,
     response_frame_count: usize,
     response_frame_lengths: Vec<usize>,
@@ -599,6 +636,8 @@ impl WisprWitnessDiagnostics {
             grpc_status: None,
             content_type: None,
             bearer_state: BearerState::Unknown,
+            metadata_user_source: MetadataUserSource::Unknown,
+            metadata_uuid_state: MetadataUuidState::UserInvalid,
             permission_category: PermissionCategory::Absent,
             response_frame_count: 0,
             response_frame_lengths: Vec::new(),
@@ -623,6 +662,8 @@ impl WisprWitnessDiagnostics {
             grpc_status: response.grpc_status,
             content_type: response.content_type.clone(),
             bearer_state,
+            metadata_user_source: MetadataUserSource::Unknown,
+            metadata_uuid_state: MetadataUuidState::UserInvalid,
             permission_category: response.permission_category,
             response_frame_count: response.messages.len(),
             response_frame_lengths: response
@@ -638,6 +679,16 @@ impl WisprWitnessDiagnostics {
                 .map(|message| protobuf_top_level_tag_histogram(message))
                 .collect(),
         }
+    }
+
+    fn with_metadata_identity(
+        mut self,
+        metadata_user_source: MetadataUserSource,
+        metadata_uuid_state: MetadataUuidState,
+    ) -> Self {
+        self.metadata_user_source = metadata_user_source;
+        self.metadata_uuid_state = metadata_uuid_state;
+        self
     }
 }
 
@@ -1128,8 +1179,10 @@ fn local_secret(secret_name: &str) -> Result<String, ProviderAttemptState> {
 /// submission is being assembled.
 struct DesktopWisprSession {
     access_token: String,
-    user_id: String,
+    user_id: Option<String>,
     bearer_state: BearerState,
+    metadata_user_source: MetadataUserSource,
+    metadata_uuid_state: MetadataUuidState,
 }
 
 /// Reads the authenticated desktop session through an already-open descriptor.
@@ -1151,7 +1204,18 @@ impl InheritedFdDesktopWisprSession {
         })
     }
 
-    fn session(&self) -> Result<(String, String, BearerState), ProviderAttemptState> {
+    fn session(
+        &self,
+    ) -> Result<
+        (
+            String,
+            Option<String>,
+            BearerState,
+            MetadataUserSource,
+            MetadataUuidState,
+        ),
+        ProviderAttemptState,
+    > {
         let mut cached = self
             .session
             .lock()
@@ -1165,13 +1229,15 @@ impl InheritedFdDesktopWisprSession {
             session.access_token.clone(),
             session.user_id.clone(),
             session.bearer_state,
+            session.metadata_user_source,
+            session.metadata_uuid_state,
         ))
     }
 }
 
 impl WisprSessionSource for InheritedFdDesktopWisprSession {
     fn refresh_session(&self) -> Result<WisprSession, ProviderAttemptState> {
-        let (access_token, _, _) = self.session()?;
+        let (access_token, _, _, _, _) = self.session()?;
         Ok(WisprSession::new(
             access_token,
             Instant::now() + WISPR_SESSION_CACHE_LIFETIME,
@@ -1181,8 +1247,11 @@ impl WisprSessionSource for InheritedFdDesktopWisprSession {
 
 impl WisprWireIdentity for InheritedFdDesktopWisprSession {
     fn user_id(&self) -> Result<String, ProviderAttemptState> {
-        let (_, user_id, _) = self.session()?;
-        Ok(user_id)
+        let (_, user_id, _, _, metadata_uuid_state) = self.session()?;
+        if metadata_uuid_state != MetadataUuidState::AllValid {
+            return Err(ProviderAttemptState::Unavailable);
+        }
+        user_id.ok_or(ProviderAttemptState::Unavailable)
     }
 
     fn fresh_request_identifiers(&self) -> Result<WisprRequestIdentifiers, ProviderAttemptState> {
@@ -1213,18 +1282,23 @@ fn desktop_session_from_json(bytes: &[u8]) -> Result<DesktopWisprSession, Provid
     let access_token = first_json_string(&document, "access_token")
         .or_else(|| first_json_string(&document, "accessToken"))
         .ok_or(ProviderAttemptState::Unavailable)?;
-    let user_id = desktop_user_identifier(&document)
-        .or_else(|| jwt_subject(&access_token))
-        .ok_or(ProviderAttemptState::Unavailable)?;
-    if access_token.is_empty() || user_id.is_empty() {
+    if access_token.is_empty() {
         return Err(ProviderAttemptState::Unavailable);
     }
+    let (metadata_user_source, candidate_user_id) =
+        desktop_metadata_user_identifier(&document, &access_token);
+    let (user_id, metadata_uuid_state) = match candidate_user_id {
+        Some(user_id) if is_uuid_shape(&user_id) => (Some(user_id), MetadataUuidState::AllValid),
+        _ => (None, MetadataUuidState::UserInvalid),
+    };
     let bearer_state = desktop_bearer_state(&document, &access_token, SystemTime::now());
     drop(document);
     Ok(DesktopWisprSession {
         access_token,
         user_id,
         bearer_state,
+        metadata_user_source,
+        metadata_uuid_state,
     })
 }
 
@@ -1295,19 +1369,29 @@ fn seconds_to_milliseconds(seconds: u64) -> Option<u128> {
     u128::from(seconds).checked_mul(1_000)
 }
 
-fn desktop_user_identifier(document: &serde_json::Value) -> Option<String> {
-    first_json_string(document, "user_id")
-        .or_else(|| first_json_string(document, "userId"))
-        .or_else(|| {
-            ["user", "currentUser", "profile", "identity"]
-                .into_iter()
-                .filter_map(|key| document.get(key))
-                .find_map(|value| {
-                    first_json_string(value, "id")
-                        .or_else(|| first_json_string(value, "user_id"))
-                        .or_else(|| first_json_string(value, "userId"))
-                })
-        })
+fn desktop_metadata_user_identifier(
+    document: &serde_json::Value,
+    access_token: &str,
+) -> (MetadataUserSource, Option<String>) {
+    match desktop_auth_provider(document, access_token) {
+        DesktopAuthProvider::Supabase => (
+            MetadataUserSource::SupabaseUserId,
+            document
+                .get("user")
+                .and_then(|user| user.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        ),
+        DesktopAuthProvider::Workos => (
+            MetadataUserSource::WorkosExternalId,
+            jwt_claim_string(access_token, "urn:wispr:user_external_id").or_else(|| {
+                jwt_payload(access_token)
+                    .and_then(|payload| payload.get("identity").cloned())
+                    .and_then(|identity| identity.get("id").cloned())
+                    .and_then(|id| id.as_str().map(str::to_owned))
+            }),
+        ),
+    }
 }
 
 fn first_json_string(document: &serde_json::Value, key: &str) -> Option<String> {
@@ -1342,10 +1426,6 @@ fn first_json_u64(document: &serde_json::Value, key: &str) -> Option<u64> {
         }
         _ => None,
     }
-}
-
-fn jwt_subject(token: &str) -> Option<String> {
-    jwt_claim_string(token, "sub")
 }
 
 fn jwt_issuer_is_workos(token: &str) -> bool {
@@ -2256,7 +2336,8 @@ pub fn sandbox_wispr_witness_checkpointed(
         }
     };
     checkpoint.advance("bundle-descriptor");
-    let (access_token, _, bearer_state) = match session.session() {
+    let (access_token, user_id, bearer_state, metadata_user_source, session_uuid_state) =
+        match session.session() {
         Ok(session) => session,
         Err(_) => {
             return WisprWitnessDiagnostics::at("session", route, auth_probe, model_variant);
@@ -2278,12 +2359,6 @@ pub fn sandbox_wispr_witness_checkpointed(
         return WisprWitnessDiagnostics::at("audio-validation", route, auth_probe, model_variant);
     }
     checkpoint.advance("audio-validation");
-    let user_id = match session.user_id() {
-        Ok(user_id) => user_id,
-        Err(_) => {
-            return WisprWitnessDiagnostics::at("session", route, auth_probe, model_variant);
-        }
-    };
     let identifiers = match session.fresh_request_identifiers() {
         Ok(identifiers) => identifiers,
         Err(_) => {
@@ -2296,6 +2371,17 @@ pub fn sandbox_wispr_witness_checkpointed(
         }
     };
     checkpoint.advance("request-identifiers");
+    let metadata_uuid_state = if session_uuid_state == MetadataUuidState::AllValid {
+        metadata_uuid_state(user_id.as_deref(), &identifiers)
+    } else {
+        session_uuid_state
+    };
+    if metadata_uuid_state != MetadataUuidState::AllValid {
+        return WisprWitnessDiagnostics::at("metadata-identity", route, auth_probe, model_variant)
+            .with_metadata_identity(metadata_user_source, metadata_uuid_state);
+    }
+    let user_id = user_id.expect("validated metadata user identifier");
+    checkpoint.advance("metadata-identity");
     let backend = match backend.backend() {
         Ok(backend) => backend,
         Err(_) => {
@@ -2342,13 +2428,15 @@ pub fn sandbox_wispr_witness_checkpointed(
             auth_probe,
             model_variant,
             bearer_state,
-        ),
+        )
+        .with_metadata_identity(metadata_user_source, metadata_uuid_state),
         Err(_) => WisprWitnessDiagnostics::at(
             checkpoint.stage(),
             route,
             auth_probe,
             model_variant,
-        ),
+        )
+        .with_metadata_identity(metadata_user_source, metadata_uuid_state),
     }
 }
 
@@ -2518,6 +2606,76 @@ mod tests {
     }
 
     #[test]
+    fn desktop_metadata_identity_uses_canonical_sources_and_uuid_identifiers() {
+        let expected_supabase = "00000000-0000-4000-8000-000000000011";
+        let supabase = serde_json::json!({
+            "access_token": "synthetic",
+            "user_id": "not-the-nested-user-id",
+            "user": {"id": expected_supabase},
+        });
+        assert_eq!(
+            desktop_session_from_json(supabase.to_string().as_bytes())
+                .expect("synthetic Supabase session")
+                .user_id,
+            Some(expected_supabase.into()),
+        );
+
+        let expected_workos = "00000000-0000-4000-8000-000000000012";
+        let workos = serde_json::json!({
+            "authProviderId": "workos",
+            "accessToken": synthetic_jwt_with_claims(serde_json::json!({
+                "urn:wispr:user_external_id": expected_workos,
+                "sub": "native-workos-sub-decoy",
+            })),
+        });
+        assert_eq!(
+            desktop_session_from_json(workos.to_string().as_bytes())
+                .expect("synthetic WorkOS session")
+                .user_id,
+            Some(expected_workos.into()),
+        );
+
+        let sub_only_workos = serde_json::json!({
+            "authProviderId": "workos",
+            "accessToken": synthetic_jwt_with_claims(serde_json::json!({
+                "sub": "native-workos-sub-decoy",
+            })),
+        });
+        let rejected = desktop_session_from_json(sub_only_workos.to_string().as_bytes())
+            .expect("synthetic session preserves only a closed rejection state");
+        assert!(rejected.user_id.is_none());
+        assert_eq!(
+            rejected.metadata_user_source,
+            MetadataUserSource::WorkosExternalId
+        );
+        assert_eq!(rejected.metadata_uuid_state, MetadataUuidState::UserInvalid);
+
+        let identifiers = GopassWisprWireIdentity::default()
+            .fresh_request_identifiers()
+            .expect("fresh opaque identifiers");
+        assert!(is_uuid_shape(&identifiers.session_id));
+        assert!(is_uuid_shape(&identifiers.request_id));
+        assert_eq!(
+            metadata_uuid_state(Some(expected_supabase), &identifiers),
+            MetadataUuidState::AllValid
+        );
+        assert_eq!(
+            metadata_uuid_state(
+                Some(expected_supabase),
+                &WisprRequestIdentifiers::new("non-uuid".into(), identifiers.request_id.clone()),
+            ),
+            MetadataUuidState::SessionInvalid
+        );
+        assert_eq!(
+            metadata_uuid_state(
+                Some(expected_supabase),
+                &WisprRequestIdentifiers::new(identifiers.session_id.clone(), "non-uuid".into()),
+            ),
+            MetadataUuidState::RequestInvalid
+        );
+    }
+
+    #[test]
     fn witness_diagnostics_retain_only_the_allowed_response_structure() {
         let response = WisprGrpcStreamResponse {
             messages: vec![synthetic_result_response(
@@ -2536,6 +2694,10 @@ mod tests {
             WisprWitnessAuthProbe::OmitBasetenAuthorization,
             WisprWitnessModelVariant::VoxtralHttp,
             BearerState::Unknown,
+        )
+        .with_metadata_identity(
+            MetadataUserSource::WorkosExternalId,
+            MetadataUuidState::AllValid,
         ))
         .expect("diagnostics serialize");
         let object = value.as_object().expect("diagnostics are an object");
@@ -2548,6 +2710,8 @@ mod tests {
                 "grpc_status",
                 "http_status",
                 "local_stage",
+                "metadata_user_source",
+                "metadata_uuid_state",
                 "model_variant",
                 "permission_category",
                 "protobuf_top_level_tag_histograms",
@@ -2558,6 +2722,8 @@ mod tests {
         );
         assert_eq!(object["auth_probe"], "omit-baseten-authorization");
         assert_eq!(object["model_variant"], "voxtral-http");
+        assert_eq!(object["metadata_user_source"], "workos-external-id");
+        assert_eq!(object["metadata_uuid_state"], "all-valid");
         assert_eq!(object["route"], "edge-proxy");
         let rendered = value.to_string();
         assert!(!rendered.contains("response text must not cross"));
@@ -2662,6 +2828,8 @@ mod tests {
                 "grpc_status",
                 "http_status",
                 "local_stage",
+                "metadata_user_source",
+                "metadata_uuid_state",
                 "model_variant",
                 "permission_category",
                 "protobuf_top_level_tag_histograms",
@@ -2672,6 +2840,8 @@ mod tests {
         );
         assert_eq!(object["bearer_state"], "near-expiry");
         assert_eq!(object["permission_category"], "bearer-auth");
+        assert_eq!(object["metadata_user_source"], "unknown");
+        assert_eq!(object["metadata_uuid_state"], "user-invalid");
         assert!(diagnostics.get("grpc_message").is_none());
         assert!(!diagnostics.to_string().contains("Bearer rejected"));
     }
@@ -2684,6 +2854,12 @@ mod tests {
             "synthetic.{}.signature",
             URL_SAFE_NO_PAD.encode(payload.to_string())
         )
+    }
+
+    fn synthetic_jwt_with_claims(claims: serde_json::Value) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        format!("synthetic.{}.signature", URL_SAFE_NO_PAD.encode(claims.to_string()))
     }
 
     #[test]

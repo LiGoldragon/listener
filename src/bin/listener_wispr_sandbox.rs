@@ -179,7 +179,7 @@ fn finish_with_diagnostics(
         ),
     };
     let contents = serde_json::to_vec(&diagnostics).unwrap_or_else(|_| {
-        br#"{"local_stage":"diagnostics","route":"default-direct","auth_probe":"full","model_variant":"packaged-default","http_status":null,"grpc_status":null,"content_type":null,"bearer_state":"unknown","permission_category":"absent","response_frame_count":0,"response_frame_lengths":[],"protobuf_top_level_tag_histograms":[]}"#.to_vec()
+        br#"{"local_stage":"diagnostics","route":"default-direct","auth_probe":"full","model_variant":"packaged-default","http_status":null,"grpc_status":null,"content_type":null,"bearer_state":"unknown","metadata_user_source":"unknown","metadata_uuid_state":"user-invalid","permission_category":"absent","response_frame_count":0,"response_frame_lengths":[],"protobuf_top_level_tag_histograms":[]}"#.to_vec()
     });
     write_diagnostics_atomically(diagnostics_path, &contents)?;
     outcome
@@ -359,13 +359,15 @@ mod tests {
         assert_eq!(diagnostics["local_stage"], "synthetic-audio");
         assert_eq!(
             diagnostics.as_object().expect("diagnostics object").len(),
-            12
+            14
         );
         assert_eq!(diagnostics["bearer_state"], "unknown");
         assert_eq!(diagnostics["permission_category"], "absent");
         assert_eq!(diagnostics["route"], "default-direct");
         assert_eq!(diagnostics["auth_probe"], "full");
         assert_eq!(diagnostics["model_variant"], "packaged-default");
+        assert_eq!(diagnostics["metadata_user_source"], "unknown");
+        assert_eq!(diagnostics["metadata_uuid_state"], "user-invalid");
         assert!(diagnostics.get("error").is_none());
         assert!(diagnostics.get("message").is_none());
     }
@@ -404,6 +406,8 @@ mod tests {
         assert_eq!(diagnostics["route"], "edge-proxy");
         assert_eq!(diagnostics["auth_probe"], "omit-bearer");
         assert_eq!(diagnostics["model_variant"], "packaged-default");
+        assert_eq!(diagnostics["metadata_user_source"], "unknown");
+        assert_eq!(diagnostics["metadata_uuid_state"], "user-invalid");
     }
 
     #[test]
