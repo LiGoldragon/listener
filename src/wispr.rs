@@ -1350,8 +1350,7 @@ fn desktop_backend_from_bundle(
 ) -> Result<WisprGrpcBackend, ProviderAttemptState> {
     let source = String::from_utf8_lossy(bytes);
     let model_id = bundled_default_model_id(&source)?;
-    let property = bundled_baseten_property(&source)?;
-    let key = bundled_exported_string(&source, property)?;
+    let key = bundled_module_47708_fo_export(&source)?;
     let baseten_authorization = Some(format!("Api-Key {key}"));
     Ok(match route {
         WisprWitnessRoute::DefaultDirect => WisprGrpcBackend {
@@ -1380,89 +1379,215 @@ fn bundled_default_model_id(source: &str) -> Result<String, ProviderAttemptState
         .ok_or(ProviderAttemptState::ProtocolFailure)
 }
 
-fn bundled_baseten_property(source: &str) -> Result<&str, ProviderAttemptState> {
-    let (_, remaining) = source
-        .split_once("\"baseten-authorization\":`Api-Key ${")
+/// Resolves the static Baseten authorization through the module that owns its
+/// `Fo` export. The opaque value remains entirely inside this constructor.
+fn bundled_module_47708_fo_export(source: &str) -> Result<String, ProviderAttemptState> {
+    let module = bundled_module_47708_body(source)?;
+    let identifier = bundled_module_export_identifier(module, "Fo")?;
+    bundled_module_declared_string(module, identifier)
+}
+
+fn bundled_module_47708_body(source: &str) -> Result<&str, ProviderAttemptState> {
+    let body = if let Some((_, wrapper)) = source.split_once("47708:") {
+        wrapper.split_once("=>{").map(|(_, body)| body)
+    } else if let Some((_, wrapper)) = source.split_once("47708(") {
+        wrapper.split_once("){").map(|(_, body)| body)
+    } else {
+        None
+    }
+    .ok_or(ProviderAttemptState::ProtocolFailure)?;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut braces = 1usize;
+    for (offset, character) in body.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '\"' | '`' => quote = Some(character),
+            '{' => braces += 1,
+            '}' => {
+                braces -= 1;
+                if braces == 0 {
+                    return Ok(&body[..offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(ProviderAttemptState::ProtocolFailure)
+}
+
+fn bundled_module_export_identifier<'a>(
+    module: &'a str,
+    property: &str,
+) -> Result<&'a str, ProviderAttemptState> {
+    let export = format!("{property}:()=>");
+    let (_, remaining) = module
+        .split_once(&export)
         .ok_or(ProviderAttemptState::ProtocolFailure)?;
-    let (expression, _) = remaining
-        .split_once('}')
-        .ok_or(ProviderAttemptState::ProtocolFailure)?;
-    expression
-        .rsplit_once('.')
-        .map(|(_, property)| property)
-        .filter(|property| !property.is_empty())
+    let identifier_length = remaining
+        .chars()
+        .take_while(|character| is_js_identifier_character(*character))
+        .map(char::len_utf8)
+        .sum();
+    remaining
+        .get(..identifier_length)
+        .filter(|identifier| !identifier.is_empty())
         .ok_or(ProviderAttemptState::ProtocolFailure)
 }
 
-/// Offline-only confidence check for the evidence that module 47708 exports
-/// `Fo`. It never participates in runtime bundle construction.
-#[cfg(test)]
-fn verified_bundled_baseten_key(source: &str) -> Result<String, ProviderAttemptState> {
-    let property = bundled_baseten_property(source)?;
-    let extracted = bundled_exported_string(source, property)?;
-    let structural = bundled_structural_fo_export(source)?;
-    if property == "Fo" && extracted == structural {
-        Ok(extracted)
-    } else {
-        Err(ProviderAttemptState::ProtocolFailure)
-    }
-}
-
-#[cfg(test)]
-fn bundled_structural_fo_export(source: &str) -> Result<String, ProviderAttemptState> {
-    let export = source
-        .split_once("Fo:()=>")
-        .ok_or(ProviderAttemptState::ProtocolFailure)?;
-    let export_offset = source.len() - export.1.len() - "Fo:()=>".len();
-    let declaration_scope = source
-        .get(..export_offset)
-        .ok_or(ProviderAttemptState::ProtocolFailure)?;
-    let remaining = export.1;
-    let identifier: String = remaining
-        .chars()
-        .take_while(|character| {
-            character.is_ascii_alphanumeric() || *character == '_' || *character == '$'
-        })
-        .collect();
-    if identifier.is_empty() {
-        return Err(ProviderAttemptState::ProtocolFailure);
-    }
+fn bundled_module_declared_string(
+    module: &str,
+    identifier: &str,
+) -> Result<String, ProviderAttemptState> {
     for declaration in ["const", "let", "var"] {
-        let binding = format!("{declaration} {identifier}=\"");
-        if let Some((_, value)) = declaration_scope.rsplit_once(&binding)
-            && let Some((key, _)) = value.split_once('"')
-            && !key.is_empty()
-        {
-            return Ok(key.to_owned());
+        let mut remaining = module;
+        while let Some(offset) = bundled_top_level_keyword(remaining, declaration) {
+            let declaration_list = &remaining[offset + declaration.len()..];
+            let end = bundled_top_level_statement_end(declaration_list);
+            if let Some(value) =
+                bundled_declaration_list_string(&declaration_list[..end], identifier)
+            {
+                return Ok(value);
+            }
+            remaining = &declaration_list[end..];
         }
     }
     Err(ProviderAttemptState::ProtocolFailure)
 }
 
-fn bundled_exported_string(source: &str, property: &str) -> Result<String, ProviderAttemptState> {
-    let export = format!("{property}:()=>");
-    let (_, remaining) = source
-        .split_once(&export)
-        .ok_or(ProviderAttemptState::ProtocolFailure)?;
-    let identifier: String = remaining
-        .chars()
-        .take_while(|character| {
-            character.is_ascii_alphanumeric() || *character == '_' || *character == '$'
-        })
-        .collect();
-    if identifier.is_empty() {
-        return Err(ProviderAttemptState::ProtocolFailure);
-    }
-    for declaration in ["const", "let", "var"] {
-        let binding = format!("{declaration} {identifier}=\"");
-        if let Some((_, value)) = source.split_once(&binding)
-            && let Some((key, _)) = value.split_once('"')
-            && !key.is_empty()
+fn bundled_top_level_keyword(source: &str, keyword: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut braces = 0usize;
+    let mut brackets = 0usize;
+    let mut parentheses = 0usize;
+    for (offset, character) in source.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '\"' | '`' => quote = Some(character),
+            '{' => braces += 1,
+            '}' => braces = braces.saturating_sub(1),
+            '[' => brackets += 1,
+            ']' => brackets = brackets.saturating_sub(1),
+            '(' => parentheses += 1,
+            ')' => parentheses = parentheses.saturating_sub(1),
+            _ => {}
+        }
+        if braces == 0
+            && brackets == 0
+            && parentheses == 0
+            && source[offset..].starts_with(keyword)
+            && source
+                .get(..offset)
+                .and_then(|before| before.chars().next_back())
+                .is_none_or(|before| !is_js_identifier_character(before))
+            && source
+                .get(offset + keyword.len()..)
+                .and_then(|after| after.chars().next())
+                .is_some_and(char::is_whitespace)
         {
-            return Ok(key.to_owned());
+            return Some(offset);
         }
     }
-    Err(ProviderAttemptState::ProtocolFailure)
+    None
+}
+
+fn bundled_top_level_statement_end(source: &str) -> usize {
+    bundled_top_level_split(source, ';')
+        .first()
+        .map_or(source.len(), |statement| statement.len())
+}
+
+fn bundled_declaration_list_string(list: &str, identifier: &str) -> Option<String> {
+    bundled_top_level_split(list, ',')
+        .into_iter()
+        .find_map(|declarator| {
+            let (binding, value) = declarator.split_once('=')?;
+            if binding.trim() == identifier {
+                bundled_quoted_string(value.trim())
+            } else {
+                None
+            }
+        })
+}
+
+fn bundled_top_level_split(source: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut braces = 0usize;
+    let mut brackets = 0usize;
+    let mut parentheses = 0usize;
+    for (offset, character) in source.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '\"' | '`' => quote = Some(character),
+            '{' => braces += 1,
+            '}' => braces = braces.saturating_sub(1),
+            '[' => brackets += 1,
+            ']' => brackets = brackets.saturating_sub(1),
+            '(' => parentheses += 1,
+            ')' => parentheses = parentheses.saturating_sub(1),
+            _ => {}
+        }
+        if character == separator && braces == 0 && brackets == 0 && parentheses == 0 {
+            parts.push(&source[start..offset]);
+            start = offset + character.len_utf8();
+        }
+    }
+    parts.push(&source[start..]);
+    parts
+}
+
+fn bundled_quoted_string(value: &str) -> Option<String> {
+    let quote = value.chars().next()?;
+    if !matches!(quote, '\'' | '\"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (offset, character) in value[quote.len_utf8()..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == quote {
+            let literal = &value[quote.len_utf8()..quote.len_utf8() + offset];
+            return (!literal.is_empty()).then(|| literal.to_owned());
+        }
+    }
+    None
+}
+
+fn is_js_identifier_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
 }
 
 /// The production host gets a fully concrete private provider, while its
@@ -2589,7 +2714,7 @@ mod tests {
     #[test]
     fn edge_proxy_backend_keeps_static_authorization_with_empty_model_routing() {
         let descriptor = desktop_backend_from_bundle(
-            br#"47708:()=>{const basetenApiKey="synthetic-client-key";const Rt={Fo:()=>basetenApiKey};};const RT="v31pl413";class G{static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#,
+            br#"47708(e,t,n){const basetenApiKey="synthetic-client-key";const Rt={Fo:()=>basetenApiKey};};const RT="v31pl413";class G{static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#,
             WisprWitnessRoute::EdgeProxy,
         )
         .expect("synthetic edge proxy descriptor");
@@ -2633,17 +2758,33 @@ mod tests {
     }
 
     #[test]
-    fn opaque_static_key_lookup_agrees_with_module_47708_fo_without_rendering_the_value() {
-        let source = r#"47708:()=>{const basetenApiKey="synthetic-client-key";const Rt={Fo:()=>basetenApiKey};};class G{static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#;
+    fn module_scoped_opaque_key_resolves_module_47708_fo_without_rendering_the_value() {
+        let descriptor = desktop_backend_from_bundle(
+            br#"47708:()=>{const basetenApiKey="synthetic-client-key";const Rt={Fo:()=>basetenApiKey};};const RT="v31pl413";class G{static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#,
+            WisprWitnessRoute::DefaultDirect,
+        )
+        .expect("synthetic desktop bundle descriptor");
 
-        assert!(verified_bundled_baseten_key(source).is_ok());
+        assert!(
+            descriptor
+                .baseten_authorization
+                .as_deref()
+                .is_some_and(|value| value.starts_with("Api-Key "))
+        );
     }
 
     #[test]
-    fn opaque_static_key_lookup_accepts_the_installed_bundle_shape_without_a_module_label() {
-        let source = r#"const basetenApiKey="synthetic-client-key";const Rt={Fo:()=>basetenApiKey};class G{static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#;
+    fn module_scoped_opaque_key_ignores_an_earlier_global_decoy_and_reads_a_comma_declarator() {
+        let descriptor = desktop_backend_from_bundle(
+            br#"52696:()=>{const b="global-decoy";};47708:()=>{const ignored=0,b="module-scoped";const Rt={Fo:()=>b};};const RT="v31pl413";class G{static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#,
+            WisprWitnessRoute::EdgeProxy,
+        )
+        .expect("synthetic desktop bundle descriptor");
 
-        assert!(verified_bundled_baseten_key(source).is_ok());
+        assert_eq!(
+            descriptor.baseten_authorization.as_deref(),
+            Some("Api-Key module-scoped")
+        );
     }
 
     #[test]
