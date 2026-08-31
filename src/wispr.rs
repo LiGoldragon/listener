@@ -6,6 +6,7 @@
 //! wire client; Listener never performs a live provider call in its test path.
 
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::Read,
     path::Path,
@@ -15,6 +16,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use bytes::Bytes;
+use serde::Serialize;
 use signal_listener::TranscriptText;
 
 use crate::{
@@ -137,29 +140,6 @@ impl WisprSessionBoundary for RefreshingWisprSessionBoundary {
             }
             result => result,
         }
-    }
-}
-
-/// The interoperability witness submits exactly once. It never refreshes or
-/// retries an authenticated desktop session, so an ambiguous outcome cannot
-/// become a second paid submission.
-struct OneShotWisprSessionBoundary {
-    source: Arc<dyn WisprSessionSource>,
-}
-
-impl OneShotWisprSessionBoundary {
-    fn new(source: Arc<dyn WisprSessionSource>) -> Self {
-        Self { source }
-    }
-}
-
-impl WisprSessionBoundary for OneShotWisprSessionBoundary {
-    fn with_session(
-        &self,
-        use_session: &mut dyn FnMut(&str) -> Result<TranscriptText, ProviderAttemptState>,
-    ) -> Result<TranscriptText, ProviderAttemptState> {
-        let session = self.source.refresh_session()?;
-        use_session(&session.value)
     }
 }
 
@@ -340,15 +320,19 @@ pub(crate) struct WisprGrpcStreamCall {
 }
 
 impl WisprGrpcStreamCall {
+    #[cfg(test)]
     pub(crate) fn host(&self) -> &str {
         &self.host
     }
+    #[cfg(test)]
     pub(crate) fn method(&self) -> &'static str {
         self.method
     }
+    #[cfg(test)]
     pub(crate) fn metadata(&self) -> &[(&'static str, String)] {
         &self.metadata
     }
+    #[cfg(test)]
     pub(crate) fn messages(&self) -> &[Vec<u8>] {
         &self.messages
     }
@@ -358,7 +342,102 @@ impl WisprGrpcStreamCall {
 /// This makes a concrete gRPC call inspectable with synthetic fixtures and
 /// prevents tests from issuing a network request.
 pub(crate) trait WisprGrpcStreamingBoundary: Send + Sync {
-    fn stream(&self, call: WisprGrpcStreamCall) -> Result<Vec<Vec<u8>>, ProviderAttemptState>;
+    fn stream(
+        &self,
+        call: WisprGrpcStreamCall,
+    ) -> Result<WisprGrpcStreamResponse, ProviderAttemptState>;
+}
+
+pub(crate) struct WisprGrpcStreamResponse {
+    messages: Vec<Vec<u8>>,
+    http_status: Option<u16>,
+    grpc_status: Option<u32>,
+    content_type: Option<String>,
+}
+
+impl WisprGrpcStreamResponse {
+    fn provider_state(&self) -> Result<(), ProviderAttemptState> {
+        match (self.http_status, self.grpc_status) {
+            (Some(200..=299), None | Some(0)) => Ok(()),
+            (Some(401 | 403), _) | (_, Some(16)) => {
+                Err(ProviderAttemptState::AuthenticationExpired)
+            }
+            (Some(408 | 429 | 500..=599), _) | (_, Some(4 | 8 | 14)) => {
+                Err(ProviderAttemptState::TransientFailure)
+            }
+            _ => Err(ProviderAttemptState::Rejected),
+        }
+    }
+
+    fn diagnostics(&self, stage: &'static str) -> WisprWitnessDiagnostics {
+        WisprWitnessDiagnostics::from_response(stage, self)
+    }
+}
+
+/// The sandbox's sole durable/output shape. It deliberately excludes every
+/// request value and every response value; only numeric and structural facts
+/// cross from the authenticated consumer into its caller.
+#[derive(Serialize)]
+pub struct WisprWitnessDiagnostics {
+    local_stage: &'static str,
+    http_status: Option<u16>,
+    grpc_status: Option<u32>,
+    content_type: Option<String>,
+    response_frame_count: usize,
+    response_frame_lengths: Vec<usize>,
+    protobuf_top_level_tag_histograms: Vec<Vec<WisprProtobufTagCount>>,
+}
+
+#[derive(Serialize)]
+struct WisprProtobufTagCount {
+    tag: u64,
+    count: usize,
+}
+
+impl WisprWitnessDiagnostics {
+    fn at(stage: &'static str) -> Self {
+        Self {
+            local_stage: stage,
+            http_status: None,
+            grpc_status: None,
+            content_type: None,
+            response_frame_count: 0,
+            response_frame_lengths: Vec::new(),
+            protobuf_top_level_tag_histograms: Vec::new(),
+        }
+    }
+
+    fn from_response(stage: &'static str, response: &WisprGrpcStreamResponse) -> Self {
+        Self {
+            local_stage: stage,
+            http_status: response.http_status,
+            grpc_status: response.grpc_status,
+            content_type: response.content_type.clone(),
+            response_frame_count: response.messages.len(),
+            response_frame_lengths: response.messages.iter().map(Vec::len).collect(),
+            protobuf_top_level_tag_histograms: response
+                .messages
+                .iter()
+                .map(|message| protobuf_top_level_tag_histogram(message))
+                .collect(),
+        }
+    }
+}
+
+fn protobuf_top_level_tag_histogram(message: &[u8]) -> Vec<WisprProtobufTagCount> {
+    let mut counts = BTreeMap::new();
+    if let Ok(fields) = protobuf_fields(message) {
+        for field in fields {
+            let number = match field {
+                ProtobufField::Integer { number } | ProtobufField::Bytes { number, .. } => number,
+            };
+            *counts.entry(number).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(tag, count)| WisprProtobufTagCount { tag, count })
+        .collect()
 }
 
 /// Concrete TLS/HTTP2 gRPC boundary. It is intentionally narrow: call
@@ -382,7 +461,10 @@ impl Default for ReqwestWisprGrpcStreamingBoundary {
 }
 
 impl WisprGrpcStreamingBoundary for ReqwestWisprGrpcStreamingBoundary {
-    fn stream(&self, call: WisprGrpcStreamCall) -> Result<Vec<Vec<u8>>, ProviderAttemptState> {
+    fn stream(
+        &self,
+        call: WisprGrpcStreamCall,
+    ) -> Result<WisprGrpcStreamResponse, ProviderAttemptState> {
         if (call.host != WISPR_GRPC_HOST && !call.host.ends_with(".grpc.api.baseten.co"))
             || call.method != TRANSCRIBE_STREAM_PATH
         {
@@ -404,18 +486,179 @@ impl WisprGrpcStreamingBoundary for ReqwestWisprGrpcStreamingBoundary {
             .body(request_body)
             .send()
             .map_err(|_| ProviderAttemptState::TransientFailure)?;
-        if !response.status().is_success() {
-            return Err(match response.status().as_u16() {
-                401 | 403 => ProviderAttemptState::AuthenticationExpired,
-                408 | 429 | 500..=599 => ProviderAttemptState::TransientFailure,
-                _ => ProviderAttemptState::Rejected,
-            });
-        }
+        let http_status = Some(response.status().as_u16());
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let grpc_status = response
+            .headers()
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok());
         let bytes = response
             .bytes()
             .map_err(|_| ProviderAttemptState::TransientFailure)?;
-        grpc_decode_messages(&bytes)
+        Ok(WisprGrpcStreamResponse {
+            messages: grpc_decode_messages(&bytes)?,
+            http_status,
+            grpc_status,
+            content_type,
+        })
     }
+}
+
+/// Native TLS/HTTP2 gRPC transport used only by the explicit sandbox witness.
+/// It submits each protobuf request as its own gRPC message and half-closes
+/// only after Commit=True. The h2 connection is driven independently while the
+/// request stream is open, so server frames are not coupled to HTTP/1 buffering.
+struct NativeWisprGrpcStreamingBoundary;
+
+impl WisprGrpcStreamingBoundary for NativeWisprGrpcStreamingBoundary {
+    fn stream(
+        &self,
+        call: WisprGrpcStreamCall,
+    ) -> Result<WisprGrpcStreamResponse, ProviderAttemptState> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|_| ProviderAttemptState::Unavailable)?
+            .block_on(tokio::time::timeout(
+                WISPR_REQUEST_TIMEOUT,
+                native_grpc_stream(call),
+            ))
+            .map_err(|_| ProviderAttemptState::TransientFailure)?
+    }
+}
+
+async fn native_grpc_stream(
+    call: WisprGrpcStreamCall,
+) -> Result<WisprGrpcStreamResponse, ProviderAttemptState> {
+    if (call.host != WISPR_GRPC_HOST && !call.host.ends_with(".grpc.api.baseten.co"))
+        || call.method != TRANSCRIBE_STREAM_PATH
+    {
+        return Err(ProviderAttemptState::ProtocolFailure);
+    }
+
+    let tcp = tokio::net::TcpStream::connect((call.host.as_str(), 443))
+        .await
+        .map_err(|_| ProviderAttemptState::TransientFailure)?;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut configuration = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    configuration.alpn_protocols = vec![b"h2".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(configuration));
+    let server_name = rustls::pki_types::ServerName::try_from(call.host.clone())
+        .map_err(|_| ProviderAttemptState::ProtocolFailure)?;
+    let tls = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|_| ProviderAttemptState::TransientFailure)?;
+    if tls.get_ref().1.alpn_protocol() != Some(b"h2") {
+        return Err(ProviderAttemptState::ProtocolFailure);
+    }
+
+    let (sender, connection) = h2::client::handshake(tls)
+        .await
+        .map_err(|_| ProviderAttemptState::TransientFailure)?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut sender = sender
+        .ready()
+        .await
+        .map_err(|_| ProviderAttemptState::TransientFailure)?;
+    let mut builder = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(call.method)
+        .version(http::Version::HTTP_2)
+        .header("content-type", "application/grpc")
+        .header("te", "trailers");
+    for (name, value) in &call.metadata {
+        builder = builder.header(*name, value);
+    }
+    let request = builder
+        .body(())
+        .map_err(|_| ProviderAttemptState::ProtocolFailure)?;
+    let (response, mut upload) = sender
+        .send_request(request, false)
+        .map_err(|_| ProviderAttemptState::TransientFailure)?;
+    for message in &call.messages {
+        native_send_grpc_message(&mut upload, message).await?;
+    }
+    upload
+        .send_data(Bytes::new(), true)
+        .map_err(|_| ProviderAttemptState::TransientFailure)?;
+
+    let response = response
+        .await
+        .map_err(|_| ProviderAttemptState::TransientFailure)?;
+    let (head, mut body) = response.into_parts();
+    let http_status = Some(head.status.as_u16());
+    let content_type = head
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let mut grpc_status = head
+        .headers
+        .get("grpc-status")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
+    let mut flow_control = body.flow_control().clone();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.map_err(|_| ProviderAttemptState::TransientFailure)?;
+        flow_control
+            .release_capacity(chunk.len())
+            .map_err(|_| ProviderAttemptState::ProtocolFailure)?;
+        bytes.extend_from_slice(&chunk);
+    }
+    if let Some(trailers) = body
+        .trailers()
+        .await
+        .map_err(|_| ProviderAttemptState::TransientFailure)?
+    {
+        grpc_status = trailers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok())
+            .or(grpc_status);
+    }
+    Ok(WisprGrpcStreamResponse {
+        messages: grpc_decode_messages(&bytes)?,
+        http_status,
+        grpc_status,
+        content_type,
+    })
+}
+
+async fn native_send_grpc_message(
+    upload: &mut h2::SendStream<Bytes>,
+    message: &[u8],
+) -> Result<(), ProviderAttemptState> {
+    let mut frame = Bytes::from(grpc_encode_message(message));
+    upload.reserve_capacity(frame.len());
+    while !frame.is_empty() {
+        let available = std::future::poll_fn(|context| upload.poll_capacity(context))
+            .await
+            .ok_or(ProviderAttemptState::TransientFailure)?
+            .map_err(|_| ProviderAttemptState::TransientFailure)?;
+        let length = available.min(frame.len());
+        if length == 0 {
+            continue;
+        }
+        let chunk = frame.split_to(length);
+        upload
+            .send_data(chunk, false)
+            .map_err(|_| ProviderAttemptState::TransientFailure)?;
+        upload.reserve_capacity(frame.len());
+    }
+    Ok(())
 }
 
 fn grpc_encode_messages(messages: &[Vec<u8>]) -> Vec<u8> {
@@ -426,6 +669,14 @@ fn grpc_encode_messages(messages: &[Vec<u8>]) -> Vec<u8> {
         encoded.extend_from_slice(&(message.len() as u32).to_be_bytes());
         encoded.extend_from_slice(message);
     }
+    encoded
+}
+
+fn grpc_encode_message(message: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(message.len() + 5);
+    encoded.push(0);
+    encoded.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(message);
     encoded
 }
 
@@ -610,8 +861,8 @@ fn first_json_string(document: &serde_json::Value, key: &str) -> Option<String> 
 
 fn jwt_subject(token: &str) -> Option<String> {
     use base64::{
-        Engine as _,
         engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+        Engine as _,
     };
 
     let encoded_payload = token.split('.').nth(1)?;
@@ -772,6 +1023,23 @@ impl ObservedWisprGrpcClient {
             backend,
         }
     }
+
+    fn submit(
+        &self,
+        request: WisprFlowWireRequest,
+    ) -> Result<WisprGrpcStreamResponse, ProviderAttemptState> {
+        let user_id = self.identity.user_id()?;
+        let identifiers = self.identity.fresh_request_identifiers()?;
+        let backend = self.backend.backend()?;
+        let mut metadata = backend.metadata();
+        metadata.push(("authorization", format!("Bearer {}", request.session)));
+        self.stream.stream(WisprGrpcStreamCall {
+            host: backend.host,
+            method: TRANSCRIBE_STREAM_PATH,
+            metadata,
+            messages: encode_observed_requests(&user_id, identifiers, &request)?,
+        })
+    }
 }
 
 impl WisprFlowWireClient for ObservedWisprGrpcClient {
@@ -779,24 +1047,15 @@ impl WisprFlowWireClient for ObservedWisprGrpcClient {
         &self,
         request: WisprFlowWireRequest,
     ) -> Result<TranscriptText, ProviderAttemptState> {
-        let user_id = self.identity.user_id()?;
-        let identifiers = self.identity.fresh_request_identifiers()?;
-        let backend = self.backend.backend()?;
-        let mut metadata = backend.metadata();
-        metadata.push(("authorization", format!("Bearer {}", request.session)));
-        let call = WisprGrpcStreamCall {
-            host: backend.host,
-            method: TRANSCRIBE_STREAM_PATH,
-            metadata,
-            messages: encode_observed_requests(&user_id, identifiers, &request)?,
-        };
-        let responses = self.stream.stream(call)?;
-        decode_observed_responses(&responses)
+        let responses = self.submit(request)?;
+        responses.provider_state()?;
+        decode_observed_responses(&responses.messages)
     }
 }
 
-/// Encodes the desktop's one-shot Init, optional cursor context, PCM16/WAV
-/// payload, and final Commit=True in one stream message.
+/// Encodes the observed request queue: Init, optional cursor context, audio,
+/// then Commit=True. Each entry is one independent gRPC message; the caller
+/// alone half-closes the HTTP/2 stream after the commit message.
 fn encode_observed_requests(
     user_id: &str,
     identifiers: WisprRequestIdentifiers,
@@ -846,17 +1105,17 @@ fn encode_observed_requests(
         protobuf_message(1, &metadata),
         protobuf_message(2, &preferences),
     ]);
-    let mut request_fields = vec![protobuf_message(1, &init_body)];
+    let mut messages = vec![protobuf_message(1, &init_body)];
     if !request.request.preceding_transcript_tail().is_empty() {
         let textbox = protobuf_string(2, request.request.preceding_transcript_tail());
         let context = protobuf_message(2, &protobuf_message(2, &textbox));
-        request_fields.push(context);
+        messages.push(context);
     }
     let payload = protobuf_bytes(1, &request.wav_pcm16);
     let audio_file = protobuf_message(2, &payload);
-    request_fields.push(protobuf_message(3, &audio_file));
-    request_fields.push(protobuf_integer(4, 1));
-    Ok(vec![protobuf_concat(&request_fields)])
+    messages.push(protobuf_message(3, &audio_file));
+    messages.push(protobuf_integer(4, 1));
+    Ok(messages)
 }
 
 fn protobuf_varint(mut value: u64) -> Vec<u8> {
@@ -1005,7 +1264,7 @@ fn parse_observed_response(data: &[u8]) -> Result<ObservedResponseText, Provider
 }
 
 enum ProtobufField<'a> {
-    Integer { number: u64, value: u64 },
+    Integer { number: u64 },
     Bytes { number: u64, value: &'a [u8] },
 }
 
@@ -1016,10 +1275,10 @@ fn protobuf_fields(data: &[u8]) -> Result<Vec<ProtobufField<'_>>, ProviderAttemp
         let tag = read_protobuf_varint(data, &mut position)?;
         let number = tag >> 3;
         match tag & 7 {
-            0 => fields.push(ProtobufField::Integer {
-                number,
-                value: read_protobuf_varint(data, &mut position)?,
-            }),
+            0 => {
+                read_protobuf_varint(data, &mut position)?;
+                fields.push(ProtobufField::Integer { number });
+            }
             2 => {
                 let length = read_protobuf_varint(data, &mut position)? as usize;
                 let end = position
@@ -1211,67 +1470,50 @@ impl WisprFlowTransport for ProtocolWisprFlowTransport {
     }
 }
 
-/// A non-retrying transport reserved for the explicit sandbox witness. The
-/// normal provider transport may retry an unsubmitted transient error; this
-/// one cannot distinguish that case from an accepted server submission, so it
-/// reports the first result exactly as observed.
-struct OneShotProtocolWisprFlowTransport {
-    media: Arc<dyn WisprMediaAdapter>,
-    wire: Arc<dyn WisprFlowWireClient>,
-}
-
-impl OneShotProtocolWisprFlowTransport {
-    fn new(media: Arc<dyn WisprMediaAdapter>, wire: Arc<dyn WisprFlowWireClient>) -> Self {
-        Self { media, wire }
-    }
-}
-
-impl WisprFlowTransport for OneShotProtocolWisprFlowTransport {
-    fn transcribe_wav(
-        &self,
-        session: &str,
-        request: &ProviderTranscriptRequest,
-    ) -> Result<TranscriptText, ProviderAttemptState> {
-        let wav_pcm16 = self.media.wav_pcm16(request)?;
-        if !is_wispr_pcm16_wav(&wav_pcm16)
-            || wav_pcm16.len() > 44 + (WISPR_MAXIMUM_SAMPLES as usize * 2)
-        {
-            return Err(ProviderAttemptState::SizeLimit);
-        }
-        self.wire.transcribe_stream(WisprFlowWireRequest::new(
-            session,
-            request.clone(),
-            wav_pcm16,
-        ))
-    }
-}
-
-/// Runs one isolated, Wispr-only provider submission against a supplied WAV.
-/// It does not construct ListenerRuntime, open audio devices or Listener
-/// sockets, create a capture/history store, access the system clipboard, or
-/// route to any fallback provider.
-pub fn sandbox_wispr_transcribe(
+/// Runs one isolated, non-retrying Wispr gRPC witness against a supplied
+/// synthetic recording. It does not create a Listener runtime, capture audio,
+/// open Listener sockets, route a fallback, parse a transcript, or return one.
+pub fn sandbox_wispr_witness(
     session_descriptor: i32,
     desktop_bundle_descriptor: i32,
     artifact_path: &Path,
-) -> Result<TranscriptText, ProviderAttemptState> {
-    let session = Arc::new(InheritedFdDesktopWisprSession::new(session_descriptor)?);
-    let session_source: Arc<dyn WisprSessionSource> = session.clone();
+) -> WisprWitnessDiagnostics {
+    let session = match InheritedFdDesktopWisprSession::new(session_descriptor) {
+        Ok(session) => Arc::new(session),
+        Err(_) => return WisprWitnessDiagnostics::at("session-descriptor"),
+    };
+    let backend = match DesktopWisprBackendSource::new(desktop_bundle_descriptor) {
+        Ok(backend) => Arc::new(backend),
+        Err(_) => return WisprWitnessDiagnostics::at("bundle-descriptor"),
+    };
+    let (access_token, _) = match session.session() {
+        Ok(session) => session,
+        Err(_) => return WisprWitnessDiagnostics::at("session"),
+    };
+    let request = ProviderTranscriptRequest::for_test(artifact_path);
+    let wav_pcm16 = match RecordingLogWisprMediaAdapter.wav_pcm16(&request) {
+        Ok(wav_pcm16) => wav_pcm16,
+        Err(_) => return WisprWitnessDiagnostics::at("recording"),
+    };
+    if !is_wispr_pcm16_wav(&wav_pcm16)
+        || wav_pcm16.len() > 44 + (WISPR_MAXIMUM_SAMPLES as usize * 2)
+    {
+        return WisprWitnessDiagnostics::at("audio-validation");
+    }
     let identity: Arc<dyn WisprWireIdentity> = session;
     let wire = Arc::new(ObservedWisprGrpcClient::new(
-        Arc::new(ReqwestWisprGrpcStreamingBoundary::default()),
+        Arc::new(NativeWisprGrpcStreamingBoundary),
         identity,
-        Arc::new(DesktopWisprBackendSource::new(desktop_bundle_descriptor)?),
+        backend,
     ));
-    let transport = Arc::new(OneShotProtocolWisprFlowTransport::new(
-        Arc::new(RecordingLogWisprMediaAdapter),
-        wire,
-    ));
-    WisprFlowProvider::new(
-        Arc::new(OneShotWisprSessionBoundary::new(session_source)),
-        transport,
-    )
-    .transcribe(&ProviderTranscriptRequest::for_test(artifact_path))
+    match wire.submit(WisprFlowWireRequest::new(&access_token, request, wav_pcm16)) {
+        Ok(response) => response.diagnostics(if response.provider_state().is_ok() {
+            "complete"
+        } else {
+            "response"
+        }),
+        Err(_) => WisprWitnessDiagnostics::at("stream"),
+    }
 }
 
 #[cfg(test)]
@@ -1346,11 +1588,86 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].host(), "inference.wisprflow.com");
         assert_eq!(calls[0].method(), TRANSCRIBE_STREAM_PATH);
-        assert_eq!(calls[0].messages().len(), 1);
-        assert!(
-            calls[0].metadata().iter().any(
-                |(name, value)| *name == "authorization" && value == "Bearer synthetic-session"
-            )
+        assert_eq!(calls[0].messages().len(), 4);
+        assert!(calls[0]
+            .metadata()
+            .iter()
+            .any(|(name, value)| *name == "authorization" && value == "Bearer synthetic-session"));
+    }
+
+    #[test]
+    fn observed_wire_queues_init_context_audio_and_commit_as_distinct_messages() {
+        let request = WisprFlowWireRequest::new(
+            "synthetic-session",
+            ProviderTranscriptRequest::new(
+                "/durable/audio.wav".into(),
+                "synthetic cursor context".into(),
+                vec!["synthetic-vocabulary".into()],
+            ),
+            synthetic_wav(),
+        );
+
+        let messages = encode_observed_requests(
+            "synthetic-user",
+            WisprRequestIdentifiers::new(
+                "00000000-0000-4000-8000-000000000001".into(),
+                "00000000-0000-4000-8000-000000000002".into(),
+            ),
+            &request,
+        )
+        .expect("synthetic request should encode");
+
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(
+            protobuf_fields(&messages[0]).unwrap().as_slice(),
+            [ProtobufField::Bytes { number: 1, .. }]
+        ));
+        assert!(matches!(
+            protobuf_fields(&messages[1]).unwrap().as_slice(),
+            [ProtobufField::Bytes { number: 2, .. }]
+        ));
+        assert!(matches!(
+            protobuf_fields(&messages[2]).unwrap().as_slice(),
+            [ProtobufField::Bytes { number: 3, .. }]
+        ));
+        assert_eq!(messages[3], protobuf_integer(4, 1));
+    }
+
+    #[test]
+    fn witness_diagnostics_retain_only_the_allowed_response_structure() {
+        let response = WisprGrpcStreamResponse {
+            messages: vec![synthetic_result_response(
+                "response text must not cross the witness boundary",
+                "nor may alternate transcript text cross it",
+            )],
+            http_status: Some(200),
+            grpc_status: Some(0),
+            content_type: Some("application/grpc".into()),
+        };
+
+        let value =
+            serde_json::to_value(response.diagnostics("complete")).expect("diagnostics serialize");
+        let object = value.as_object().expect("diagnostics are an object");
+        assert_eq!(
+            object.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "content_type",
+                "grpc_status",
+                "http_status",
+                "local_stage",
+                "protobuf_top_level_tag_histograms",
+                "response_frame_count",
+                "response_frame_lengths",
+            ],
+        );
+        let rendered = value.to_string();
+        assert!(!rendered.contains("response text must not cross"));
+        assert!(!rendered.contains("alternate transcript text"));
+        assert_eq!(object["response_frame_count"], 1);
+        assert_eq!(object["response_frame_lengths"], serde_json::json!([101]));
+        assert_eq!(
+            object["protobuf_top_level_tag_histograms"],
+            serde_json::json!([[{"tag": 1, "count": 1}]]),
         );
     }
 
@@ -1411,9 +1728,17 @@ mod tests {
     }
 
     impl WisprGrpcStreamingBoundary for SyntheticGrpcStream {
-        fn stream(&self, call: WisprGrpcStreamCall) -> Result<Vec<Vec<u8>>, ProviderAttemptState> {
+        fn stream(
+            &self,
+            call: WisprGrpcStreamCall,
+        ) -> Result<WisprGrpcStreamResponse, ProviderAttemptState> {
             self.calls.lock().expect("synthetic call sink").push(call);
-            Ok(self.responses.clone())
+            Ok(WisprGrpcStreamResponse {
+                messages: self.responses.clone(),
+                http_status: Some(200),
+                grpc_status: Some(0),
+                content_type: Some("application/grpc".into()),
+            })
         }
     }
 

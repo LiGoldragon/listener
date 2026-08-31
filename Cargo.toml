@@ -44,13 +44,17 @@ nota-text = ["dep:nota", "signal-frame/nota-text", "signal-listener/nota-text", 
 
 [dependencies]
 base64               = "0.22"
+bytes                = "1"
 crc32fast            = "1"
 fs2                  = "0.4"
+h2                   = "0.4"
+http                 = "1"
 meta-signal-listener = { git = "https://github.com/LiGoldragon/meta-signal-listener.git", branch = "listener-wispr-01a04e75", default-features = false }
 kameo                = { git = "https://github.com/LiGoldragon/kameo.git", rev = "f491b45d7dcb55e5837eddde3d5d7ca8ceaa9f01", default-features = false, features = ["macros"] }
 nota                 = { package = "nota", git = "https://github.com/LiGoldragon/nota.git", rev = "7d0651a0e098efea5fe2578cb06d88e009d40ff0", optional = true }
 reqwest              = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 rkyv                 = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
+rustls               = "0.23"
 sema-engine          = { git = "https://github.com/LiGoldragon/sema-engine.git", rev = "93a6b5f063292e000a7bf395fdd5b46e3e943068" }
 serde                = { version = "1", features = ["derive"] }
 serde_json           = "1"
@@ -58,6 +62,8 @@ signal-frame         = { git = "https://github.com/LiGoldragon/signal-frame.git"
 signal-listener      = { git = "https://github.com/LiGoldragon/signal-listener.git", rev = "b44a9e7a2161e1fd77df6ecde64bb824f2dd2069", default-features = false }
 thiserror            = "2"
 tokio                = { version = "1", features = ["net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-rustls         = "0.26"
+webpki-roots         = "1"
 zbus                 = "4.4"
 
 [dev-dependencies]

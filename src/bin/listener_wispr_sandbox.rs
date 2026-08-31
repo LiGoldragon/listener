@@ -1,15 +1,8 @@
-use std::{
-    env,
-    fs::OpenOptions,
-    io::{Read, Write},
-    os::unix::net::UnixListener,
-    path::PathBuf,
-    process::ExitCode,
-};
+use std::{env, fs::OpenOptions, io::Write, path::PathBuf, process::ExitCode};
 
 use listener::{
-    RecordingAudioFormat, RecordingInputSource, RecordingLogHeader, RecordingLogWriter,
-    RecordingStartTime, sandbox_wispr_transcribe,
+    sandbox_wispr_witness, RecordingAudioFormat, RecordingInputSource, RecordingLogHeader,
+    RecordingLogWriter, RecordingStartTime,
 };
 use signal_listener::CaptureSession;
 
@@ -17,11 +10,7 @@ struct SandboxWitness {
     session_descriptor: i32,
     bundle_descriptor: i32,
     artifact_path: PathBuf,
-    pcm_descriptor: i32,
-    clipboard_sink: PathBuf,
-    state_store: PathBuf,
-    ordinary_socket: PathBuf,
-    meta_socket: PathBuf,
+    diagnostics_path: PathBuf,
 }
 
 impl SandboxWitness {
@@ -30,41 +19,24 @@ impl SandboxWitness {
             session_descriptor: required_descriptor("LISTENER_WISPR_SESSION_FD")?,
             bundle_descriptor: required_descriptor("LISTENER_WISPR_DESKTOP_BUNDLE_FD")?,
             artifact_path: required_path("LISTENER_WISPR_SANDBOX_ARTIFACT")?,
-            pcm_descriptor: required_descriptor("LISTENER_WISPR_SANDBOX_PCM_FD")?,
-            clipboard_sink: required_path("LISTENER_WISPR_SANDBOX_CLIPBOARD_SINK")?,
-            state_store: required_path("LISTENER_WISPR_SANDBOX_STATE_STORE")?,
-            ordinary_socket: required_path("LISTENER_WISPR_SANDBOX_SOCKET")?,
-            meta_socket: required_path("LISTENER_WISPR_SANDBOX_META_SOCKET")?,
+            diagnostics_path: required_path("LISTENER_WISPR_SANDBOX_DIAGNOSTICS")?,
         })
     }
 
-    fn run(&self) -> Result<String, &'static str> {
-        let _ordinary = reserve_socket(&self.ordinary_socket)?;
-        let _meta = reserve_socket(&self.meta_socket)?;
-        write_new(&self.state_store, b"listener-wispr-sandbox\n")?;
-        create_sandbox_recording(&self.artifact_path, self.pcm_descriptor)?;
-        let transcript = sandbox_wispr_transcribe(
+    fn run(&self) -> Result<(), &'static str> {
+        create_synthetic_recording(&self.artifact_path)?;
+        let diagnostics = sandbox_wispr_witness(
             self.session_descriptor,
             self.bundle_descriptor,
             &self.artifact_path,
-        )
-        .map_err(redacted_provider_failure)?;
-        write_new(&self.clipboard_sink, transcript.as_str().as_bytes())?;
-        Ok(transcript.as_str().to_owned())
+        );
+        let diagnostics = serde_json::to_vec(&diagnostics)
+            .map_err(|_| "sandbox-diagnostics-serialization-failed")?;
+        write_new(&self.diagnostics_path, &diagnostics)
     }
 }
 
-fn create_sandbox_recording(path: &PathBuf, descriptor: i32) -> Result<(), &'static str> {
-    let mut source = std::fs::File::open(format!("/proc/self/fd/{descriptor}"))
-        .map_err(|_| "sandbox-pcm-unavailable")?;
-    let mut pcm = Vec::new();
-    Read::by_ref(&mut source)
-        .take(12 * 1024 * 1024)
-        .read_to_end(&mut pcm)
-        .map_err(|_| "sandbox-pcm-unavailable")?;
-    if pcm.is_empty() || pcm.len() % 2 != 0 {
-        return Err("sandbox-pcm-invalid");
-    }
+fn create_synthetic_recording(path: &PathBuf) -> Result<(), &'static str> {
     let header = RecordingLogHeader::new(
         CaptureSession::new(1),
         RecordingAudioFormat::signed_sixteen_bit_little_endian_mono_16khz(),
@@ -75,31 +47,11 @@ fn create_sandbox_recording(path: &PathBuf, descriptor: i32) -> Result<(), &'sta
     .map_err(|_| "sandbox-recording-header-invalid")?;
     let mut writer =
         RecordingLogWriter::create(path, header).map_err(|_| "sandbox-recording-unavailable")?;
-    for record in pcm.chunks(8192) {
-        writer
-            .append_record(record)
-            .map_err(|_| "sandbox-recording-unavailable")?;
-    }
+    // 10 ms of zero-valued PCM is synthetic, non-private audio.
+    writer
+        .append_record(&[0_u8; 320])
+        .map_err(|_| "sandbox-recording-unavailable")?;
     writer.finish().map_err(|_| "sandbox-recording-unavailable")
-}
-
-fn redacted_provider_failure(state: listener::ProviderAttemptState) -> &'static str {
-    match state {
-        listener::ProviderAttemptState::Unavailable => "redacted-provider-unavailable",
-        listener::ProviderAttemptState::Rejected => "redacted-provider-rejected",
-        listener::ProviderAttemptState::TransientFailure => "redacted-provider-transient-failure",
-        listener::ProviderAttemptState::ProtocolFailure => "redacted-provider-protocol-failure",
-        listener::ProviderAttemptState::SizeLimit => "redacted-provider-size-limit",
-        listener::ProviderAttemptState::AuthenticationExpired => {
-            "redacted-provider-authentication-expired"
-        }
-        listener::ProviderAttemptState::Cancelled => "redacted-provider-cancelled",
-        listener::ProviderAttemptState::LocalArtifactFailure => "redacted-local-artifact-failure",
-        listener::ProviderAttemptState::AmbiguousAfterSubmit => {
-            "redacted-provider-ambiguous-after-submit"
-        }
-        listener::ProviderAttemptState::Succeeded => "redacted-provider-invalid-success-state",
-    }
 }
 
 fn required_descriptor(variable: &'static str) -> Result<i32, &'static str> {
@@ -124,10 +76,6 @@ fn required_path(variable: &'static str) -> Result<PathBuf, &'static str> {
     Ok(path)
 }
 
-fn reserve_socket(path: &PathBuf) -> Result<UnixListener, &'static str> {
-    UnixListener::bind(path).map_err(|_| "sandbox-socket-unavailable")
-}
-
 fn write_new(path: &PathBuf, contents: &[u8]) -> Result<(), &'static str> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -140,8 +88,8 @@ fn write_new(path: &PathBuf, contents: &[u8]) -> Result<(), &'static str> {
 fn main() -> ExitCode {
     let result = SandboxWitness::from_environment().and_then(|witness| witness.run());
     match result {
-        Ok(transcript) => {
-            println!("wispr-sandbox-transcript: {transcript}");
+        Ok(()) => {
+            println!("wispr-sandbox: diagnostics-written");
             ExitCode::SUCCESS
         }
         Err(status) => {
