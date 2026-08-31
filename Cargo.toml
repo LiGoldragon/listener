@@ -61,13 +61,11 @@ serde_json           = "1"
 signal-frame         = { git = "https://github.com/LiGoldragon/signal-frame.git", rev = "f46872e7e8edae5264c892443d415a273b231234", default-features = false }
 signal-listener      = { git = "https://github.com/LiGoldragon/signal-listener.git", rev = "b44a9e7a2161e1fd77df6ecde64bb824f2dd2069", default-features = false }
 thiserror            = "2"
+tempfile             = "3"
 tokio                = { version = "1", features = ["net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-rustls         = "0.26"
 webpki-roots         = "1"
 zbus                 = "4.4"
-
-[dev-dependencies]
-tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

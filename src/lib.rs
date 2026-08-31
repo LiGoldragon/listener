@@ -103,4 +103,7 @@ pub use transcription::{
     TranscriptionPrompt,
 };
 pub use transport::{ContractFrameCodec, ContractFrameStream, MaximumFrameLength};
-pub use wispr::{WisprWitnessDiagnostics, sandbox_wispr_witness};
+pub use wispr::{
+    WisprWitnessCheckpoint, WisprWitnessDiagnostics, sandbox_wispr_witness,
+    sandbox_wispr_witness_checkpointed,
+};
