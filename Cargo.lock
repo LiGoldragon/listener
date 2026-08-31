@@ -907,6 +907,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 name = "listener"
 version = "0.17.0"
 dependencies = [
+ "base64",
  "crc32fast",
  "fs2",
  "kameo",
@@ -1345,6 +1346,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redb"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "rend"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1531,6 +1541,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "sema"
+version = "0.1.1"
+source = "git+https://github.com/LiGoldragon/sema.git?rev=51d7927c872f0df12791bad8d39a4db6433b01a1#51d7927c872f0df12791bad8d39a4db6433b01a1"
+dependencies = [
+ "redb",
+ "rkyv",
+ "thiserror",
+]
+
+[[package]]
+name = "sema-engine"
+version = "0.10.1"
+source = "git+https://github.com/LiGoldragon/sema-engine.git?rev=93a6b5f063292e000a7bf395fdd5b46e3e943068#93a6b5f063292e000a7bf395fdd5b46e3e943068"
+dependencies = [
+ "blake3",
+ "rkyv",
+ "sema",
+ "signal-frame",
+ "signal-sema",
+ "thiserror",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1654,6 +1687,15 @@ dependencies = [
  "rkyv",
  "schema-rust",
  "signal-frame",
+ "thiserror",
+]
+
+[[package]]
+name = "signal-sema"
+version = "0.2.0"
+source = "git+https://github.com/LiGoldragon/signal-sema.git?rev=4f3a24e6677ab9d200672851016c4c760c1e36e8#4f3a24e6677ab9d200672851016c4c760c1e36e8"
+dependencies = [
+ "rkyv",
  "thiserror",
 ]
 
@@ -2573,45 +2615,4 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
-]
-
-[[package]]
-name = "redb"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "sema"
-version = "0.1.1"
-source = "git+https://github.com/LiGoldragon/sema.git?rev=51d7927c872f0df12791bad8d39a4db6433b01a1#51d7927c872f0df12791bad8d39a4db6433b01a1"
-dependencies = [
- "redb",
- "rkyv",
- "thiserror",
-]
-
-[[package]]
-name = "sema-engine"
-version = "0.10.1"
-source = "git+https://github.com/LiGoldragon/sema-engine.git?rev=93a6b5f063292e000a7bf395fdd5b46e3e943068#93a6b5f063292e000a7bf395fdd5b46e3e943068"
-dependencies = [
- "blake3",
- "rkyv",
- "sema",
- "signal-frame",
- "signal-sema",
- "thiserror",
-]
-
-[[package]]
-name = "signal-sema"
-version = "0.2.0"
-source = "git+https://github.com/LiGoldragon/signal-sema.git?rev=4f3a24e6677ab9d200672851016c4c760c1e36e8#4f3a24e6677ab9d200672851016c4c760c1e36e8"
-dependencies = [
- "rkyv",
- "thiserror",
 ]

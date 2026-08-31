@@ -35,9 +35,9 @@ mod wispr;
 
 pub use capture::{
     ActiveAudioCapture, AudioCaptureBackend, AudioCaptureStart, CaptureMaintenanceSnapshot,
-    CommittedSampleSink,
     CaptureRetentionAge, CaptureRetentionByteLimit, CaptureRetentionPolicy, CaptureStore,
-    ProcessAudioCaptureBackend, RecoveredCaptureRecordings, TerminalCaptureState,
+    CommittedSampleSink, ProcessAudioCaptureBackend, RecoveredCaptureRecordings,
+    TerminalCaptureState,
 };
 pub use client::{ListenerClient, ListenerMaintenanceClient};
 #[cfg(feature = "nota-text")]
@@ -68,9 +68,9 @@ pub use notification::{
 };
 pub use provider::{
     ProviderAttempt, ProviderAttemptOutcome, ProviderAttemptState, ProviderCircuitBreaker,
-    ProviderHealthEvent, ProviderHealthFanout, ProviderHealthSink, ProviderIdentifier, ProviderPolicy, ProviderRouter,
-    ProviderTranscriptRequest, TranscriptProvider, WisprFlowProvider, WisprFlowTransport,
-    WisprSessionBoundary,
+    ProviderHealthEvent, ProviderHealthFanout, ProviderHealthSink, ProviderIdentifier,
+    ProviderPolicy, ProviderRouter, ProviderTranscriptRequest, TranscriptProvider,
+    WisprFlowProvider, WisprFlowTransport, WisprSessionBoundary,
 };
 pub use provider_finalization::{
     DurableProviderFinalizer, OpenAiBatchProvider, PreparedProviderFinalization,
@@ -103,3 +103,4 @@ pub use transcription::{
     TranscriptionPrompt,
 };
 pub use transport::{ContractFrameCodec, ContractFrameStream, MaximumFrameLength};
+pub use wispr::sandbox_wispr_transcribe;

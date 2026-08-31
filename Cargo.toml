@@ -30,6 +30,10 @@ name = "listener-transcription-customization"
 path = "src/bin/listener_transcription_customization.rs"
 
 [[bin]]
+name = "listener-wispr-sandbox"
+path = "src/bin/listener_wispr_sandbox.rs"
+
+[[bin]]
 name = "meta-listener"
 path = "src/bin/meta_listener.rs"
 required-features = ["nota-text"]
@@ -39,6 +43,7 @@ default = ["nota-text"]
 nota-text = ["dep:nota", "signal-frame/nota-text", "signal-listener/nota-text", "meta-signal-listener/nota-text"]
 
 [dependencies]
+base64               = "0.22"
 crc32fast            = "1"
 fs2                  = "0.4"
 meta-signal-listener = { git = "https://github.com/LiGoldragon/meta-signal-listener.git", branch = "listener-wispr-01a04e75", default-features = false }

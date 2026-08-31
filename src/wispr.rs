@@ -6,9 +6,12 @@
 //! wire client; Listener never performs a live provider call in its test path.
 
 use std::{
+    fs::File,
+    io::Read,
+    path::Path,
     process::Command,
-    sync::{Arc, Mutex},
     sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -29,6 +32,8 @@ const WISPR_USER_ID_SECRET_NAME: &str = "wispr-flow/user-id";
 const WISPR_SESSION_CACHE_LIFETIME: Duration = Duration::from_secs(300);
 const WISPR_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 static NEXT_WISPR_REQUEST_IDENTIFIER: AtomicU64 = AtomicU64::new(1);
+const DESKTOP_BUNDLE_MAXIMUM_BYTES: u64 = 384 * 1024 * 1024;
+const DESKTOP_SESSION_MAXIMUM_BYTES: u64 = 256 * 1024;
 
 /// An opaque, expiring session. It deliberately exposes no value accessor and
 /// does not implement Debug, Serialize, or Clone.
@@ -61,14 +66,19 @@ pub(crate) struct GopassWisprSessionSource {
 
 impl Default for GopassWisprSessionSource {
     fn default() -> Self {
-        Self { secret_name: WISPR_SESSION_SECRET_NAME }
+        Self {
+            secret_name: WISPR_SESSION_SECRET_NAME,
+        }
     }
 }
 
 impl WisprSessionSource for GopassWisprSessionSource {
     fn refresh_session(&self) -> Result<WisprSession, ProviderAttemptState> {
         let value = local_secret(self.secret_name)?;
-        Ok(WisprSession::new(value, Instant::now() + WISPR_SESSION_CACHE_LIFETIME))
+        Ok(WisprSession::new(
+            value,
+            Instant::now() + WISPR_SESSION_CACHE_LIFETIME,
+        ))
     }
 }
 
@@ -130,6 +140,29 @@ impl WisprSessionBoundary for RefreshingWisprSessionBoundary {
     }
 }
 
+/// The interoperability witness submits exactly once. It never refreshes or
+/// retries an authenticated desktop session, so an ambiguous outcome cannot
+/// become a second paid submission.
+struct OneShotWisprSessionBoundary {
+    source: Arc<dyn WisprSessionSource>,
+}
+
+impl OneShotWisprSessionBoundary {
+    fn new(source: Arc<dyn WisprSessionSource>) -> Self {
+        Self { source }
+    }
+}
+
+impl WisprSessionBoundary for OneShotWisprSessionBoundary {
+    fn with_session(
+        &self,
+        use_session: &mut dyn FnMut(&str) -> Result<TranscriptText, ProviderAttemptState>,
+    ) -> Result<TranscriptText, ProviderAttemptState> {
+        let session = self.source.refresh_session()?;
+        use_session(&session.value)
+    }
+}
+
 /// A redacted protocol request. Its caller knows the inferred stream path,
 /// fresh session/request identifiers, optional context, WAV payload, and final
 /// commit; diagnostics contain only typed state.
@@ -154,9 +187,9 @@ impl WisprFlowWireRequest {
 }
 
 /// The only place transport implementations receive the opaque session.
-/// Implementors must speak the private inferred streaming route, send init and
-/// non-final commit followed by PCM16/WAV and final commit, ignore heartbeats,
-/// and select HTML/plain/formatted/raw response text in that order.
+/// Implementors must speak the private streaming route, submit the desktop's
+/// combined init/payload/final-commit shape for a one-shot WAV, ignore
+/// heartbeats, and select HTML/plain/formatted/raw response text in that order.
 pub(crate) trait WisprFlowWireClient: Send + Sync {
     fn transcribe_stream(
         &self,
@@ -172,6 +205,56 @@ pub(crate) trait WisprWireIdentity: Send + Sync {
     fn fresh_request_identifiers(&self) -> Result<WisprRequestIdentifiers, ProviderAttemptState>;
 }
 
+/// The desktop-selected transport destination and its non-user client
+/// metadata. This stays private so neither the client credential nor model
+/// routing data can enter a status or durable-state surface.
+pub(crate) struct WisprGrpcBackend {
+    host: String,
+    model_id: String,
+    environment: String,
+    baseten_authorization: Option<String>,
+}
+
+impl WisprGrpcBackend {
+    fn inferred() -> Self {
+        Self {
+            host: WISPR_GRPC_HOST.into(),
+            model_id: String::new(),
+            environment: String::new(),
+            baseten_authorization: None,
+        }
+    }
+
+    fn metadata(&self) -> Vec<(&'static str, String)> {
+        let mut metadata = vec![
+            ("flow-debug", "false".into()),
+            ("disable-formatting", "false".into()),
+            ("content-type", "application/grpc".into()),
+            ("te", "trailers".into()),
+        ];
+        if let Some(authorization) = &self.baseten_authorization {
+            metadata.extend([
+                ("baseten-authorization", authorization.clone()),
+                ("baseten-model-id", self.model_id.clone()),
+                ("x-baseten-environment", self.environment.clone()),
+            ]);
+        }
+        metadata
+    }
+}
+
+pub(crate) trait WisprGrpcBackendSource: Send + Sync {
+    fn backend(&self) -> Result<WisprGrpcBackend, ProviderAttemptState>;
+}
+
+struct FixedWisprGrpcBackendSource;
+
+impl WisprGrpcBackendSource for FixedWisprGrpcBackendSource {
+    fn backend(&self) -> Result<WisprGrpcBackend, ProviderAttemptState> {
+        Ok(WisprGrpcBackend::inferred())
+    }
+}
+
 /// Resolves the non-public Wispr identity at submission time through the same
 /// local secret boundary. The request/session identifiers are newly generated
 /// opaque values and never enter durable provider-job state.
@@ -181,7 +264,9 @@ pub(crate) struct GopassWisprWireIdentity {
 
 impl Default for GopassWisprWireIdentity {
     fn default() -> Self {
-        Self { user_id_secret_name: WISPR_USER_ID_SECRET_NAME }
+        Self {
+            user_id_secret_name: WISPR_USER_ID_SECRET_NAME,
+        }
     }
 }
 
@@ -209,6 +294,32 @@ pub(crate) struct WisprRequestIdentifiers {
 }
 
 impl WisprRequestIdentifiers {
+    fn desktop() -> Result<Self, ProviderAttemptState> {
+        let sequence = NEXT_WISPR_REQUEST_IDENTIFIER.fetch_add(1, Ordering::Relaxed) as u128;
+        let epoch_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ProviderAttemptState::Unavailable)?
+            .as_nanos();
+        Ok(Self::new(
+            uuid_from_entropy(epoch_nanos, sequence),
+            uuid_from_entropy(epoch_nanos.rotate_left(17), sequence.rotate_left(9)),
+        ))
+    }
+}
+
+fn uuid_from_entropy(first: u128, second: u128) -> String {
+    let value = first ^ second.rotate_left(37);
+    format!(
+        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+        (value >> 96) as u32,
+        (value >> 80) as u16,
+        ((value >> 64) & 0x0fff) as u16,
+        ((value >> 48) & 0x0fff) as u16,
+        value & 0x0000_0000_0000_ffff_ffff_ffff_ffff
+    )
+}
+
+impl WisprRequestIdentifiers {
     // Exception: Too trivial. The identity boundary constructs opaque identifiers.
     pub(crate) fn new(session_id: String, request_id: String) -> Self {
         Self {
@@ -222,15 +333,15 @@ impl WisprRequestIdentifiers {
 /// HTTP/2 and the actual connection; this type owns only the observed service
 /// route, relevant metadata and already-encoded protobuf messages.
 pub(crate) struct WisprGrpcStreamCall {
-    host: &'static str,
+    host: String,
     method: &'static str,
     metadata: Vec<(&'static str, String)>,
     messages: Vec<Vec<u8>>,
 }
 
 impl WisprGrpcStreamCall {
-    pub(crate) fn host(&self) -> &'static str {
-        self.host
+    pub(crate) fn host(&self) -> &str {
+        &self.host
     }
     pub(crate) fn method(&self) -> &'static str {
         self.method
@@ -262,6 +373,8 @@ impl Default for ReqwestWisprGrpcStreamingBoundary {
     fn default() -> Self {
         let client = reqwest::blocking::Client::builder()
             .timeout(WISPR_REQUEST_TIMEOUT)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::blocking::Client::new());
         Self { client }
@@ -270,7 +383,9 @@ impl Default for ReqwestWisprGrpcStreamingBoundary {
 
 impl WisprGrpcStreamingBoundary for ReqwestWisprGrpcStreamingBoundary {
     fn stream(&self, call: WisprGrpcStreamCall) -> Result<Vec<Vec<u8>>, ProviderAttemptState> {
-        if call.host != WISPR_GRPC_HOST || call.method != TRANSCRIBE_STREAM_PATH {
+        if (call.host != WISPR_GRPC_HOST && !call.host.ends_with(".grpc.api.baseten.co"))
+            || call.method != TRANSCRIBE_STREAM_PATH
+        {
             return Err(ProviderAttemptState::ProtocolFailure);
         }
         let mut headers = reqwest::header::HeaderMap::new();
@@ -318,7 +433,9 @@ fn grpc_decode_messages(bytes: &[u8]) -> Result<Vec<Vec<u8>>, ProviderAttemptSta
     let mut messages = Vec::new();
     let mut position = 0;
     while position < bytes.len() {
-        let compressed = *bytes.get(position).ok_or(ProviderAttemptState::ProtocolFailure)?;
+        let compressed = *bytes
+            .get(position)
+            .ok_or(ProviderAttemptState::ProtocolFailure)?;
         position += 1;
         if compressed != 0 {
             return Err(ProviderAttemptState::ProtocolFailure);
@@ -328,7 +445,9 @@ fn grpc_decode_messages(bytes: &[u8]) -> Result<Vec<Vec<u8>>, ProviderAttemptSta
             .ok_or(ProviderAttemptState::ProtocolFailure)
             .map(|length| u32::from_be_bytes(length.try_into().expect("four bytes")) as usize)?;
         position += 4;
-        let end = position.checked_add(size).ok_or(ProviderAttemptState::ProtocolFailure)?;
+        let end = position
+            .checked_add(size)
+            .ok_or(ProviderAttemptState::ProtocolFailure)?;
         let message = bytes
             .get(position..end)
             .ok_or(ProviderAttemptState::ProtocolFailure)?;
@@ -356,6 +475,256 @@ fn local_secret(secret_name: &str) -> Result<String, ProviderAttemptState> {
     Ok(value)
 }
 
+/// Session material acquired by the sandbox consumer. It deliberately has no
+/// Debug or serialization implementation, and is retained only while one
+/// submission is being assembled.
+struct DesktopWisprSession {
+    access_token: String,
+    user_id: String,
+}
+
+/// Reads the authenticated desktop session through an already-open descriptor.
+/// The shell opens the protected file but never reads, transforms, or receives
+/// its contents; this consumer selects the Supabase or WorkOS token in memory.
+struct InheritedFdDesktopWisprSession {
+    descriptor: i32,
+    session: Mutex<Option<DesktopWisprSession>>,
+}
+
+impl InheritedFdDesktopWisprSession {
+    fn new(descriptor: i32) -> Result<Self, ProviderAttemptState> {
+        if descriptor < 3 {
+            return Err(ProviderAttemptState::Unavailable);
+        }
+        Ok(Self {
+            descriptor,
+            session: Mutex::new(None),
+        })
+    }
+
+    fn session(&self) -> Result<(String, String), ProviderAttemptState> {
+        let mut cached = self
+            .session
+            .lock()
+            .map_err(|_| ProviderAttemptState::Unavailable)?;
+        if cached.is_none() {
+            let bytes = inherited_descriptor_bytes(self.descriptor, DESKTOP_SESSION_MAXIMUM_BYTES)?;
+            *cached = Some(desktop_session_from_json(&bytes)?);
+        }
+        let session = cached.as_ref().expect("desktop session was populated");
+        Ok((session.access_token.clone(), session.user_id.clone()))
+    }
+}
+
+impl WisprSessionSource for InheritedFdDesktopWisprSession {
+    fn refresh_session(&self) -> Result<WisprSession, ProviderAttemptState> {
+        let (access_token, _) = self.session()?;
+        Ok(WisprSession::new(
+            access_token,
+            Instant::now() + WISPR_SESSION_CACHE_LIFETIME,
+        ))
+    }
+}
+
+impl WisprWireIdentity for InheritedFdDesktopWisprSession {
+    fn user_id(&self) -> Result<String, ProviderAttemptState> {
+        let (_, user_id) = self.session()?;
+        Ok(user_id)
+    }
+
+    fn fresh_request_identifiers(&self) -> Result<WisprRequestIdentifiers, ProviderAttemptState> {
+        WisprRequestIdentifiers::desktop()
+    }
+}
+
+fn inherited_descriptor_bytes(
+    descriptor: i32,
+    maximum: u64,
+) -> Result<Vec<u8>, ProviderAttemptState> {
+    let path = format!("/proc/self/fd/{descriptor}");
+    let mut file = File::open(path).map_err(|_| ProviderAttemptState::Unavailable)?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ProviderAttemptState::Unavailable)?;
+    if bytes.len() as u64 > maximum {
+        return Err(ProviderAttemptState::Unavailable);
+    }
+    Ok(bytes)
+}
+
+fn desktop_session_from_json(bytes: &[u8]) -> Result<DesktopWisprSession, ProviderAttemptState> {
+    let document: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| ProviderAttemptState::Unavailable)?;
+    let access_token = first_json_string(&document, "access_token")
+        .or_else(|| first_json_string(&document, "accessToken"))
+        .ok_or(ProviderAttemptState::Unavailable)?;
+    let user_id = desktop_user_identifier(&document)
+        .or_else(|| jwt_subject(&access_token))
+        .ok_or(ProviderAttemptState::Unavailable)?;
+    if access_token.is_empty() || user_id.is_empty() {
+        return Err(ProviderAttemptState::Unavailable);
+    }
+    Ok(DesktopWisprSession {
+        access_token,
+        user_id,
+    })
+}
+
+fn desktop_user_identifier(document: &serde_json::Value) -> Option<String> {
+    first_json_string(document, "user_id")
+        .or_else(|| first_json_string(document, "userId"))
+        .or_else(|| {
+            ["user", "currentUser", "profile", "identity"]
+                .into_iter()
+                .filter_map(|key| document.get(key))
+                .find_map(|value| {
+                    first_json_string(value, "id")
+                        .or_else(|| first_json_string(value, "user_id"))
+                        .or_else(|| first_json_string(value, "userId"))
+                })
+        })
+}
+
+fn first_json_string(document: &serde_json::Value, key: &str) -> Option<String> {
+    match document {
+        serde_json::Value::Object(fields) => fields
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .or_else(|| {
+                fields
+                    .values()
+                    .find_map(|value| first_json_string(value, key))
+            }),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|value| first_json_string(value, key)),
+        serde_json::Value::String(value) => serde_json::from_str(value)
+            .ok()
+            .and_then(|nested| first_json_string(&nested, key)),
+        _ => None,
+    }
+}
+
+fn jwt_subject(token: &str) -> Option<String> {
+    use base64::{
+        Engine as _,
+        engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+    };
+
+    let encoded_payload = token.split('.').nth(1)?;
+    let payload = URL_SAFE_NO_PAD
+        .decode(encoded_payload)
+        .or_else(|_| URL_SAFE.decode(encoded_payload))
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    value.get("sub")?.as_str().map(str::to_owned)
+}
+
+/// Non-user desktop backend material selected from a packaged app bundle. The
+/// static client authorization never leaves this value or reaches logs,
+/// environment, arguments, the clipboard, or durable sandbox state.
+struct DesktopWisprBackendSource {
+    backend: WisprGrpcBackend,
+}
+
+impl DesktopWisprBackendSource {
+    fn new(descriptor: i32) -> Result<Self, ProviderAttemptState> {
+        if descriptor < 3 {
+            return Err(ProviderAttemptState::Unavailable);
+        }
+        Ok(Self {
+            backend: desktop_backend_from_bundle(&inherited_descriptor_bytes(
+                descriptor,
+                DESKTOP_BUNDLE_MAXIMUM_BYTES,
+            )?)?,
+        })
+    }
+}
+
+impl WisprGrpcBackendSource for DesktopWisprBackendSource {
+    fn backend(&self) -> Result<WisprGrpcBackend, ProviderAttemptState> {
+        Ok(WisprGrpcBackend {
+            host: self.backend.host.clone(),
+            model_id: self.backend.model_id.clone(),
+            environment: self.backend.environment.clone(),
+            baseten_authorization: self.backend.baseten_authorization.clone(),
+        })
+    }
+}
+
+fn desktop_backend_from_bundle(bytes: &[u8]) -> Result<WisprGrpcBackend, ProviderAttemptState> {
+    let source = String::from_utf8_lossy(bytes);
+    let model_id = bundled_qwen_model_id(&source)?;
+    let property = bundled_baseten_property(&source)?;
+    let key = bundled_exported_string(&source, property)?;
+    Ok(WisprGrpcBackend {
+        host: format!("model-{model_id}.grpc.api.baseten.co"),
+        model_id: format!("model-{model_id}"),
+        environment: "production".into(),
+        baseten_authorization: Some(format!("Api-Key {key}")),
+    })
+}
+
+fn bundled_qwen_model_id(source: &str) -> Result<String, ProviderAttemptState> {
+    let mappings = source
+        .split_once("ASR_VARIANT_BASETEN_MODEL_IDS={")
+        .and_then(|(_, remaining)| remaining.split_once("};"))
+        .map(|(mappings, _)| mappings)
+        .ok_or(ProviderAttemptState::ProtocolFailure)?;
+    let (_, value) = mappings
+        .split_once("QwenHttp]:\"")
+        .ok_or(ProviderAttemptState::ProtocolFailure)?;
+    value
+        .split_once('"')
+        .map(|(model_id, _)| model_id.to_owned())
+        .filter(|model_id| !model_id.is_empty())
+        .ok_or(ProviderAttemptState::ProtocolFailure)
+}
+
+fn bundled_baseten_property(source: &str) -> Result<&str, ProviderAttemptState> {
+    let (_, remaining) = source
+        .split_once("\"baseten-authorization\":`Api-Key ${")
+        .ok_or(ProviderAttemptState::ProtocolFailure)?;
+    let (expression, _) = remaining
+        .split_once('}')
+        .ok_or(ProviderAttemptState::ProtocolFailure)?;
+    expression
+        .rsplit_once('.')
+        .map(|(_, property)| property)
+        .filter(|property| !property.is_empty())
+        .ok_or(ProviderAttemptState::ProtocolFailure)
+}
+
+fn bundled_exported_string(source: &str, property: &str) -> Result<String, ProviderAttemptState> {
+    let export = format!("{property}:()=>");
+    let (_, remaining) = source
+        .split_once(&export)
+        .ok_or(ProviderAttemptState::ProtocolFailure)?;
+    let identifier: String = remaining
+        .chars()
+        .take_while(|character| {
+            character.is_ascii_alphanumeric() || *character == '_' || *character == '$'
+        })
+        .collect();
+    if identifier.is_empty() {
+        return Err(ProviderAttemptState::ProtocolFailure);
+    }
+    for declaration in ["const", "let", "var"] {
+        let binding = format!("{declaration} {identifier}=\"");
+        if let Some((_, value)) = source.split_once(&binding) {
+            if let Some((key, _)) = value.split_once('"') {
+                if !key.is_empty() {
+                    return Ok(key.to_owned());
+                }
+            }
+        }
+    }
+    Err(ProviderAttemptState::ProtocolFailure)
+}
+
 /// The production host gets a fully concrete private provider, while its
 /// secret/session values remain request-local. The provider's public router
 /// interface has no credential getter or persistence projection.
@@ -366,6 +735,7 @@ pub(crate) fn production_wispr_provider() -> Arc<dyn TranscriptProvider> {
     let wire = Arc::new(ObservedWisprGrpcClient::new(
         Arc::new(ReqwestWisprGrpcStreamingBoundary::default()),
         Arc::new(GopassWisprWireIdentity::default()),
+        Arc::new(FixedWisprGrpcBackendSource),
     ));
     let transport = Arc::new(ProtocolWisprFlowTransport::new(
         Arc::new(RecordingLogWisprMediaAdapter),
@@ -386,6 +756,7 @@ pub(crate) fn production_wispr_provider() -> Arc<dyn TranscriptProvider> {
 pub(crate) struct ObservedWisprGrpcClient {
     stream: Arc<dyn WisprGrpcStreamingBoundary>,
     identity: Arc<dyn WisprWireIdentity>,
+    backend: Arc<dyn WisprGrpcBackendSource>,
 }
 
 impl ObservedWisprGrpcClient {
@@ -393,8 +764,13 @@ impl ObservedWisprGrpcClient {
     pub(crate) fn new(
         stream: Arc<dyn WisprGrpcStreamingBoundary>,
         identity: Arc<dyn WisprWireIdentity>,
+        backend: Arc<dyn WisprGrpcBackendSource>,
     ) -> Self {
-        Self { stream, identity }
+        Self {
+            stream,
+            identity,
+            backend,
+        }
     }
 }
 
@@ -405,16 +781,13 @@ impl WisprFlowWireClient for ObservedWisprGrpcClient {
     ) -> Result<TranscriptText, ProviderAttemptState> {
         let user_id = self.identity.user_id()?;
         let identifiers = self.identity.fresh_request_identifiers()?;
+        let backend = self.backend.backend()?;
+        let mut metadata = backend.metadata();
+        metadata.push(("authorization", format!("Bearer {}", request.session)));
         let call = WisprGrpcStreamCall {
-            host: WISPR_GRPC_HOST,
+            host: backend.host,
             method: TRANSCRIBE_STREAM_PATH,
-            metadata: vec![
-                ("authorization", format!("Bearer {}", request.session)),
-                ("flow-debug", "false".into()),
-                ("disable-formatting", "false".into()),
-                ("content-type", "application/grpc".into()),
-                ("te", "trailers".into()),
-            ],
+            metadata,
             messages: encode_observed_requests(&user_id, identifiers, &request)?,
         };
         let responses = self.stream.stream(call)?;
@@ -422,8 +795,8 @@ impl WisprFlowWireClient for ObservedWisprGrpcClient {
     }
 }
 
-/// Encodes the inferred Init, optional cursor context, and final audio stream
-/// messages. Commit 2 is non-final; Commit 1 seals the PCM16 WAV upload.
+/// Encodes the desktop's one-shot Init, optional cursor context, PCM16/WAV
+/// payload, and final Commit=True in one stream message.
 fn encode_observed_requests(
     user_id: &str,
     identifiers: WisprRequestIdentifiers,
@@ -435,11 +808,11 @@ fn encode_observed_requests(
     let version = protobuf_concat(&[
         protobuf_integer(1, 1),
         protobuf_integer(2, 6),
-        protobuf_integer(3, 606),
+        protobuf_integer(3, 7),
     ]);
     let client = protobuf_concat(&[
         protobuf_string(1, "Wispr Flow"),
-        protobuf_integer(2, 2),
+        protobuf_integer(2, 0),
         protobuf_message(3, &version),
     ]);
     let metadata = protobuf_concat(&[
@@ -473,18 +846,17 @@ fn encode_observed_requests(
         protobuf_message(1, &metadata),
         protobuf_message(2, &preferences),
     ]);
-    let init = protobuf_concat(&[protobuf_message(1, &init_body), protobuf_integer(4, 2)]);
-    let mut messages = vec![init];
+    let mut request_fields = vec![protobuf_message(1, &init_body)];
     if !request.request.preceding_transcript_tail().is_empty() {
         let textbox = protobuf_string(2, request.request.preceding_transcript_tail());
         let context = protobuf_message(2, &protobuf_message(2, &textbox));
-        messages.push(protobuf_concat(&[context, protobuf_integer(4, 2)]));
+        request_fields.push(context);
     }
     let payload = protobuf_bytes(1, &request.wav_pcm16);
     let audio_file = protobuf_message(2, &payload);
-    let audio = protobuf_concat(&[protobuf_message(3, &audio_file), protobuf_integer(4, 1)]);
-    messages.push(audio);
-    Ok(messages)
+    request_fields.push(protobuf_message(3, &audio_file));
+    request_fields.push(protobuf_integer(4, 1));
+    Ok(vec![protobuf_concat(&request_fields)])
 }
 
 fn protobuf_varint(mut value: u64) -> Vec<u8> {
@@ -839,6 +1211,69 @@ impl WisprFlowTransport for ProtocolWisprFlowTransport {
     }
 }
 
+/// A non-retrying transport reserved for the explicit sandbox witness. The
+/// normal provider transport may retry an unsubmitted transient error; this
+/// one cannot distinguish that case from an accepted server submission, so it
+/// reports the first result exactly as observed.
+struct OneShotProtocolWisprFlowTransport {
+    media: Arc<dyn WisprMediaAdapter>,
+    wire: Arc<dyn WisprFlowWireClient>,
+}
+
+impl OneShotProtocolWisprFlowTransport {
+    fn new(media: Arc<dyn WisprMediaAdapter>, wire: Arc<dyn WisprFlowWireClient>) -> Self {
+        Self { media, wire }
+    }
+}
+
+impl WisprFlowTransport for OneShotProtocolWisprFlowTransport {
+    fn transcribe_wav(
+        &self,
+        session: &str,
+        request: &ProviderTranscriptRequest,
+    ) -> Result<TranscriptText, ProviderAttemptState> {
+        let wav_pcm16 = self.media.wav_pcm16(request)?;
+        if !is_wispr_pcm16_wav(&wav_pcm16)
+            || wav_pcm16.len() > 44 + (WISPR_MAXIMUM_SAMPLES as usize * 2)
+        {
+            return Err(ProviderAttemptState::SizeLimit);
+        }
+        self.wire.transcribe_stream(WisprFlowWireRequest::new(
+            session,
+            request.clone(),
+            wav_pcm16,
+        ))
+    }
+}
+
+/// Runs one isolated, Wispr-only provider submission against a supplied WAV.
+/// It does not construct ListenerRuntime, open audio devices or Listener
+/// sockets, create a capture/history store, access the system clipboard, or
+/// route to any fallback provider.
+pub fn sandbox_wispr_transcribe(
+    session_descriptor: i32,
+    desktop_bundle_descriptor: i32,
+    artifact_path: &Path,
+) -> Result<TranscriptText, ProviderAttemptState> {
+    let session = Arc::new(InheritedFdDesktopWisprSession::new(session_descriptor)?);
+    let session_source: Arc<dyn WisprSessionSource> = session.clone();
+    let identity: Arc<dyn WisprWireIdentity> = session;
+    let wire = Arc::new(ObservedWisprGrpcClient::new(
+        Arc::new(ReqwestWisprGrpcStreamingBoundary::default()),
+        identity,
+        Arc::new(DesktopWisprBackendSource::new(desktop_bundle_descriptor)?),
+    ));
+    let transport = Arc::new(OneShotProtocolWisprFlowTransport::new(
+        Arc::new(RecordingLogWisprMediaAdapter),
+        wire,
+    ));
+    WisprFlowProvider::new(
+        Arc::new(OneShotWisprSessionBoundary::new(session_source)),
+        transport,
+    )
+    .transcribe(&ProviderTranscriptRequest::for_test(artifact_path))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -889,7 +1324,11 @@ mod tests {
             synthetic_result_response("<p>formatted</p>", "plain text"),
         ]);
         let client_stream: Arc<dyn WisprGrpcStreamingBoundary> = stream.clone();
-        let client = ObservedWisprGrpcClient::new(client_stream, Arc::new(SyntheticWireIdentity));
+        let client = ObservedWisprGrpcClient::new(
+            client_stream,
+            Arc::new(SyntheticWireIdentity),
+            Arc::new(FixedWisprGrpcBackendSource),
+        );
         let text = client
             .transcribe_stream(WisprFlowWireRequest::new(
                 "synthetic-session",
@@ -907,7 +1346,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].host(), "inference.wisprflow.com");
         assert_eq!(calls[0].method(), TRANSCRIBE_STREAM_PATH);
-        assert_eq!(calls[0].messages().len(), 3);
+        assert_eq!(calls[0].messages().len(), 1);
         assert!(
             calls[0].metadata().iter().any(
                 |(name, value)| *name == "authorization" && value == "Bearer synthetic-session"
@@ -916,9 +1355,24 @@ mod tests {
     }
 
     #[test]
+    fn desktop_backend_descriptor_selects_the_packaged_default_without_exposing_its_key() {
+        let descriptor = desktop_backend_from_bundle(
+            br#"const basetenApiKey="synthetic-client-key";const Rt={Fo:()=>basetenApiKey};class G{static ASR_VARIANT_BASETEN_MODEL_IDS={[xt.eW.QwenHttp]:"synthetic-model"};static getRpcOptions(){return {"baseten-authorization":`Api-Key ${Rt.Fo}`}}}"#,
+        )
+        .expect("synthetic desktop bundle descriptor");
+
+        assert_eq!(descriptor.host, "model-synthetic-model.grpc.api.baseten.co");
+        assert_eq!(descriptor.model_id, "model-synthetic-model");
+        assert_eq!(descriptor.environment, "production");
+    }
+
+    #[test]
     fn grpc_framing_round_trips_without_contacting_a_provider() {
         let encoded = grpc_encode_messages(&[vec![1, 2], vec![3, 4, 5]]);
-        assert_eq!(grpc_decode_messages(&encoded), Ok(vec![vec![1, 2], vec![3, 4, 5]]));
+        assert_eq!(
+            grpc_decode_messages(&encoded),
+            Ok(vec![vec![1, 2], vec![3, 4, 5]])
+        );
         assert_eq!(
             grpc_decode_messages(&[1, 0, 0, 0, 0]),
             Err(ProviderAttemptState::ProtocolFailure),
