@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "listener_wispr_auth_01a0539e_lBulYC",
+  "project_id": "472bb976-1ed6-4b38-9ff7-59102e8c9204"
+}
