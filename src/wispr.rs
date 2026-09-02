@@ -12,7 +12,7 @@ use std::{
     io::Read,
     net::SocketAddr,
     path::Path,
-    process::Command,
+    process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -32,8 +32,8 @@ pub(crate) const TRANSCRIBE_STREAM_PATH: &str =
 pub(crate) const WISPR_GRPC_HOST: &str = "inference.wisprflow.com";
 pub(crate) const WISPR_SAMPLE_RATE: u32 = 16_000;
 pub(crate) const WISPR_MAXIMUM_SAMPLES: u64 = 350 * WISPR_SAMPLE_RATE as u64;
-const WISPR_SESSION_SECRET_NAME: &str = "wispr-flow/session";
-const WISPR_USER_ID_SECRET_NAME: &str = "wispr-flow/user-id";
+const WISPR_CREDENTIAL_SECRET_NAME: &str = "wispr-flow/credentials";
+const WISPR_CREDENTIAL_DOCUMENT_MAXIMUM_BYTES: u64 = 256 * 1024;
 const WISPR_SESSION_CACHE_LIFETIME: Duration = Duration::from_secs(300);
 const WISPR_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 static NEXT_WISPR_REQUEST_IDENTIFIER: AtomicU64 = AtomicU64::new(1);
@@ -60,31 +60,6 @@ impl WisprSession {
 /// is acquired; they must never return it to logs or durable state.
 pub(crate) trait WisprSessionSource: Send + Sync {
     fn refresh_session(&self) -> Result<WisprSession, ProviderAttemptState>;
-}
-
-/// Local, request-time secret consumer for the opaque Wispr session. It never
-/// stores, logs, serializes, or returns the token beyond `WisprSession`; the
-/// gopass entry name is an identifier, not credential material.
-pub(crate) struct GopassWisprSessionSource {
-    secret_name: &'static str,
-}
-
-impl Default for GopassWisprSessionSource {
-    fn default() -> Self {
-        Self {
-            secret_name: WISPR_SESSION_SECRET_NAME,
-        }
-    }
-}
-
-impl WisprSessionSource for GopassWisprSessionSource {
-    fn refresh_session(&self) -> Result<WisprSession, ProviderAttemptState> {
-        let value = local_secret(self.secret_name)?;
-        Ok(WisprSession::new(
-            value,
-            Instant::now() + WISPR_SESSION_CACHE_LIFETIME,
-        ))
-    }
 }
 
 struct SessionCache {
@@ -237,53 +212,20 @@ impl WisprGrpcBackendSource for FixedWisprGrpcBackendSource {
     }
 }
 
-/// Resolves the non-public Wispr identity at submission time through the same
-/// local secret boundary. The request/session identifiers are newly generated
-/// opaque values and never enter durable provider-job state.
-pub(crate) struct GopassWisprWireIdentity {
-    user_id_secret_name: &'static str,
-}
-
-impl Default for GopassWisprWireIdentity {
-    fn default() -> Self {
-        Self {
-            user_id_secret_name: WISPR_USER_ID_SECRET_NAME,
-        }
-    }
-}
-
-impl WisprWireIdentity for GopassWisprWireIdentity {
-    fn user_id(&self) -> Result<String, ProviderAttemptState> {
-        local_secret(self.user_id_secret_name)
-    }
-
-    fn fresh_request_identifiers(&self) -> Result<WisprRequestIdentifiers, ProviderAttemptState> {
-        let sequence = NEXT_WISPR_REQUEST_IDENTIFIER.fetch_add(1, Ordering::Relaxed);
-        let epoch_nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| ProviderAttemptState::Unavailable)?
-            .as_nanos();
-        Ok(WisprRequestIdentifiers::new(
-            format!("listener-{epoch_nanos}-{sequence}"),
-            format!("listener-request-{epoch_nanos}-{sequence}"),
-        ))
-    }
-}
-
 pub(crate) struct WisprRequestIdentifiers {
     session_id: String,
     request_id: String,
 }
 
 impl WisprRequestIdentifiers {
-    fn desktop() -> Result<Self, ProviderAttemptState> {
+    fn desktop(session_id: String) -> Result<Self, ProviderAttemptState> {
         let sequence = NEXT_WISPR_REQUEST_IDENTIFIER.fetch_add(1, Ordering::Relaxed) as u128;
         let epoch_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| ProviderAttemptState::Unavailable)?
             .as_nanos();
         Ok(Self::new(
-            uuid_from_entropy(epoch_nanos, sequence),
+            session_id,
             uuid_from_entropy(epoch_nanos.rotate_left(17), sequence.rotate_left(9)),
         ))
     }
@@ -297,7 +239,7 @@ fn uuid_from_entropy(first: u128, second: u128) -> String {
         (value >> 80) as u16,
         ((value >> 64) & 0x0fff) as u16,
         ((value >> 48) & 0x0fff) as u16,
-        value & 0x0000_0000_0000_ffff_ffff_ffff_ffff
+        value & 0x0000_0000_0000_0000_ffff_ffff_ffff
     )
 }
 
@@ -968,22 +910,111 @@ fn grpc_decode_messages(bytes: &[u8]) -> Result<Vec<Vec<u8>>, ProviderAttemptSta
     Ok(messages)
 }
 
-fn local_secret(secret_name: &str) -> Result<String, ProviderAttemptState> {
-    let output = Command::new("gopass")
-        .args(["show", "-o", secret_name])
-        .output()
-        .map_err(|_| ProviderAttemptState::Unavailable)?;
-    if !output.status.success() {
-        return Err(ProviderAttemptState::Unavailable);
+/// The only production reader for the GoPass document. GoPass writes the
+/// document to its supported stdout descriptor; stderr is discarded and the
+/// document is consumed, bounded, and parsed entirely by Listener.
+trait WisprCredentialDocumentSource: Send + Sync {
+    fn read_document(&self) -> Result<Vec<u8>, ProviderAttemptState>;
+}
+
+struct GopassWisprCredentialDocument;
+
+impl WisprCredentialDocumentSource for GopassWisprCredentialDocument {
+    fn read_document(&self) -> Result<Vec<u8>, ProviderAttemptState> {
+        let mut child = Command::new("gopass")
+            .args(["show", "-o", WISPR_CREDENTIAL_SECRET_NAME])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| ProviderAttemptState::Unavailable)?;
+        let mut output = child
+            .stdout
+            .take()
+            .ok_or(ProviderAttemptState::Unavailable)?;
+        let mut document = Vec::new();
+        output
+            .by_ref()
+            .take(WISPR_CREDENTIAL_DOCUMENT_MAXIMUM_BYTES + 1)
+            .read_to_end(&mut document)
+            .map_err(|_| ProviderAttemptState::Unavailable)?;
+        drop(output);
+        let status = child
+            .wait()
+            .map_err(|_| ProviderAttemptState::Unavailable)?;
+        if !status.success() || document.len() as u64 > WISPR_CREDENTIAL_DOCUMENT_MAXIMUM_BYTES {
+            return Err(ProviderAttemptState::Unavailable);
+        }
+        Ok(document)
     }
-    let value = String::from_utf8(output.stdout)
-        .map_err(|_| ProviderAttemptState::Unavailable)?
-        .trim()
-        .to_owned();
-    if value.is_empty() {
-        return Err(ProviderAttemptState::Unavailable);
+}
+
+/// Shares one parsed request-time document between the bearer and the
+/// provider identity encoder. It is deliberately private, non-serializable,
+/// and only populated by the session refresh path.
+struct GopassWisprCredentials {
+    document: Arc<dyn WisprCredentialDocumentSource>,
+    current: Mutex<Option<DesktopWisprSession>>,
+}
+
+impl Default for GopassWisprCredentials {
+    fn default() -> Self {
+        Self {
+            document: Arc::new(GopassWisprCredentialDocument),
+            current: Mutex::new(None),
+        }
     }
-    Ok(value)
+}
+
+impl GopassWisprCredentials {
+    #[cfg(test)]
+    fn new(document: Arc<dyn WisprCredentialDocumentSource>) -> Self {
+        Self {
+            document,
+            current: Mutex::new(None),
+        }
+    }
+
+    fn refresh(&self) -> Result<WisprSession, ProviderAttemptState> {
+        let document = self.document.read_document()?;
+        let parsed = desktop_session_from_json(&document)?;
+        let access_token = parsed.access_token.clone();
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| ProviderAttemptState::Unavailable)?;
+        *current = Some(parsed);
+        Ok(WisprSession::new(
+            access_token,
+            Instant::now() + WISPR_SESSION_CACHE_LIFETIME,
+        ))
+    }
+
+    fn current(&self) -> Result<(String, String), ProviderAttemptState> {
+        let current = self
+            .current
+            .lock()
+            .map_err(|_| ProviderAttemptState::Unavailable)?;
+        let current = current.as_ref().ok_or(ProviderAttemptState::Unavailable)?;
+        Ok((current.user_id.clone(), current.session_id.clone()))
+    }
+}
+
+impl WisprSessionSource for GopassWisprCredentials {
+    fn refresh_session(&self) -> Result<WisprSession, ProviderAttemptState> {
+        self.refresh()
+    }
+}
+
+impl WisprWireIdentity for GopassWisprCredentials {
+    fn user_id(&self) -> Result<String, ProviderAttemptState> {
+        self.current().map(|(user_id, _)| user_id)
+    }
+
+    fn fresh_request_identifiers(&self) -> Result<WisprRequestIdentifiers, ProviderAttemptState> {
+        let (_, session_id) = self.current()?;
+        WisprRequestIdentifiers::desktop(session_id)
+    }
 }
 
 /// Session material acquired by the sandbox consumer. It deliberately has no
@@ -992,6 +1023,7 @@ fn local_secret(secret_name: &str) -> Result<String, ProviderAttemptState> {
 struct DesktopWisprSession {
     access_token: String,
     user_id: String,
+    session_id: String,
     bearer_state: BearerState,
 }
 
@@ -1014,7 +1046,7 @@ impl InheritedFdDesktopWisprSession {
         })
     }
 
-    fn session(&self) -> Result<(String, String, BearerState), ProviderAttemptState> {
+    fn session(&self) -> Result<(String, String, String, BearerState), ProviderAttemptState> {
         let mut cached = self
             .session
             .lock()
@@ -1027,6 +1059,7 @@ impl InheritedFdDesktopWisprSession {
         Ok((
             session.access_token.clone(),
             session.user_id.clone(),
+            session.session_id.clone(),
             session.bearer_state,
         ))
     }
@@ -1034,7 +1067,7 @@ impl InheritedFdDesktopWisprSession {
 
 impl WisprSessionSource for InheritedFdDesktopWisprSession {
     fn refresh_session(&self) -> Result<WisprSession, ProviderAttemptState> {
-        let (access_token, _, _) = self.session()?;
+        let (access_token, _, _, _) = self.session()?;
         Ok(WisprSession::new(
             access_token,
             Instant::now() + WISPR_SESSION_CACHE_LIFETIME,
@@ -1044,12 +1077,13 @@ impl WisprSessionSource for InheritedFdDesktopWisprSession {
 
 impl WisprWireIdentity for InheritedFdDesktopWisprSession {
     fn user_id(&self) -> Result<String, ProviderAttemptState> {
-        let (_, user_id, _) = self.session()?;
+        let (_, user_id, _, _) = self.session()?;
         Ok(user_id)
     }
 
     fn fresh_request_identifiers(&self) -> Result<WisprRequestIdentifiers, ProviderAttemptState> {
-        WisprRequestIdentifiers::desktop()
+        let (_, _, session_id, _) = self.session()?;
+        WisprRequestIdentifiers::desktop(session_id)
     }
 }
 
@@ -1076,8 +1110,17 @@ fn desktop_session_from_json(bytes: &[u8]) -> Result<DesktopWisprSession, Provid
     let access_token = first_json_string(&document, "access_token")
         .or_else(|| first_json_string(&document, "accessToken"))
         .ok_or(ProviderAttemptState::Unavailable)?;
-    let user_id = desktop_user_identifier(&document)
-        .or_else(|| jwt_subject(&access_token))
+    let provider = desktop_auth_provider(&document, &access_token);
+    let user_id = match provider {
+        DesktopAuthProvider::Supabase => supabase_user_identifier(&document),
+        DesktopAuthProvider::Workos => {
+            jwt_claim_string(&access_token, "urn:wispr:user_external_id")
+        }
+    }
+    .ok_or(ProviderAttemptState::Unavailable)?;
+    let session_id = first_json_string(&document, "session_id")
+        .or_else(|| first_json_string(&document, "sessionId"))
+        .filter(|identifier| is_uuid_identifier(identifier))
         .ok_or(ProviderAttemptState::Unavailable)?;
     if access_token.is_empty() || user_id.is_empty() {
         return Err(ProviderAttemptState::Unavailable);
@@ -1087,6 +1130,7 @@ fn desktop_session_from_json(bytes: &[u8]) -> Result<DesktopWisprSession, Provid
     Ok(DesktopWisprSession {
         access_token,
         user_id,
+        session_id,
         bearer_state,
     })
 }
@@ -1158,18 +1202,15 @@ fn seconds_to_milliseconds(seconds: u64) -> Option<u128> {
     u128::from(seconds).checked_mul(1_000)
 }
 
-fn desktop_user_identifier(document: &serde_json::Value) -> Option<String> {
-    first_json_string(document, "user_id")
-        .or_else(|| first_json_string(document, "userId"))
+fn supabase_user_identifier(document: &serde_json::Value) -> Option<String> {
+    document
+        .get("user")
+        .and_then(|user| first_json_string(user, "id"))
         .or_else(|| {
-            ["user", "currentUser", "profile", "identity"]
-                .into_iter()
-                .filter_map(|key| document.get(key))
-                .find_map(|value| {
-                    first_json_string(value, "id")
-                        .or_else(|| first_json_string(value, "user_id"))
-                        .or_else(|| first_json_string(value, "userId"))
-                })
+            document
+                .get("currentSession")
+                .and_then(|session| session.get("user"))
+                .and_then(|user| first_json_string(user, "id"))
         })
 }
 
@@ -1207,8 +1248,12 @@ fn first_json_u64(document: &serde_json::Value, key: &str) -> Option<u64> {
     }
 }
 
-fn jwt_subject(token: &str) -> Option<String> {
-    jwt_claim_string(token, "sub")
+fn is_uuid_identifier(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
 }
 
 fn jwt_issuer_is_workos(token: &str) -> bool {
@@ -1341,12 +1386,11 @@ fn bundled_exported_string(source: &str, property: &str) -> Result<String, Provi
 /// secret/session values remain request-local. The provider's public router
 /// interface has no credential getter or persistence projection.
 pub(crate) fn production_wispr_provider() -> Arc<dyn TranscriptProvider> {
-    let session = Arc::new(RefreshingWisprSessionBoundary::new(Arc::new(
-        GopassWisprSessionSource::default(),
-    )));
+    let credentials = Arc::new(GopassWisprCredentials::default());
+    let session = Arc::new(RefreshingWisprSessionBoundary::new(credentials.clone()));
     let wire = Arc::new(ObservedWisprGrpcClient::new(
         Arc::new(ReqwestWisprGrpcStreamingBoundary::default()),
-        Arc::new(GopassWisprWireIdentity::default()),
+        credentials,
         Arc::new(FixedWisprGrpcBackendSource),
     ));
     let transport = Arc::new(ProtocolWisprFlowTransport::new(
@@ -1868,7 +1912,7 @@ pub fn sandbox_wispr_witness_checkpointed(
         Err(_) => return WisprWitnessDiagnostics::at("bundle-descriptor"),
     };
     checkpoint.advance("bundle-descriptor");
-    let (access_token, _, bearer_state) = match session.session() {
+    let (access_token, _, _, bearer_state) = match session.session() {
         Ok(session) => session,
         Err(_) => return WisprWitnessDiagnostics::at("session"),
     };
@@ -2191,6 +2235,126 @@ mod tests {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
         let payload = serde_json::json!({"iss": issuer});
+        format!(
+            "synthetic.{}.signature",
+            URL_SAFE_NO_PAD.encode(payload.to_string())
+        )
+    }
+
+    #[test]
+    fn credential_document_derives_the_provider_identity_for_supported_sessions() {
+        let supabase = serde_json::json!({
+            "access_token": "synthetic-supabase-token",
+            "user": { "id": "synthetic-supabase-user" },
+            "session_id": "00000000-0000-4000-8000-000000000001",
+        });
+        let workos_token = synthetic_jwt_with_claims(serde_json::json!({
+            "iss": "https://authkit.example.invalid",
+            "urn:wispr:user_external_id": "synthetic-workos-user",
+        }));
+        let workos = serde_json::json!({
+            "authProviderId": "workos",
+            "accessToken": workos_token,
+            "sessionId": "00000000-0000-4000-8000-000000000002",
+        });
+
+        let supabase = desktop_session_from_json(supabase.to_string().as_bytes())
+            .expect("synthetic Supabase document");
+        let workos = desktop_session_from_json(workos.to_string().as_bytes())
+            .expect("synthetic WorkOS document");
+
+        assert_eq!(supabase.user_id, "synthetic-supabase-user");
+        assert_eq!(supabase.session_id, "00000000-0000-4000-8000-000000000001");
+        assert_eq!(workos.user_id, "synthetic-workos-user");
+        assert_eq!(workos.session_id, "00000000-0000-4000-8000-000000000002");
+    }
+
+    #[test]
+    fn credential_document_is_read_at_refresh_and_shared_with_the_wire_identity() {
+        let document = Arc::new(SyntheticCredentialDocument::new(
+            serde_json::json!({
+                "access_token": "synthetic-request-time-token",
+                "user": { "id": "synthetic-request-time-user" },
+                "session_id": "00000000-0000-4000-8000-000000000003",
+            })
+            .to_string()
+            .into_bytes(),
+        ));
+        let credentials = GopassWisprCredentials::new(document.clone());
+
+        assert_eq!(document.reads(), 0);
+        let _session = credentials
+            .refresh_session()
+            .expect("refresh credential document");
+        assert_eq!(document.reads(), 1);
+        assert_eq!(
+            credentials.user_id().expect("derive provider user id"),
+            "synthetic-request-time-user"
+        );
+        let identifiers = credentials
+            .fresh_request_identifiers()
+            .expect("derive request identifiers");
+        assert_eq!(
+            identifiers.session_id,
+            "00000000-0000-4000-8000-000000000003"
+        );
+        assert!(is_uuid_identifier(&identifiers.request_id));
+        assert_eq!(
+            document.reads(),
+            1,
+            "the wire identity must use the parsed request-time document"
+        );
+    }
+
+    #[test]
+    fn credential_document_rejects_a_missing_provider_session_identifier() {
+        let credentials = GopassWisprCredentials::new(Arc::new(SyntheticCredentialDocument::new(
+            serde_json::json!({
+                "access_token": "synthetic-token",
+                "user": { "id": "synthetic-user" },
+            })
+            .to_string()
+            .into_bytes(),
+        )));
+
+        assert!(matches!(
+            credentials.refresh_session(),
+            Err(ProviderAttemptState::Unavailable)
+        ));
+        assert_eq!(
+            credentials.user_id(),
+            Err(ProviderAttemptState::Unavailable)
+        );
+    }
+
+    struct SyntheticCredentialDocument {
+        document: Vec<u8>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SyntheticCredentialDocument {
+        fn new(document: Vec<u8>) -> Self {
+            Self {
+                document,
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::Relaxed)
+        }
+    }
+
+    impl WisprCredentialDocumentSource for SyntheticCredentialDocument {
+        fn read_document(&self) -> Result<Vec<u8>, ProviderAttemptState> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.document.clone())
+        }
+    }
+
+    fn synthetic_jwt_with_claims(payload: serde_json::Value) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
         format!(
             "synthetic.{}.signature",
             URL_SAFE_NO_PAD.encode(payload.to_string())
