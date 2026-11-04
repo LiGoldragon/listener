@@ -2,7 +2,7 @@
   description = "Listener speech-to-text CLI and supervised daemon scaffold.";
 
   inputs = {
-    nixpkgs.url = "github:LiGoldragon/nixpkgs?ref=main";
+    nixpkgs.url = "github:LiGoldragon/nixpkgs";
     fenix.url = "github:nix-community/fenix";
     fenix.inputs.nixpkgs.follows = "nixpkgs";
     crane.url = "github:ipetkov/crane";
