@@ -16,6 +16,37 @@ use listener::{
 use signal_listener::CaptureSession;
 use tempfile::TempDir;
 
+#[derive(Clone)]
+struct RecordingStatusSink {
+    events: Arc<Mutex<Vec<listener::ListenerStatusEvent>>>,
+}
+
+impl RecordingStatusSink {
+    fn new() -> Self {
+        Self {
+            events: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn events(&self) -> Vec<listener::ListenerStatusEvent> {
+        self.events.lock().expect("status events").clone()
+    }
+}
+
+impl listener::StatusEventPublishable for RecordingStatusSink {
+    fn publish(&self, event: listener::ListenerStatusEvent) {
+        if let Ok(mut events) = self.events.lock() {
+            events.push(event);
+        }
+    }
+}
+
+fn recording_status_publisher() -> (listener::StatusPublisher, RecordingStatusSink) {
+    let sink = RecordingStatusSink::new();
+    let publisher = listener::StatusPublisher::with_sink(Arc::new(sink.clone()));
+    (publisher, sink)
+}
+
 struct CaptureWriterFixture {
     directory: TempDir,
     committed_lengths: Arc<Mutex<Vec<u64>>>,
@@ -694,7 +725,7 @@ fn capture_writer_samples_live_level_at_fifty_millisecond_pcm_window() {
         Box::new(CommitProbe::new(Arc::clone(&fixture.committed_lengths))),
     )
     .expect("create recording log");
-    let (status_publisher, status_events) = listener::StatusPublisher::recorder();
+    let (status_publisher, status_events) = recording_status_publisher();
     let sample_window_bytes = 1_600;
     let input = ReadWindowProbeInput::new(vec![
         vec![1; sample_window_bytes],

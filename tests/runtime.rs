@@ -18,8 +18,8 @@ use listener::{
     Configuration, DeliveryOwnershipAdmission, HistoryLimit, ListenerMaintenanceClient,
     ListenerRuntime, OutputTargetDispatcher, RecordingAudioFormat, RecordingInputSource,
     RecordingLog, RecordingLogHeader, RecordingLogWriter, RecordingStartTime,
-    RuntimeFinalizationFeedback, StatusEventRecorder, StatusPublisher, StatusStreamServer,
-    SuccessNotifier, TranscriptDelivery, TranscriptDeliveryRequest, TranscriptHistoryStore,
+    RuntimeFinalizationFeedback, StatusPublisher, StatusStreamServer, SuccessNotifier,
+    TranscriptDelivery, TranscriptDeliveryRequest, TranscriptHistoryStore,
 };
 use signal_frame::{ExchangeIdentifier, ExchangeLane, LaneSequence, Reply, SessionEpoch, SubReply};
 use signal_listener::{
@@ -32,17 +32,48 @@ use signal_listener::{
 };
 use tempfile::TempDir;
 
+#[derive(Clone)]
+struct RecordingStatusSink {
+    events: Arc<Mutex<Vec<listener::ListenerStatusEvent>>>,
+}
+
+impl RecordingStatusSink {
+    fn new() -> Self {
+        Self {
+            events: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn events(&self) -> Vec<listener::ListenerStatusEvent> {
+        self.events.lock().expect("status events").clone()
+    }
+}
+
+impl listener::StatusEventPublishable for RecordingStatusSink {
+    fn publish(&self, event: listener::ListenerStatusEvent) {
+        if let Ok(mut events) = self.events.lock() {
+            events.push(event);
+        }
+    }
+}
+
+fn recording_status_publisher() -> (StatusPublisher, RecordingStatusSink) {
+    let sink = RecordingStatusSink::new();
+    let publisher = StatusPublisher::with_sink(Arc::new(sink.clone()));
+    (publisher, sink)
+}
+
 struct RuntimeFixture {
     directory: TempDir,
     deliveries: Arc<Mutex<Vec<String>>>,
     transcription_inputs: Arc<Mutex<Vec<BatchTranscriptionInput>>>,
     status_publisher: StatusPublisher,
-    status_events: StatusEventRecorder,
+    status_events: RecordingStatusSink,
 }
 
 impl RuntimeFixture {
     fn new() -> Self {
-        let (status_publisher, status_events) = StatusPublisher::recorder();
+        let (status_publisher, status_events) = recording_status_publisher();
         Self {
             directory: TempDir::new().expect("temp directory"),
             deliveries: Arc::new(Mutex::new(Vec::new())),
@@ -748,6 +779,31 @@ impl CancellationProbe {
             {
                 Output::StatusReported(report)
                     if report.status() == &CaptureStatus::Delivered(session.clone()) =>
+                {
+                    return;
+                }
+                Output::StatusReported(_) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Output::StatusReported(report) => {
+                    panic!("expected delivered completion status, got {report:?}")
+                }
+                other => panic!("expected status reply, got {other:?}"),
+            }
+        }
+    }
+
+    fn wait_until_any_delivered(server: &ListenerSocketServer, sessions: &[CaptureSession]) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match server
+                .handle_input(Input::Status(StatusRequest {}))
+                .expect("read parallel completion status through actor")
+            {
+                Output::StatusReported(report)
+                    if sessions.iter().any(|session| {
+                        report.status() == &CaptureStatus::Delivered(session.clone())
+                    }) =>
                 {
                     return;
                 }
@@ -1850,6 +1906,7 @@ fn actor_records_again_while_two_transcriptions_run_in_parallel_without_losing_h
     );
 
     gate.release();
+    CancellationProbe::wait_until_any_delivered(&server, &[first.clone(), second.clone()]);
     let deadline = Instant::now() + Duration::from_secs(2);
     while fixture.recorded_history().len() < 2 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));

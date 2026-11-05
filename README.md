@@ -144,5 +144,4 @@ Environment configuration:
 - `LISTENER_TRANSCRIPTION_CUSTOMIZATION_ARCHIVE`: optional vocabulary archive.
 
 The production backend reads the existing OpenAI credential at request time
-and uses `gpt-4o-transcribe`. The development-only
-`LISTENER_DEVELOPMENT_TRANSCRIPTION_PROGRAM` seam is not the production path.
+and uses `gpt-4o-transcribe`.

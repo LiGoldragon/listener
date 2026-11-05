@@ -64,14 +64,13 @@ pub use recording_log::{
 };
 pub use runtime::{DeliveryOwnershipAdmission, ListenerRuntime, RuntimeFinalizationFeedback};
 pub use status::{
-    ListenerStatusEvent, ListenerStatusState, MicrophoneLevel, StatusEventRecorder,
+    ListenerStatusEvent, ListenerStatusState, MicrophoneLevel, StatusEventPublishable,
     StatusPublisher, StatusStreamServer,
 };
 pub use transcription::{
     BatchTranscriber, BatchTranscriptionInput, BatchTranscriptionInputFormat,
-    BatchTranscriptionRequest, ConfiguredBatchTranscriber, HonestStubTranscriber,
-    OpenAiBatchTranscriptionActor, OpenAiCredentialSource, OpenAiRestTranscriber,
-    OpenAiTranscriptionRequestConfiguration,
+    BatchTranscriptionRequest, OpenAiBatchTranscriptionActor, OpenAiCredentialSource,
+    OpenAiRestTranscriber, OpenAiTranscriptionRequestConfiguration,
     TRANSCRIPTION_CUSTOMIZATION_ARCHIVE_ENVIRONMENT_VARIABLE, TranscriptionCustomization,
     TranscriptionCustomizationEnvironment, TranscriptionCustomizationTextSource,
     TranscriptionPrompt,

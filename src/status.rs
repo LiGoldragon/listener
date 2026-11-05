@@ -192,7 +192,7 @@ impl<'a> ListenerStatusEventFrame<'a> {
 
 #[derive(Clone)]
 pub struct StatusPublisher {
-    sink: StatusPublisherSink,
+    sink: Arc<dyn StatusEventPublishable>,
     latency_instrumentation: LatencyInstrumentation,
     in_flight_transcriptions: Arc<AtomicUsize>,
 }
@@ -200,22 +200,18 @@ pub struct StatusPublisher {
 impl StatusPublisher {
     pub fn silent() -> Self {
         Self {
-            sink: StatusPublisherSink::Silent,
+            sink: Arc::new(SilentStatusSink),
             latency_instrumentation: LatencyInstrumentation::disabled(),
             in_flight_transcriptions: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    pub fn recorder() -> (Self, StatusEventRecorder) {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        (
-            Self {
-                sink: StatusPublisherSink::Recorder(Arc::clone(&events)),
-                latency_instrumentation: LatencyInstrumentation::disabled(),
-                in_flight_transcriptions: Arc::new(AtomicUsize::new(0)),
-            },
-            StatusEventRecorder::new(events),
-        )
+    pub fn with_sink(sink: Arc<dyn StatusEventPublishable>) -> Self {
+        Self {
+            sink,
+            latency_instrumentation: LatencyInstrumentation::disabled(),
+            in_flight_transcriptions: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     fn stream(
@@ -223,7 +219,7 @@ impl StatusPublisher {
         latency_instrumentation: LatencyInstrumentation,
     ) -> Self {
         Self {
-            sink: StatusPublisherSink::Stream(sender),
+            sink: Arc::new(StreamStatusSink { sender }),
             latency_instrumentation,
             in_flight_transcriptions: Arc::new(AtomicUsize::new(0)),
         }
@@ -234,17 +230,7 @@ impl StatusPublisher {
             .with_in_flight_transcriptions(self.in_flight_transcriptions.load(Ordering::Acquire));
         self.latency_instrumentation
             .record_state_publication(event.state());
-        match &self.sink {
-            StatusPublisherSink::Silent => {}
-            StatusPublisherSink::Stream(sender) => {
-                let _ = sender.send(StatusStreamMessage::Publish(event));
-            }
-            StatusPublisherSink::Recorder(events) => {
-                if let Ok(mut events) = events.lock() {
-                    events.push(event);
-                }
-            }
-        }
+        self.sink.publish(event);
     }
 
     pub fn publish_idle(&self) {
@@ -289,25 +275,23 @@ impl StatusPublisher {
     }
 }
 
-#[derive(Clone)]
-enum StatusPublisherSink {
-    Silent,
-    Stream(mpsc::Sender<StatusStreamMessage>),
-    Recorder(Arc<Mutex<Vec<ListenerStatusEvent>>>),
+pub trait StatusEventPublishable: Send + Sync {
+    fn publish(&self, event: ListenerStatusEvent);
 }
 
-#[derive(Clone)]
-pub struct StatusEventRecorder {
-    events: Arc<Mutex<Vec<ListenerStatusEvent>>>,
+struct SilentStatusSink;
+
+impl StatusEventPublishable for SilentStatusSink {
+    fn publish(&self, _event: ListenerStatusEvent) {}
 }
 
-impl StatusEventRecorder {
-    fn new(events: Arc<Mutex<Vec<ListenerStatusEvent>>>) -> Self {
-        Self { events }
-    }
+struct StreamStatusSink {
+    sender: mpsc::Sender<StatusStreamMessage>,
+}
 
-    pub fn events(&self) -> Vec<ListenerStatusEvent> {
-        self.events.lock().expect("status events").clone()
+impl StatusEventPublishable for StreamStatusSink {
+    fn publish(&self, event: ListenerStatusEvent) {
+        let _ = self.sender.send(StatusStreamMessage::Publish(event));
     }
 }
 
