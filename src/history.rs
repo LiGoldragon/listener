@@ -24,7 +24,6 @@ use crate::{Error, Result};
 
 const HISTORY_DIRECTORY_MODE: u32 = 0o700;
 const HISTORY_FILE_MODE: u32 = 0o600;
-const DEFAULT_HISTORY_MAXIMUM_BYTES: u64 = 16 * 1024 * 1024;
 const MILLISECONDS_PER_DAY: u64 = 24 * 60 * 60 * 1000;
 const HISTORY_READ_BUFFER_BYTES: usize = 8 * 1024;
 const HISTORY_MAXIMUM_LINE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
@@ -85,37 +84,36 @@ impl HistoryByteLimit {
 
 /// The retention contract for transcript history.
 ///
-/// The default retains records without age expiry and at most 16 MiB. Both
+/// The default retains records without age or byte expiry. Both
 /// values are configurable through
 /// `LISTENER_HISTORY_RETENTION_DAYS` and `LISTENER_HISTORY_MAXIMUM_BYTES`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HistoryRetentionPolicy {
     maximum_age: Option<HistoryRetentionAge>,
-    maximum_bytes: HistoryByteLimit,
+    maximum_bytes: Option<HistoryByteLimit>,
 }
 
 impl HistoryRetentionPolicy {
     pub fn new(maximum_age: HistoryRetentionAge, maximum_bytes: HistoryByteLimit) -> Self {
         Self {
             maximum_age: Some(maximum_age),
-            maximum_bytes,
+            maximum_bytes: Some(maximum_bytes),
         }
     }
 
     pub fn from_environment() -> Result<Self> {
-        let maximum_age = match Self::environment_u64("LISTENER_HISTORY_RETENTION_DAYS")? {
-            Some(days) => Some(HistoryRetentionAge::from_days(days).ok_or_else(|| {
-                Error::InvalidHistoryRetentionPolicy {
-                    variable: "LISTENER_HISTORY_RETENTION_DAYS".to_owned(),
-                    value: days.to_string(),
-                }
-            })?),
-            None => None,
-        };
-        let maximum_bytes = match Self::environment_u64("LISTENER_HISTORY_MAXIMUM_BYTES")? {
-            Some(bytes) => HistoryByteLimit::new(bytes),
-            None => Self::default().maximum_bytes,
-        };
+        let maximum_age = Self::environment_u64("LISTENER_HISTORY_RETENTION_DAYS")?
+            .map(|days| {
+                HistoryRetentionAge::from_days(days).ok_or_else(|| {
+                    Error::InvalidHistoryRetentionPolicy {
+                        variable: "LISTENER_HISTORY_RETENTION_DAYS".to_owned(),
+                        value: days.to_string(),
+                    }
+                })
+            })
+            .transpose()?;
+        let maximum_bytes =
+            Self::environment_u64("LISTENER_HISTORY_MAXIMUM_BYTES")?.map(HistoryByteLimit::new);
         Ok(Self {
             maximum_age,
             maximum_bytes,
@@ -126,7 +124,7 @@ impl HistoryRetentionPolicy {
         self.maximum_age
     }
 
-    pub fn maximum_bytes(&self) -> HistoryByteLimit {
+    pub fn maximum_bytes(&self) -> Option<HistoryByteLimit> {
         self.maximum_bytes
     }
 
@@ -142,15 +140,6 @@ impl HistoryRetentionPolicy {
                 variable: variable.to_owned(),
                 value,
             })
-    }
-}
-
-impl Default for HistoryRetentionPolicy {
-    fn default() -> Self {
-        Self {
-            maximum_age: None,
-            maximum_bytes: HistoryByteLimit::new(DEFAULT_HISTORY_MAXIMUM_BYTES),
-        }
     }
 }
 
@@ -389,12 +378,20 @@ impl TranscriptHistoryStore {
         entry: TranscriptHistoryEntry,
     ) -> Result<()> {
         let retained_entry = RetainedHistoryEntry::from_entry(entry)?;
-        if retained_entry.byte_length() > self.retention.maximum_bytes().bytes() {
+        if self
+            .retention
+            .maximum_bytes()
+            .is_some_and(|maximum_bytes| retained_entry.byte_length() > maximum_bytes.bytes())
+        {
             return Ok(());
         }
         *retained_bytes = retained_bytes.saturating_add(retained_entry.byte_length());
         retained.push_back(retained_entry);
-        while *retained_bytes > self.retention.maximum_bytes().bytes() {
+        while self
+            .retention
+            .maximum_bytes()
+            .is_some_and(|maximum_bytes| *retained_bytes > maximum_bytes.bytes())
+        {
             let Some(expired_by_size) = retained.pop_front() else {
                 return Ok(());
             };
@@ -521,8 +518,10 @@ impl TranscriptHistoryStore {
     }
 
     fn maximum_line_bytes(&self) -> usize {
-        usize::try_from(self.retention.maximum_bytes().bytes())
-            .unwrap_or(usize::MAX)
+        self.retention
+            .maximum_bytes()
+            .and_then(|maximum_bytes| usize::try_from(maximum_bytes.bytes()).ok())
+            .unwrap_or(HISTORY_MAXIMUM_LINE_BUFFER_BYTES)
             .min(HISTORY_MAXIMUM_LINE_BUFFER_BYTES)
     }
 
