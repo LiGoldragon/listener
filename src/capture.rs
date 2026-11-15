@@ -19,7 +19,6 @@ use crate::{
 
 const LIVE_LEVEL_SAMPLE_DURATION: Duration = Duration::from_millis(50);
 const MILLISECONDS_PER_DAY: u64 = 24 * 60 * 60 * 1_000;
-const DEFAULT_CAPTURE_RETENTION_DAYS: u64 = 3;
 const TERMINAL_CAPTURE_MAGIC: [u8; 8] = *b"LSTNTERM";
 const TERMINAL_CAPTURE_RECORD_LENGTH: usize = 24;
 const LEGACY_AUDIO_EXTENSIONS: [&str; 13] = [
@@ -70,9 +69,8 @@ impl CaptureRetentionByteLimit {
     }
 }
 
-/// Policy for terminal capture media. By default Listener retains canonical
-/// audio for three days from terminal capture completion. The optional byte
-/// cap may reclaim older terminal captures earlier.
+/// Policy for terminal capture media. Age retention is opt-in; the optional
+/// byte cap may reclaim older terminal captures when explicitly configured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CaptureRetentionPolicy {
     maximum_age: Option<CaptureRetentionAge>,
@@ -91,14 +89,16 @@ impl CaptureRetentionPolicy {
     }
 
     pub fn from_environment() -> Result<Self> {
-        let days = Self::environment_u64("LISTENER_CAPTURE_RETENTION_DAYS")?
-            .unwrap_or(DEFAULT_CAPTURE_RETENTION_DAYS);
-        let maximum_age = Some(CaptureRetentionAge::from_days(days).ok_or_else(|| {
-            Error::InvalidCaptureRetentionPolicy {
-                variable: "LISTENER_CAPTURE_RETENTION_DAYS".to_owned(),
-                value: days.to_string(),
-            }
-        })?);
+        let maximum_age = Self::environment_u64("LISTENER_CAPTURE_RETENTION_DAYS")?
+            .map(|days| {
+                CaptureRetentionAge::from_days(days).ok_or_else(|| {
+                    Error::InvalidCaptureRetentionPolicy {
+                        variable: "LISTENER_CAPTURE_RETENTION_DAYS".to_owned(),
+                        value: days.to_string(),
+                    }
+                })
+            })
+            .transpose()?;
         let maximum_bytes = Self::environment_u64("LISTENER_CAPTURE_RETENTION_MAXIMUM_BYTES")?
             .map(CaptureRetentionByteLimit::new);
         Ok(Self::new(maximum_age, maximum_bytes))
@@ -129,13 +129,7 @@ impl CaptureRetentionPolicy {
 
 impl Default for CaptureRetentionPolicy {
     fn default() -> Self {
-        Self::new(
-            Some(
-                CaptureRetentionAge::from_days(DEFAULT_CAPTURE_RETENTION_DAYS)
-                    .expect("default capture retention age fits u64"),
-            ),
-            None,
-        )
+        Self::new(None, None)
     }
 }
 
@@ -407,7 +401,7 @@ impl CaptureStore {
     /// capture is never marked terminal and is therefore never considered here.
     /// Every source survives until a verified canonical WebM/Opus replacement
     /// exists; a failed conversion leaves a durable failed state for inspection
-    /// and the normal three-day terminal reaper.
+    /// and any explicitly configured terminal reaper.
     pub fn migrate_terminal_captures(&self) -> Result<()> {
         self.prepare()?;
         let sessions = self.known_sessions()?;

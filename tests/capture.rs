@@ -227,7 +227,7 @@ fn terminal_capture_media_reclaims_oldest_session_when_byte_bound_is_exceeded() 
 }
 
 #[test]
-fn default_three_day_terminal_retention_reclaims_terminal_media() {
+fn explicit_three_day_terminal_retention_reclaims_terminal_media() {
     let fixture = CaptureWriterFixture::new();
     let store = CaptureStore::new(fixture.directory.path().join("captures"));
     store.prepare().expect("prepare capture store");
@@ -243,13 +243,40 @@ fn default_three_day_terminal_retention_reclaims_terminal_media() {
 
     store
         .enforce_retention_at(
-            CaptureRetentionPolicy::default(),
+            CaptureRetentionPolicy::new(
+                Some(CaptureRetentionAge::from_days(3).expect("three-day retention")),
+                None,
+            ),
             SystemTime::now() + Duration::from_secs(4 * 24 * 60 * 60),
         )
-        .expect("enforce default three-day retention");
+        .expect("enforce explicit three-day retention");
     assert!(
         !Path::new(store.artifact_for_session(&session).path().as_str()).exists(),
-        "default policy must reap terminal media after its three-day horizon"
+        "explicit policy must reap terminal media after its three-day horizon"
+    );
+}
+
+#[test]
+fn default_maintenance_does_not_expire_terminal_media_by_age() {
+    let fixture = CaptureWriterFixture::new();
+    let store = CaptureStore::new(fixture.directory.path().join("captures"));
+    store.prepare().expect("prepare capture store");
+    let session = CaptureSession::new(1);
+    let path = store.artifact_for_session(&session);
+    fs::write(path.path().as_str(), b"terminal media").expect("write terminal capture");
+    store
+        .mark_terminal_capture(&session, TerminalCaptureState::Cancelled)
+        .expect("mark terminal capture");
+
+    store
+        .enforce_retention_at(
+            CaptureRetentionPolicy::default(),
+            SystemTime::now() + Duration::from_secs(365 * 24 * 60 * 60),
+        )
+        .expect("enforce default retention");
+    assert!(
+        Path::new(path.path().as_str()).exists(),
+        "default retention must not expire terminal media by age"
     );
 }
 
@@ -333,7 +360,10 @@ fn failed_legacy_audio_migration_preserves_source_until_terminal_reaping() {
 
     store
         .enforce_retention_at(
-            CaptureRetentionPolicy::default(),
+            CaptureRetentionPolicy::new(
+                Some(CaptureRetentionAge::from_days(3).expect("three-day retention")),
+                None,
+            ),
             SystemTime::now() + Duration::from_secs(4 * 24 * 60 * 60),
         )
         .expect("reap expired terminal legacy audio");

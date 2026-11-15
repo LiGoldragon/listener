@@ -24,7 +24,6 @@ use crate::{Error, Result};
 
 const HISTORY_DIRECTORY_MODE: u32 = 0o700;
 const HISTORY_FILE_MODE: u32 = 0o600;
-const DEFAULT_HISTORY_RETENTION_DAYS: u64 = 90;
 const DEFAULT_HISTORY_MAXIMUM_BYTES: u64 = 16 * 1024 * 1024;
 const MILLISECONDS_PER_DAY: u64 = 24 * 60 * 60 * 1000;
 const HISTORY_READ_BUFFER_BYTES: usize = 8 * 1024;
@@ -86,41 +85,44 @@ impl HistoryByteLimit {
 
 /// The retention contract for transcript history.
 ///
-/// The default is provisional operational policy: retain records for 90 days
-/// and at most 16 MiB. Both values are configurable through
+/// The default retains records without age expiry and at most 16 MiB. Both
+/// values are configurable through
 /// `LISTENER_HISTORY_RETENTION_DAYS` and `LISTENER_HISTORY_MAXIMUM_BYTES`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HistoryRetentionPolicy {
-    maximum_age: HistoryRetentionAge,
+    maximum_age: Option<HistoryRetentionAge>,
     maximum_bytes: HistoryByteLimit,
 }
 
 impl HistoryRetentionPolicy {
     pub fn new(maximum_age: HistoryRetentionAge, maximum_bytes: HistoryByteLimit) -> Self {
         Self {
-            maximum_age,
+            maximum_age: Some(maximum_age),
             maximum_bytes,
         }
     }
 
     pub fn from_environment() -> Result<Self> {
         let maximum_age = match Self::environment_u64("LISTENER_HISTORY_RETENTION_DAYS")? {
-            Some(days) => HistoryRetentionAge::from_days(days).ok_or_else(|| {
+            Some(days) => Some(HistoryRetentionAge::from_days(days).ok_or_else(|| {
                 Error::InvalidHistoryRetentionPolicy {
                     variable: "LISTENER_HISTORY_RETENTION_DAYS".to_owned(),
                     value: days.to_string(),
                 }
-            })?,
-            None => Self::default().maximum_age,
+            })?),
+            None => None,
         };
         let maximum_bytes = match Self::environment_u64("LISTENER_HISTORY_MAXIMUM_BYTES")? {
             Some(bytes) => HistoryByteLimit::new(bytes),
             None => Self::default().maximum_bytes,
         };
-        Ok(Self::new(maximum_age, maximum_bytes))
+        Ok(Self {
+            maximum_age,
+            maximum_bytes,
+        })
     }
 
-    pub fn maximum_age(&self) -> HistoryRetentionAge {
+    pub fn maximum_age(&self) -> Option<HistoryRetentionAge> {
         self.maximum_age
     }
 
@@ -145,11 +147,10 @@ impl HistoryRetentionPolicy {
 
 impl Default for HistoryRetentionPolicy {
     fn default() -> Self {
-        Self::new(
-            HistoryRetentionAge::from_days(DEFAULT_HISTORY_RETENTION_DAYS)
-                .expect("default history retention age fits u64"),
-            HistoryByteLimit::new(DEFAULT_HISTORY_MAXIMUM_BYTES),
-        )
+        Self {
+            maximum_age: None,
+            maximum_bytes: HistoryByteLimit::new(DEFAULT_HISTORY_MAXIMUM_BYTES),
+        }
     }
 }
 
@@ -180,7 +181,10 @@ impl HistoryTimestamp {
     }
 
     fn is_expired_at(&self, evaluated_at: Self, retention: HistoryRetentionPolicy) -> bool {
-        let maximum_age = i64::try_from(retention.maximum_age().milliseconds()).unwrap_or(i64::MAX);
+        let Some(maximum_age) = retention.maximum_age() else {
+            return false;
+        };
+        let maximum_age = i64::try_from(maximum_age.milliseconds()).unwrap_or(i64::MAX);
         self.unix_milliseconds < evaluated_at.unix_milliseconds.saturating_sub(maximum_age)
     }
 }
