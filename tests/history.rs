@@ -36,14 +36,29 @@ fn store(path: impl Into<std::path::PathBuf>) -> TranscriptHistoryStore {
 fn default_history_retention_is_ninety_days_and_sixteen_megabytes() {
     let policy = HistoryRetentionPolicy::default();
 
-    assert_eq!(
-        policy.maximum_age(),
-        HistoryRetentionAge::from_days(90).expect("ninety-day retention")
-    );
+    assert_eq!(policy.maximum_age(), None);
     assert_eq!(
         policy.maximum_bytes(),
         HistoryByteLimit::new(16 * 1024 * 1024)
     );
+}
+
+#[test]
+fn default_history_retention_does_not_expire_old_records_by_age() {
+    let directory = TempDir::new().expect("temp directory");
+    let store = TranscriptHistoryStore::new(directory.path().join("history.jsonl"));
+    let old = TranscriptHistoryEntry::new(
+        HistoryTimestamp::from_unix_milliseconds(1),
+        CaptureSession::new(1),
+        TranscriptText::new("old transcript"),
+    );
+
+    store.append(&old).expect("append old entry");
+    let entries = store
+        .read_recent(HistoryLimit::new(1))
+        .expect("read old entry");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].transcript_text().as_str(), "old transcript");
 }
 
 #[test]
