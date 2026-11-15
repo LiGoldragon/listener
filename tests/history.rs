@@ -33,6 +33,20 @@ fn store(path: impl Into<std::path::PathBuf>) -> TranscriptHistoryStore {
 }
 
 #[test]
+fn default_history_retention_is_ninety_days_and_sixteen_megabytes() {
+    let policy = HistoryRetentionPolicy::default();
+
+    assert_eq!(
+        policy.maximum_age(),
+        HistoryRetentionAge::from_days(90).expect("ninety-day retention")
+    );
+    assert_eq!(
+        policy.maximum_bytes(),
+        HistoryByteLimit::new(16 * 1024 * 1024)
+    );
+}
+
+#[test]
 fn append_and_read_back_transcript_history_newest_first() {
     let directory = TempDir::new().expect("temp directory");
     let store = store(directory.path().join("data").join("history.jsonl"));
