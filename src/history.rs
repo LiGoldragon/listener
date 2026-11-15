@@ -517,12 +517,11 @@ impl TranscriptHistoryStore {
         Ok(file)
     }
 
-    fn maximum_line_bytes(&self) -> usize {
+    fn maximum_line_bytes(&self) -> Option<usize> {
         self.retention
             .maximum_bytes()
             .and_then(|maximum_bytes| usize::try_from(maximum_bytes.bytes()).ok())
-            .unwrap_or(HISTORY_MAXIMUM_LINE_BUFFER_BYTES)
-            .min(HISTORY_MAXIMUM_LINE_BUFFER_BYTES)
+            .map(|bytes| bytes.min(HISTORY_MAXIMUM_LINE_BUFFER_BYTES))
     }
 
     fn sync_parent_directory(&self) -> Result<()> {
@@ -572,11 +571,11 @@ struct HistoryLineReader {
     buffered_length: usize,
     buffered_position: usize,
     state: HistoryLineState,
-    maximum_line_bytes: usize,
+    maximum_line_bytes: Option<usize>,
 }
 
 impl HistoryLineReader {
-    fn new(file: File, maximum_line_bytes: usize) -> Self {
+    fn new(file: File, maximum_line_bytes: Option<usize>) -> Self {
         Self {
             reader: BufReader::new(file),
             buffer: [0; HISTORY_READ_BUFFER_BYTES],
@@ -612,13 +611,15 @@ enum HistoryLineState {
 }
 
 impl HistoryLineState {
-    fn accept(&mut self, byte: u8, maximum_line_bytes: usize) -> Option<Vec<u8>> {
+    fn accept(&mut self, byte: u8, maximum_line_bytes: Option<usize>) -> Option<Vec<u8>> {
         match self {
             Self::Collecting(line) if byte == b'\n' => {
                 let complete = std::mem::take(line);
                 Some(complete)
             }
-            Self::Collecting(line) if line.len() < maximum_line_bytes => {
+            Self::Collecting(line)
+                if maximum_line_bytes.is_none_or(|maximum| line.len() < maximum) =>
+            {
                 line.push(byte);
                 None
             }
