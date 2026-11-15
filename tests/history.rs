@@ -81,6 +81,25 @@ fn default_history_retention_keeps_more_than_sixteen_megabytes() {
 }
 
 #[test]
+fn default_history_retention_keeps_one_record_larger_than_sixteen_megabytes() {
+    let directory = TempDir::new().expect("temp directory");
+    let store = TranscriptHistoryStore::new(directory.path().join("history.jsonl"));
+    let transcript = "x".repeat(17 * 1024 * 1024);
+
+    store
+        .append(&entry(1, &transcript))
+        .expect("append large entry");
+    let entries = store
+        .read_recent(HistoryLimit::new(1))
+        .expect("read large entry");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].transcript_text().as_str().len(),
+        transcript.len()
+    );
+}
+
+#[test]
 fn append_and_read_back_transcript_history_newest_first() {
     let directory = TempDir::new().expect("temp directory");
     let store = store(directory.path().join("data").join("history.jsonl"));
