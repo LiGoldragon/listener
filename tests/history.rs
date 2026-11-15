@@ -37,10 +37,7 @@ fn default_history_retention_is_ninety_days_and_sixteen_megabytes() {
     let policy = HistoryRetentionPolicy::default();
 
     assert_eq!(policy.maximum_age(), None);
-    assert_eq!(
-        policy.maximum_bytes(),
-        HistoryByteLimit::new(16 * 1024 * 1024)
-    );
+    assert_eq!(policy.maximum_bytes(), None);
 }
 
 #[test]
@@ -59,6 +56,28 @@ fn default_history_retention_does_not_expire_old_records_by_age() {
         .expect("read old entry");
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].transcript_text().as_str(), "old transcript");
+}
+
+#[test]
+fn default_history_retention_keeps_more_than_sixteen_megabytes() {
+    let directory = TempDir::new().expect("temp directory");
+    let store = TranscriptHistoryStore::new(directory.path().join("history.jsonl"));
+    let transcript = "x".repeat(9 * 1024 * 1024);
+
+    store
+        .append(&entry(1, &transcript))
+        .expect("append first large entry");
+    store
+        .append(&entry(2, &transcript))
+        .expect("append second large entry");
+
+    assert_eq!(
+        store
+            .read_recent(HistoryLimit::new(2))
+            .expect("read large history")
+            .len(),
+        2
+    );
 }
 
 #[test]
