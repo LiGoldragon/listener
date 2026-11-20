@@ -145,11 +145,11 @@ impl Transitioning for Record {
             {
                 return Next::Nothing;
             }
-            if job.state == State::Waiting {
-                if let Some(ready) = job.ready() {
-                    self.delivery_claim.0 = Some(job.job_id.clone());
-                    return Next::Deliverable(ready);
-                }
+            if job.state == State::Waiting
+                && let Some(ready) = job.ready()
+            {
+                self.delivery_claim.0 = Some(job.job_id.clone());
+                return Next::Deliverable(ready);
             }
         }
         Next::Nothing
@@ -339,13 +339,12 @@ impl Transitioning for Record {
                         .audio_kept
                         .0
                         .expired(job.moment, execution.moment)
+                        && let Audio::Kept(directory) = &job.audio
                     {
-                        if let Audio::Kept(directory) = &job.audio {
-                            locations.push(AudioLocation {
-                                directory: directory.clone(),
-                                job_id: job.job_id.clone(),
-                            });
-                        }
+                        locations.push(AudioLocation {
+                            directory: directory.clone(),
+                            job_id: job.job_id.clone(),
+                        });
                     }
                 }
                 self.job_vector.retain(|job| {
@@ -358,12 +357,12 @@ impl Transitioning for Record {
                     if !job.terminal() {
                         continue;
                     }
-                    if let Audio::Kept(directory) = &job.audio {
-                        if locations.iter().any(|location| {
+                    if let Audio::Kept(directory) = &job.audio
+                        && locations.iter().any(|location| {
                             location.job_id == job.job_id && &location.directory == directory
-                        }) {
-                            job.audio = Audio::Erased;
-                        }
+                        })
+                    {
+                        job.audio = Audio::Erased;
                     }
                 }
                 self.job_vector.retain(|job| {
