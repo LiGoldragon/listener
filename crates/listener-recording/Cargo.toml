@@ -1,0 +1,26 @@
+[package]
+name = "listener-recording"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/LiGoldragon/listener"
+publish = false
+build = "build.rs"
+
+[features]
+default = []
+datom = ["dep:datom-codec", "listener-library/datom"]
+
+[dependencies]
+listener-library = { git = "https://github.com/LiGoldragon/listener-library", rev = "3549987a7fa5eaab826f21521d5d6a3a23a7d8d7", default-features = false }
+rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
+datom-codec = { git = "https://github.com/LiGoldragon/datom-codec", rev = "09a0526", optional = true }
+
+[build-dependencies]
+ethos-zero = { git = "https://github.com/LiGoldragon/ethos-zero", rev = "2999292dc67c8608e54d32c333c550b29153cbff" }
+
+[lints.rust]
+unsafe_code = "forbid"
+unused = { level = "warn", priority = -1 }
+dead_code = "warn"

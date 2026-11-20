@@ -1,0 +1,29 @@
+Library
+[ :listener_library:JobId :listener_library:AudioLocation :listener_library:Options
+  :listener_library:Hearing :listener_library:Handing :listener_library:Configuration
+  :listener_library:Moment :listener_library:Text :listener_library:JobState
+  :listener_library:Past :listener_library:Ready :listener_library:Backend
+  :listener_library:RecordingSettings :listener_library:Term :listener_library:Kilobits :listener_library:Source
+  :meta_signal_listener:Set :meta_signal_listener:UnknownBackend
+  :signal_listener:NoSuchJob :signal_listener:NoAudio ]
+[ Input.[ Turn.Options Drop Interrupt.JobId Requeue.JobId Tries.JobId
+    Record.{ JobId Hearing } Finish.{ JobId Handing } Prune
+    Forget.Vector<AudioLocation> Last Find.JobId Pending Recollect Apply.Set Settings
+    Import.{ Moment Text } Recover ]
+  Output.[ Turning Dropping Interrupting Requeueing
+    Trial.{ Vector<Backend> Vector<Term> } Next Pruned.Vector<AudioLocation>
+    Forgotten Lasting Finding Standing.Vector<JobState> Recollected.Vector<Past>
+    Applying Configuration Imported.JobId Recovered.Recovery ]
+  Execution.{ Input Moment Option<JobId> }
+  Changes.{ Vector<JobState> Retired.Vector<JobId> Option<Set> }
+  Committed.{ Output Changes }
+  Recovery.{ Hear.Vector<JobId> Next }
+  Turning.[ Fresh.{ Kilobits Source AudioLocation RecordingSettings } Running.JobId NoBackend ]
+  Dropping.[ Dropped.JobId NothingRecording ]
+  Interrupting.[ Interrupted.JobId NothingRecording ]
+  Requeueing.[ Requeued.JobId NoSuchJob NoAudio ]
+  Next.[ Deliverable.Ready Nothing ]
+  Lasting.[ Ready NothingKept ] Finding.[ Ready NoSuchJob NothingKept ]
+  Applying.[ Applied.Set UnknownBackend ] ]
+[]
+[]

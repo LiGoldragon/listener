@@ -1,0 +1,9 @@
+Memory
+[ :listener_library:JobId :listener_library:Moment :listener_library:State
+  :listener_library:Delivery :listener_library:BackendName :listener_library:Transcript
+  :listener_library:Text :listener_library:Try :listener_library:Handing :listener_library:Directory
+  :listener_library:RecordingSettings :listener_library:Configuration ]
+[ Record.{ Vector<Job> Configuration DeliveryClaim.Option<JobId> }
+  Job.{ JobId Moment State Delivery Vector<BackendName> Vector<Transcript>
+    Vector<Try> Option<Handing> Audio RecordingSettings ImportedText.Option<Text> }
+  Audio.[ Kept.Directory Erased ] ]
