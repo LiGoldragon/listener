@@ -3,6 +3,7 @@ use crate::{
     ValidatingConfiguration, ViewingJob, operations, state,
 };
 use listener_library::Configuration;
+use signal_listener::JobChange;
 use std::{
     ffi::OsStr,
     fs::{self, File},
@@ -150,7 +151,7 @@ impl ExecutingMemory for Memory {
         let mut after = before.clone();
         let output = after.transition(&execution)?;
         let changes = operations::Changes {
-            job_state_vector: after
+            job_change_vector: after
                 .job_vector
                 .iter()
                 .filter(|job| {
@@ -160,21 +161,20 @@ impl ExecutingMemory for Memory {
                         .find(|prior| prior.job_id == job.job_id)
                         .is_none_or(|prior| prior.state != job.state)
                 })
-                .map(ViewingJob::status)
+                .map(|job| JobChange::JobState(job.status()))
+                .chain(
+                    before
+                        .job_vector
+                        .iter()
+                        .filter(|job| {
+                            !after
+                                .job_vector
+                                .iter()
+                                .any(|kept| kept.job_id == job.job_id)
+                        })
+                        .map(|job| JobChange::Forgotten(job.job_id.clone())),
+                )
                 .collect(),
-            retired: operations::Retired(
-                before
-                    .job_vector
-                    .iter()
-                    .filter(|job| {
-                        !after
-                            .job_vector
-                            .iter()
-                            .any(|kept| kept.job_id == job.job_id)
-                    })
-                    .map(|job| job.job_id.clone())
-                    .collect(),
-            ),
             set_option: match &output {
                 operations::Output::Applying(operations::Applying::Applied(set)) => {
                     Some(set.clone())

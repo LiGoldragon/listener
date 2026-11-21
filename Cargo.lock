@@ -540,7 +540,7 @@ dependencies = [
 [[package]]
 name = "signal-listener"
 version = "1.0.0"
-source = "git+https://github.com/LiGoldragon/signal-listener?rev=5e588a2e975ff80781ab9411779281f1fc63d109#5e588a2e975ff80781ab9411779281f1fc63d109"
+source = "git+https://github.com/LiGoldragon/signal-listener?rev=df64d2d6e4ca497980a750c4a9229354c126c330#df64d2d6e4ca497980a750c4a9229354c126c330"
 dependencies = [
  "datom-codec",
  "ethos-zero 30.0.1",

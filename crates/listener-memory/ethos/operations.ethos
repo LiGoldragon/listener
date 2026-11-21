@@ -5,7 +5,7 @@ Library
   :listener_library:Past :listener_library:Ready :listener_library:Backend
   :listener_library:RecordingSettings :listener_library:Term :listener_library:Kilobits :listener_library:Source
   :meta_signal_listener:Set :listener_library:UnknownBackend
-  :signal_listener:NoSuchJob :signal_listener:NoAudio ]
+  :signal_listener:NoSuchJob :signal_listener:NoAudio :signal_listener:JobChange ]
 [ Input.[ Turn.Options Drop Interrupt.JobId Requeue.JobId Tries.JobId
     Record.{ JobId Hearing } Finish.{ JobId Handing } Prune
     Forget.Vector<AudioLocation> Last Find.JobId Pending Recollect Apply.Set Settings
@@ -15,7 +15,7 @@ Library
     Forgotten Lasting Finding Standing.Vector<JobState> Recollected.Vector<Past>
     Applying Configuration Imported.JobId Recovered.Recovery ]
   Execution.{ Input Moment Option<JobId> }
-  Changes.{ Vector<JobState> Retired.Vector<JobId> Option<Set> }
+  Changes.{ Vector<JobChange> Option<Set> }
   Committed.{ Output Changes }
   Recovery.{ Hear.Vector<JobId> Next }
   Turning.[ Fresh.{ Kilobits Source AudioLocation RecordingSettings } Running.JobId NoBackend UnknownBackend ]

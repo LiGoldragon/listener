@@ -1897,8 +1897,8 @@ rec {
         workspace_member = null;
         src = pkgs.fetchgit {
           url = "https://github.com/LiGoldragon/signal-listener";
-          rev = "5e588a2e975ff80781ab9411779281f1fc63d109";
-          sha256 = "08snj0p6i4w0ig9nd9cxl17x6bnvbwyr8fax51rs2dl8mv0844rm";
+          rev = "df64d2d6e4ca497980a750c4a9229354c126c330";
+          sha256 = "0k021g4h13js03cwqm4dhgwsn45v0054wd9v820rm6i39kyyhpn6";
         };
         libName = "signal_listener";
         dependencies = [

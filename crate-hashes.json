@@ -8,7 +8,7 @@
   "git+https://github.com/LiGoldragon/meta-signal-listener?rev=0cf47f03e4c99ab424f5db6171875dd9f929161a#1.0.0": "1k2qkbl467x7w89jc4dhlkvfx16y73qhsbxx08zdrww4wixnshzk",
   "git+https://github.com/LiGoldragon/nexus?rev=681a99ba307acd9cce6d5c120846072f1cedd814#0.9.0": "00smri09ygifa939ywnkiykrsw8ssjy6gwkarb66fqmmq9jpxjqv",
   "git+https://github.com/LiGoldragon/protos?rev=c93b598#0.33.0": "00rwpzkxqmwhmxr2dkv9ay9wfvjxbprvvv23lfxmqamm2264r2gb",
-  "git+https://github.com/LiGoldragon/signal-listener?rev=5e588a2e975ff80781ab9411779281f1fc63d109#1.0.0": "08snj0p6i4w0ig9nd9cxl17x6bnvbwyr8fax51rs2dl8mv0844rm",
+  "git+https://github.com/LiGoldragon/signal-listener?rev=df64d2d6e4ca497980a750c4a9229354c126c330#1.0.0": "0k021g4h13js03cwqm4dhgwsn45v0054wd9v820rm6i39kyyhpn6",
   "git+https://github.com/LiGoldragon/signal?rev=4f5cbb9#11.2.0": "14f2bwprz32psr58n9i36padya0r4p54hwm1yq145h1ab6nawvk2",
   "git+https://github.com/LiGoldragon/translator?rev=77ecf05ff43d2063cf4336287dd4bf281ca2e69f#0.2.0": "06agdjjw83cknfpw9vd7n4xbv0zk38jhk25ssag77lfiqhdmivmv"
 }

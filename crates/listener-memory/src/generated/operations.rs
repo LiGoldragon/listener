@@ -86,13 +86,8 @@ pub struct Execution {
 #[rustfmt::skip]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "datom", derive(datom_codec::Datomizable, datom_codec::Composing))]
-pub struct Retired(pub std::vec::Vec<listener_library::JobId>);
-#[rustfmt::skip]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "datom", derive(datom_codec::Datomizable, datom_codec::Composing))]
 pub struct Changes {
-    pub job_state_vector: std::vec::Vec<listener_library::JobState>,
-    pub retired: Retired,
+    pub job_change_vector: std::vec::Vec<signal_listener::JobChange>,
     pub set_option: std::option::Option<meta_signal_listener::Set>,
 }
 #[rustfmt::skip]

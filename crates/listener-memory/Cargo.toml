@@ -14,7 +14,7 @@ datom = ["dep:datom-codec", "listener-library/datom", "signal-listener/datom", "
 
 [dependencies]
 listener-library = { git = "https://github.com/LiGoldragon/listener-library", rev = "d0f571a18e0aa5fb8ecd6454fc5bf813a52edf96", default-features = false }
-signal-listener = { git = "https://github.com/LiGoldragon/signal-listener", rev = "5e588a2e975ff80781ab9411779281f1fc63d109", default-features = false }
+signal-listener = { git = "https://github.com/LiGoldragon/signal-listener", rev = "df64d2d6e4ca497980a750c4a9229354c126c330", default-features = false }
 meta-signal-listener = { git = "https://github.com/LiGoldragon/meta-signal-listener", rev = "0cf47f03e4c99ab424f5db6171875dd9f929161a", default-features = false }
 memory = { git = "https://github.com/LiGoldragon/memory", rev = "e78519c2fc8f213246328bf28f9e38f9a216f76e" }
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
