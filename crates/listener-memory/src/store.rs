@@ -87,7 +87,7 @@ impl CreatingMemory for MemoryDefinition {
         let name = self.path.file_name().ok_or(Error::StoreNotRegular)?;
         let stage = StagedMemory::stage(parent, name)?;
         let database = stage.stamp()?;
-        let table = memory::Table::new(self.table_name);
+        let table = memory::Table::<&str, state::Record>::new(self.table_name);
         let record = state::Record {
             job_vector: Vec::new(),
             configuration,
@@ -112,7 +112,7 @@ impl OpeningMemory for MemoryDefinition {
             Err(error) => return Err(error.into()),
         }
         let database = memory::Memory::open_with_schema(&self.path, &SCHEMA)?;
-        let table = memory::Table::new(self.table_name);
+        let table = memory::Table::<&str, state::Record>::new(self.table_name);
         database
             .read(|transaction| table.get(transaction, self.record_key.as_str()))?
             .ok_or(Error::MissingRecord)?;
