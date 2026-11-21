@@ -16,7 +16,7 @@ datom = ["dep:datom-codec", "listener-library/datom"]
 [dependencies]
 listener-place = { path = "../listener-place" }
 tokio = { version = "1.53.1", default-features = false, features = ["net", "io-util", "sync", "rt"] }
-listener-library = { git = "https://github.com/LiGoldragon/listener-library", rev = "d0f571a18e0aa5fb8ecd6454fc5bf813a52edf96", default-features = false }
+listener-library = { git = "https://github.com/LiGoldragon/listener-library", rev = "5dbc60f59084a388bb0348d528b3da92bf53aedd", default-features = false }
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
 datom-codec = { git = "https://github.com/LiGoldragon/datom-codec", rev = "09a0526", optional = true }
 

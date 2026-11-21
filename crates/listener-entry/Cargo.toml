@@ -27,6 +27,6 @@ signal = { workspace = true, features = ["datom"] }
 signal-listener = { workspace = true, features = ["datom"] }
 tokio.workspace = true
 translator = { workspace = true, default-features = false, features = ["datom"] }
-translator-runtime = { git = "https://github.com/LiGoldragon/translator", rev = "77ecf05ff43d2063cf4336287dd4bf281ca2e69f" }
+translator-runtime = { git = "https://github.com/LiGoldragon/translator", rev = "cb4f6f4e5b3ef07f41d749e669dda58a6bcbf585" }
 ureq = { version = "=3.5.1", default-features = false, features = ["rustls"] }
 zbus = { version = "=4.4.0", default-features = false, features = ["tokio"] }
