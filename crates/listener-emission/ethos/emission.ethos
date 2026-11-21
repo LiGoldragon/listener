@@ -2,10 +2,13 @@ Emission
 [ :listener_library:Program :listener_library:AudioLocation :listener_library:Backend
   :listener_library:Term :listener_library:Text :listener_library:ProviderId
   :listener_library:Failure :listener_library:Try :listener_library:JobId
-  :listener_library:Interruption ]
+  :listener_library:Delivery :listener_library:Failing ]
 [ Transcribe.{ Program AudioLocation Backend Vector<Term> }
   Paste.{ Program Text } Copy.{ Program Text } Notify.Notice ]
 [ Transcription.[ Heard.{ Text Option<ProviderId> } Failure ]
   Pasting.[ Pasted Failure ] Copying.[ Copied Failure ]
   Notifying.[ Notified Failure ] ]
-[ Notice.[ BackendFailed.Try Exhausted.JobId Copied.JobId Interruption ] ]
+[ Notice.[ BackendFailed.Try Exhausted.JobId Copied.JobId
+    DeliveryFailed.{ JobId Delivery Failing }
+    RecordingInterrupted.{ JobId InterruptionCause } ]
+  InterruptionCause.[ MicrophoneLost Unwritable Gap ] ]

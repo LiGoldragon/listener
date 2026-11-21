@@ -1,0 +1,25 @@
+[package]
+name = "listener-place"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+datom = ["dep:datom-codec", "listener-library/datom", "translator/datom"]
+
+[dependencies]
+datom-codec = { workspace = true, optional = true }
+listener-library.workspace = true
+rkyv.workspace = true
+rustix.workspace = true
+translator.workspace = true
+
+[build-dependencies]
+ethos-zero.workspace = true

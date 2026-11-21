@@ -1,0 +1,27 @@
+[package]
+name = "listener-nexus-engine"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+futures-util.workspace = true
+listener-library.workspace = true
+listener-place = { path = "../listener-place" }
+listener-memory = { path = "../listener-memory" }
+listener-emission = { path = "../listener-emission" }
+listener-recording = { path = "../listener-recording" }
+meta-signal-listener.workspace = true
+nexus.workspace = true
+rustix.workspace = true
+signal.workspace = true
+signal-listener.workspace = true
+tokio.workspace = true
+translator.workspace = true

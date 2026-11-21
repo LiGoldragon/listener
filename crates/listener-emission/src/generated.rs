@@ -7,11 +7,35 @@
 #[rustfmt::skip]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "datom", derive(datom_codec::Datomizable, datom_codec::Composing))]
+pub struct DeliveryFailed_Data {
+    pub job_id: listener_library::JobId,
+    pub delivery: listener_library::Delivery,
+    pub failing: listener_library::Failing,
+}
+#[rustfmt::skip]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "datom", derive(datom_codec::Datomizable, datom_codec::Composing))]
+pub struct RecordingInterrupted_Data {
+    pub job_id: listener_library::JobId,
+    pub interruption_cause: InterruptionCause,
+}
+#[rustfmt::skip]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "datom", derive(datom_codec::Datomizable, datom_codec::Composing))]
 pub enum Notice {
     BackendFailed(listener_library::Try),
     Exhausted(listener_library::JobId),
     Copied(listener_library::JobId),
-    Interruption(listener_library::Interruption),
+    DeliveryFailed(DeliveryFailed_Data),
+    RecordingInterrupted(RecordingInterrupted_Data),
+}
+#[rustfmt::skip]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "datom", derive(datom_codec::Datomizable, datom_codec::Composing))]
+pub enum InterruptionCause {
+    MicrophoneLost,
+    Unwritable,
+    Gap,
 }
 #[rustfmt::skip]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq, Hash)]

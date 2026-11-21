@@ -1,0 +1,32 @@
+[package]
+name = "listener-entry"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+datom-codec.workspace = true
+rkyv.workspace = true
+protos = { git = "https://github.com/LiGoldragon/protos", rev = "c93b598" }
+listener-place = { path = "../listener-place", features = ["datom"] }
+listener-library = { workspace = true, features = ["datom"] }
+listener-emission = { path = "../listener-emission" }
+meta-signal-listener = { workspace = true, features = ["datom"] }
+nexus.workspace = true
+nexus-client = { git = "https://github.com/LiGoldragon/nexus", rev = "681a99ba307acd9cce6d5c120846072f1cedd814" }
+rustix.workspace = true
+serde_json = "1"
+signal = { workspace = true, features = ["datom"] }
+signal-listener = { workspace = true, features = ["datom"] }
+tokio.workspace = true
+translator = { workspace = true, features = ["text", "unix"] }
+translator-runtime = { git = "https://github.com/LiGoldragon/translator", rev = "77ecf05ff43d2063cf4336287dd4bf281ca2e69f" }
+ureq = { version = "=3.5.1", default-features = false, features = ["rustls"] }
+zbus = { version = "=4.4.0", default-features = false, features = ["tokio"] }

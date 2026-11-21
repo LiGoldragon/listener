@@ -1,3 +1,31 @@
 [workspace]
-members = ["crates/listener-memory", "crates/listener-recording", "crates/listener-emission"]
+members = [
+  "crates/listener-memory", "crates/listener-recording", "crates/listener-emission",
+  "crates/listener-place", "crates/listener-nexus-engine", "crates/listener-entry",
+]
 resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/LiGoldragon/listener"
+publish = false
+
+[workspace.dependencies]
+listener-library = { git = "https://github.com/LiGoldragon/listener-library", rev = "d0f571a18e0aa5fb8ecd6454fc5bf813a52edf96", default-features = false }
+signal-listener = { git = "https://github.com/LiGoldragon/signal-listener", rev = "df64d2d6e4ca497980a750c4a9229354c126c330", default-features = false }
+meta-signal-listener = { git = "https://github.com/LiGoldragon/meta-signal-listener", rev = "0cf47f03e4c99ab424f5db6171875dd9f929161a", default-features = false }
+nexus = { git = "https://github.com/LiGoldragon/nexus", rev = "681a99ba307acd9cce6d5c120846072f1cedd814", default-features = false }
+translator = { git = "https://github.com/LiGoldragon/translator", rev = "77ecf05ff43d2063cf4336287dd4bf281ca2e69f", default-features = false }
+signal = { git = "https://github.com/LiGoldragon/signal", rev = "4f5cbb9", default-features = false }
+ethos-zero = { git = "https://github.com/LiGoldragon/ethos-zero", rev = "2999292dc67c8608e54d32c333c550b29153cbff" }
+datom-codec = { git = "https://github.com/LiGoldragon/datom-codec", rev = "09a0526" }
+rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
+tokio = { version = "1.53.1", default-features = false, features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time", "tracing"] }
+rustix = { version = "1", features = ["event", "fs", "net", "process", "rand", "time"] }
+base64 = "0.22"
+futures-util = { version = "0.3.34", default-features = false }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

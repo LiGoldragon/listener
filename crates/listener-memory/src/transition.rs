@@ -150,6 +150,28 @@ impl ApplyingConfiguration for Configuration {
         self.validate()
     }
 }
+trait FinishingClaim {
+    fn finish_claim(&mut self, id: &JobId, handing: Handing) -> Result<(), Error>;
+}
+impl FinishingClaim for Record {
+    fn finish_claim(&mut self, id: &JobId, handing: Handing) -> Result<(), Error> {
+        if self.delivery_claim.0.as_ref() != Some(id) {
+            return Err(Error::WrongState(id.clone()));
+        }
+        let job = self
+            .job_vector
+            .iter_mut()
+            .find(|job| &job.job_id == id)
+            .ok_or_else(|| Error::NoSuchJob(id.clone()))?;
+        if job.state != State::Waiting {
+            return Err(Error::WrongState(id.clone()));
+        }
+        job.handing_option = Some(handing);
+        job.state = State::Delivered;
+        self.delivery_claim.0 = None;
+        Ok(())
+    }
+}
 impl Transitioning for Record {
     fn next(&mut self) -> Next {
         if self.delivery_claim.0.is_some() {
@@ -326,20 +348,7 @@ impl Transitioning for Record {
                 Ok(Output::Next(self.next()))
             }
             Input::Finish(finish) => {
-                if self.delivery_claim.0.as_ref() != Some(&finish.job_id) {
-                    return Err(Error::WrongState(finish.job_id.clone()));
-                }
-                let job = self
-                    .job_vector
-                    .iter_mut()
-                    .find(|job| job.job_id == finish.job_id)
-                    .ok_or_else(|| Error::NoSuchJob(finish.job_id.clone()))?;
-                if job.state != State::Waiting {
-                    return Err(Error::WrongState(finish.job_id.clone()));
-                }
-                job.handing_option = Some(finish.handing.clone());
-                job.state = State::Delivered;
-                self.delivery_claim.0 = None;
+                self.finish_claim(&finish.job_id, finish.handing.clone())?;
                 Ok(Output::Next(self.next()))
             }
             Input::Prune => {
@@ -475,7 +484,10 @@ impl Transitioning for Record {
             }
             Input::Recover => {
                 let mut hearing = Vec::new();
-                self.delivery_claim.0 = None;
+                // The saved claim may already have reached the desktop.
+                if let Some(claim) = self.delivery_claim.0.clone() {
+                    self.finish_claim(&claim, Handing::Kept)?;
+                }
                 for job in &mut self.job_vector {
                     if matches!(job.state, State::Recording | State::Transcribing) {
                         job.state = State::Transcribing;
@@ -487,6 +499,16 @@ impl Transitioning for Record {
                     next: self.next(),
                 }))
             }
+            Input::AbortStart(id) => {
+                let index = self
+                    .job_vector
+                    .iter()
+                    .position(|job| &job.job_id == id && job.state == State::Recording)
+                    .ok_or_else(|| Error::WrongState(id.clone()))?;
+                self.job_vector.remove(index);
+                Ok(Output::StartAborted(id.clone()))
+            }
+            Input::Advance => Ok(Output::Next(self.next())),
         }
     }
 }

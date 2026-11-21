@@ -7,20 +7,25 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/LiGoldragon/listener"
 publish = false
 build = "build.rs"
+links = "listener_recording"
 
 [features]
 default = []
 datom = ["dep:datom-codec", "listener-library/datom"]
 
 [dependencies]
+listener-place = { path = "../listener-place" }
+tokio = { version = "1.53.1", default-features = false, features = ["net", "io-util", "sync", "rt"] }
 listener-library = { git = "https://github.com/LiGoldragon/listener-library", rev = "d0f571a18e0aa5fb8ecd6454fc5bf813a52edf96", default-features = false }
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
 datom-codec = { git = "https://github.com/LiGoldragon/datom-codec", rev = "09a0526", optional = true }
 
 [build-dependencies]
+cc = "=1.4.6"
+pkg-config = "0.3"
 ethos-zero = { git = "https://github.com/LiGoldragon/ethos-zero", rev = "2999292dc67c8608e54d32c333c550b29153cbff" }
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 unused = { level = "warn", priority = -1 }
 dead_code = "warn"

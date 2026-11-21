@@ -1,0 +1,7 @@
+Library
+[ :translator:Place :listener_library:Configuration ]
+[ Startup.[ Create.{ Place PublicationCapacity Configuration }
+            Open.{ Place PublicationCapacity } ]
+  PublicationCapacity.Integer ]
+[]
+[]

@@ -1,147 +1,47 @@
-# listener
+# Listener 1
 
-`listener` is the supervised speech-to-text component. `listener` is a thin
-client for `listener-daemon`; it never reads or mutates captures directly.
+Listener records a microphone to its own Ogg Opus job file, tries the configured speech services in order, then hands the verbatim transcript to the desktop. The Nexus owns capture, durable job state and scheduling. The Translator owns text, credentials, HTTP and desktop calls. Their connections carry typed Signal; the audio stays on disk.
 
-## Commands
+## Run an isolated place
 
-Every ordinary invocation takes exactly one inline `signal-listener::Input`
-NOTA object. These are the canonical forms emitted and parsed by the schema:
+Build `packages.x86_64-linux.default`. Its `bin` directory contains `listener-nexus`, `listener-translator`, `listener` and `listener-meta`. The Nexus launcher replaces itself with the typed engine; the launch PID is the engine PID.
 
-```sh
-listener 'Toggle.{}'
-listener 'Status.{}'
-listener 'Start.{}'
-listener 'Stop.7'
-listener 'Cancel.7'
-listener 'ListCaptures.{}'
-listener 'Retry.7'
+The two services each take one startup datom. `Place` is `{ name absoluteRuntime absoluteState }`. For the clients to reach it, put `{ name }` in `${XDG_CONFIG_HOME:-$HOME/.config}/nexus/listener-nexus.datom` and use `$XDG_RUNTIME_DIR/nexus/name` as its runtime directory. The clients read only those three environment variables for routing. They take one datom, or no arguments to display their Signal schema.
+
+- `listener-nexus 'Create.{ <place> <publication-capacity> <configuration> }'` creates a fresh store and starts serving. It refuses to replace an existing store.
+- `listener-nexus 'Open.{ <place> <publication-capacity> }'` serves an existing store with its persisted configuration. The publication capacity is a positive in-memory backlog setting, independent of the store.
+- `listener-translator '<place>'` serves the ordinary, meta and emission sockets. Start it before opening existing work that should resume external effects immediately.
+- `listener 'Toggle'` starts a recording, or finalizes the current recording and queues its hearing. `listener 'Subscribe'` opens on the retained non-Delivered jobs. `Subscribed.Changed` updates that view; `Subscribed.Lagged` replaces it with a full snapshot. The meta subscription follows the same framing for settings.
+
+Memory is `<State>/listener.memory`, with the table `listener` and record key `state` in schema 1. Kept audio is `<AudioDirectory>/<JobId>.opus`. Audio and text age out independently. Existing stores from the legacy Listener are outside this format.
+
+## Positional configuration
+
+The initial configuration is the `Configuration` from `listener-library` at the runtime's Cargo pin. The immutable ordinary and meta Signal declarations, also printed by the clients, are in `crates/listener-entry/ethos`. This example uses a private Pulse fixture, one loopback HTTP fixture and dummy credential and desktop programs; set paths and the source to your fixture's values.
+
+```datom
+{
+  [ { fixture OpenAiTranscription http://127.0.0.1:8123 fixture-model fixture-key en «Transcribe all words exactly as heard.» 20 } ]
+  [ fixture ]
+  Pasted AsRecorded Forever Forever [ Listener ] 32 Named.fixture.monitor 50
+  /example/paste /example/copy /example/read-key /example/state/audio
+  { 65536 32 }
+  { Named.«unix:/example/runtime/pulse.sock» Listener 48000 Mono
+    3840 15360 8 TwentyMilliseconds Voice Variable 5 Voice Automatic
+    Disabled Disabled 0 2 SyncEachPage Interrupt }
+}
 ```
 
-`Toggle.{}` atomically starts an idle daemon or gracefully completes its active
-recording; once completion is acknowledged, the recording slot is immediately
-available even while that session is still finalizing or transcribing. It is
-the hotkey-facing request because it never races a separate status read.
-`Cancel.<session>` is the explicit immediate-cancellation request and retains
-the capture artifact without transcription or delivery.
-`Stop.<session>` remains the distinct graceful-stop request: it finalizes,
-transcribes, and delivers. `Status.{}` reports the in-memory active session
-without exposing transcript text or running recovery, migration, or retention
-work. Positional subcommands such as `listener toggle` and `listener stop 7`
-are not supported.
+The recording settings above, in order, are Pulse server and application name, sample rate and channels, capture fragment and buffer bytes, pending PCM frames, Opus frame duration, application, bitrate control, complexity, signal, bandwidth, discontinuous transmission, forward error correction, expected loss percentage, packets per page, durability, and gap handling.
 
-`ListCaptures.{}` returns one typed record per known capture. Its state is:
+Set backends and their order separately using `listener-meta 'Configure.Backend.{ ... }'` and `listener-meta 'Configure.Order.[ ... ]'`. Terms use `Configure.AddTerm.Term` and `Configure.RemoveTerm.Term` with the term in the payload. `Configure.Delivery.Pasted`, `Copied` and `Kept` select delivery. `Configure.Source.Named.fixture.monitor` selects a named Pulse source. Configure the companion `RecordingSettings.PulseServer` for the fixture's own daemon.
 
-- `Recovering`: a crash-recovery `.listenerlog` is still present;
-- `Retryable`: a compact WebM/Opus artifact is ready to transcribe;
-- `Failed`: the most recent conversion or provider attempt failed; retry is
-  still safe;
-- `Completed`: a canonical WebM/Opus artifact whose transcript exists in
-  Listener history; it remains available until its three-day terminal retention
-  horizon expires.
+## External boundaries
 
-Terminal captures remain in `ListCaptures.{}` while their canonical audio is retained.
-Retry a failed capture after inspecting it:
+The secret program is called with the configured secret-entry name as its sole argument and supplies the key on standard output. Paste and copy programs take no arguments; they read the exact UTF-8 transcript from standard input. Their exit status is the observed outcome. Typed notifications use the desktop session's `org.freedesktop.Notifications.Notify`; a successful method reply carries the notification ID.
 
-```sh
-listener 'ListCaptures.{}'
-listener 'Retry.87'
-listener 'ListCaptures.{}'
-```
+OpenAI transcription posts multipart audio, model, language, prompt and `response_format=json` to `/v1/audio/transcriptions`, with bearer authentication. Gemini posts one user content with prompt and base64 inline `audio/ogg` to `/v1beta/models/<model>:generateContent`, with `x-goog-api-key`. The configured service address is the base, and language, instruction and terms shape the request. HTTPS is required outside literal loopback. Redirects are not followed.
 
-`Retry.<session>` uses the retained compact artifact (or first recovers and compacts a
-legacy `.listenerlog`), calls the configured OpenAI transcription backend, then
-sends the transcript to configured outputs and appends it to history. A failed
-retry leaves its compact artifact in place and marks it `Failed`; it is not
-lost and can be retried again.
+## Recovery
 
-## Capture and artifact lifecycle
-
-While recording, Listener commits PCM records to one owner-only (`0700`
-directory, `0600` file) crash-recoverable `capture-<session>.listenerlog` under
-`$XDG_STATE_HOME/listener/captures` (normally
-`~/.local/state/listener/captures`). In a separate encoder worker it immediately
-feeds each already-committed record to FFmpeg, which incrementally writes
-`capture-<session>.webm.part`: mono 16 kHz Opus-in-WebM, 24 kbit/s with the
-Opus `voip` application. This worker never blocks the capture writer; a failed
-encoder leaves the durable log intact for recovery.
-
-The `.part` file is an unfinished container, not a retry artifact and is not
-shown by `ListCaptures.{}`. On normal `Stop.<session>`, Listener closes the encoder input,
-waits only for the active container to flush and finalizes it atomically as
-`capture-<session>.webm`. It validates that the container decodes as Opus before
-removing the active `.listenerlog` and any raw PCM export. This WebM extension
-is the sole canonical retained audio format: it provides a broadly interoperable
-container around Opus and is also the transcription input.
-
-A private `capture-<session>.terminal` record is capture-store metadata, not
-audio. It records terminal outcome and the terminal completion clock. A single
-snapshot-bounded background maintenance pass at daemon startup, never an active
-capture or an interactive request, recovers a crash-survived `.listenerlog`,
-re-encodes every decodable legacy `capture-<session>.*` audio container through
-a temporary WebM/Opus file, verifies it before deleting the source, and removes
-any duplicate legacy source once a canonical artifact exists. A corrupt or
-non-convertible source is removed and remains observable as `Failed` through
-its terminal record. Exactly one canonical retained audio artifact remains for
-each terminal capture.
-
-The default terminal audio horizon is three days from terminal capture
-completion (`LISTENER_CAPTURE_RETENTION_DAYS` may override it); an optional
-`LISTENER_CAPTURE_RETENTION_MAXIMUM_BYTES` can reclaim older terminal captures
-earlier. Reaping removes audio and terminal metadata together. Failed,
-cancelled, corrupt, and non-convertible terminal artifacts follow the same
-three-day bound. The separate transcript history policy remains independent:
-completed transcripts are history, not old audio.
-
-Completed transcript history is an owner-only append-only projection at
-`$XDG_DATA_HOME/listener/history.jsonl` (normally
-`~/.local/share/listener/history.jsonl`). `listener-recall` reads this history
-newest first and copies a selected transcript to the clipboard.
-
-For long recordings, Listener slices the compact artifact into 600-second Opus
-WebM requests before uploading, joins the returned transcript parts in order,
-and therefore does not rely on a single upload fitting the provider's duration
-or token limit. Each request is also checked against OpenAI's 25 MiB upload
-limit.
-
-## Service and configuration
-
-Run the daemon through the installed service; the ordinary CLI talks to its
-working Unix socket. The normal user-visible workflow is:
-
-```sh
-listener 'Toggle.{}'
-# dictate
-listener 'Toggle.{}'
-# an older transcription may still be running; start the next idea immediately
-listener 'Toggle.{}'
-listener-recall
-```
-
-Listener keeps one microphone recording at a time and allows multiple older
-sessions to finalize and transcribe concurrently. Every successful result is
-serialized into the private history store, so `listener-recall` remains the
-stable result selector even when completion order differs from recording order.
-
-`Cancel.<session>` stops active recording and retains its recoverable log; it
-does not upload or deliver text. It can later be recovered with
-`Retry.<session>`.
-
-Environment configuration:
-
-- `LISTENER_SOCKET`: ordinary daemon socket.
-- `LISTENER_STATUS_SOCKET`: UI-safe status stream socket.
-- `LISTENER_CAPTURE_STORE`: capture directory.
-- `LISTENER_CAPTURE_PROGRAM`: `parecord`-compatible capture command.
-- `LISTENER_FFMPEG_PROGRAM`: FFmpeg-compatible encoder (default `ffmpeg`).
-- `LISTENER_HISTORY_STORE`: transcript history file.
-- `LISTENER_HISTORY_RETENTION_DAYS`: hard-delete transcript records older than this age (default: provisional 90 days).
-- `LISTENER_HISTORY_MAXIMUM_BYTES`: hard cap for the retained JSONL projection (default: provisional 16 MiB).
-- `LISTENER_CAPTURE_RETENTION_DAYS`: optional hard age cap for failed or cancelled capture media. Unset by default; owner policy is required before media deletion.
-- `LISTENER_CAPTURE_RETENTION_MAXIMUM_BYTES`: optional hard byte cap for failed or cancelled capture media; oldest sessions are removed first. Unset by default.
-- `LISTENER_LATENCY_TRACE`: optional owner-private, transition-only trace path. When set, it records request receipt, capture/encoder startup, and state publication timestamps; unset production operation writes no trace.
-- `LISTENER_CLIPBOARD_PROGRAM`: clipboard command (default `wl-copy`).
-- `LISTENER_TRANSCRIPTION_CUSTOMIZATION_ARCHIVE`: optional vocabulary archive.
-
-The production backend reads the existing OpenAI credential at request time
-and uses `gpt-4o-transcribe`.
+Open repairs the tail of an interrupted Ogg recording through the last complete sound page and re-hears retained Recording and Transcribing jobs. Unfinished attempts may recur; a completed hearing commits its transcript and preceding failures together. A persisted outstanding delivery claim is atomically settled as Kept on open: the desktop effect may already have happened. It is never replayed automatically; Recall is explicit. When several jobs are already Waiting behind an occupied claim, they drain in recording order even under AsReady; AsReady can claim an idle handoff without waiting for an earlier transcription.

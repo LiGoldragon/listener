@@ -1,0 +1,11 @@
+Signal
+[ :listener_library:JobId :listener_library:Text :listener_library:Options
+  :listener_library:JobState :listener_library:Past :listener_library:UnknownBackend ]
+[ Toggle ToggleCustom.Options Cancel Recall RecallJob.JobId Retranscribe.JobId
+  Jobs History Subscribe ]
+[ Toggled.Toggling CustomToggled.Toggling Cancelled.JobId Recalled.Text
+  JobRecalled.Text Retranscribing.JobId JobsListed.Vector<JobState>
+  HistoryListed.Vector<Past> Subscribed.Stream<Vector<JobState> JobChange>
+  Refused.[ NothingRecording NothingKept NoBackend UnknownBackend NoSuchJob NoAudio InProgress.JobState NoMicrophone Unwritable ] ]
+[ JobChange.[ JobState Forgotten.JobId ]
+  Toggling.[ Began.JobId Ended.JobId ] NoSuchJob.JobId NoAudio.JobId ]

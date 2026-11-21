@@ -46,6 +46,8 @@ pub enum Input {
     Settings,
     Import(Import_Data),
     Recover,
+    AbortStart(listener_library::JobId),
+    Advance,
 }
 #[rustfmt::skip]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
@@ -74,6 +76,7 @@ pub enum Output {
     Configuration(listener_library::Configuration),
     Imported(listener_library::JobId),
     Recovered(Recovery),
+    StartAborted(listener_library::JobId),
 }
 #[rustfmt::skip]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq, Hash)]

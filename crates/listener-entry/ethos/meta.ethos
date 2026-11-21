@@ -1,0 +1,14 @@
+Signal
+[ :listener_library:Backend :listener_library:BackendName :listener_library:UnknownBackend :listener_library:Delivery
+  :listener_library:Sequence :listener_library:Retention :listener_library:Term
+  :listener_library:Kilobits :listener_library:Source :listener_library:HistoryLength
+  :listener_library:ConfigurationValue.Configuration :listener_library:Program :listener_library:Directory
+  :listener_library:RecordingSettings :listener_library:JobId :listener_library:Moment :listener_library:Text
+  :translator:DatomReadingBudget ]
+[ Configure.Set Configuration Remember.{ Moment Text } Subscribe ]
+[ Configured.Set Configuration.ConfigurationValue Remembered.JobId Subscribed.Stream<ConfigurationValue Set>
+  Refused.[ UnknownBackend InvalidValue ] ]
+[ Set.[ Backend RemoveBackend.BackendName Order.Vector<BackendName> Delivery Sequence
+    AudioKept.Retention TextKept.Retention AddTerm.Term RemoveTerm.Term Kilobits Source
+    HistoryLength PasteProgram.Program CopyProgram.Program SecretProgram.Program
+    AudioDirectory.Directory Budget.DatomReadingBudget RecordingSettings ] ]

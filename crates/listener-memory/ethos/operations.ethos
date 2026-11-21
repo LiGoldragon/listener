@@ -9,11 +9,11 @@ Library
 [ Input.[ Turn.Options Drop Interrupt.JobId Requeue.JobId Tries.JobId
     Record.{ JobId Hearing } Finish.{ JobId Handing } Prune
     Forget.Vector<AudioLocation> Last Find.JobId Pending Recollect Apply.Set Settings
-    Import.{ Moment Text } Recover ]
+    Import.{ Moment Text } Recover AbortStart.JobId Advance ]
   Output.[ Turning Dropping Interrupting Requeueing
     Trial.{ Vector<Backend> Vector<Term> } Next Pruned.Vector<AudioLocation>
     Forgotten Lasting Finding Standing.Vector<JobState> Recollected.Vector<Past>
-    Applying Configuration Imported.JobId Recovered.Recovery ]
+    Applying Configuration Imported.JobId Recovered.Recovery StartAborted.JobId ]
   Execution.{ Input Moment Option<JobId> }
   Changes.{ Vector<JobChange> Option<Set> }
   Committed.{ Output Changes }
