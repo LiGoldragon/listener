@@ -26,7 +26,7 @@ serde_json = "1"
 signal = { workspace = true, features = ["datom"] }
 signal-listener = { workspace = true, features = ["datom"] }
 tokio.workspace = true
-translator = { workspace = true, features = ["text", "unix"] }
+translator = { workspace = true, default-features = false, features = ["datom"] }
 translator-runtime = { git = "https://github.com/LiGoldragon/translator", rev = "77ecf05ff43d2063cf4336287dd4bf281ca2e69f" }
 ureq = { version = "=3.5.1", default-features = false, features = ["rustls"] }
 zbus = { version = "=4.4.0", default-features = false, features = ["tokio"] }

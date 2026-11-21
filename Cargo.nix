@@ -1969,7 +1969,7 @@ rec {
             name = "translator";
             packageId = "translator";
             usesDefaultFeatures = false;
-            features = [ "text" "unix" ];
+            features = [ "datom" ];
           }
           {
             name = "translator-runtime";
