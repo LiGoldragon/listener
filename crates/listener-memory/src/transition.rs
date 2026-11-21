@@ -4,6 +4,22 @@ use crate::{
 };
 use listener_library::*;
 use meta_signal_listener::Set;
+use std::path::Path;
+
+trait ConfigurationText {
+    fn is_configuration_name(&self) -> bool;
+    fn is_configuration_path(&self) -> bool;
+}
+
+impl ConfigurationText for str {
+    fn is_configuration_name(&self) -> bool {
+        !self.is_empty() && !self.contains('\0')
+    }
+
+    fn is_configuration_path(&self) -> bool {
+        self.is_configuration_name() && Path::new(self).is_absolute()
+    }
+}
 
 impl ViewingJob for Job {
     fn text(&self) -> Option<&Text> {
@@ -49,7 +65,13 @@ impl ValidatingConfiguration for Configuration {
             Channels::Mono => 1,
             Channels::Stereo => 2,
         };
-        let bad = self.budget.0.reading_steps.0 <= 0
+        let bad = !self.audio_directory.0.0.is_configuration_path()
+            || !self.paste_program.0.0.is_configuration_path()
+            || !self.copy_program.0.0.is_configuration_path()
+            || !self.secret_program.0.0.is_configuration_path()
+            || !settings.pulse_application_name.0.is_configuration_name()
+            || matches!(&settings.pulse_server, PulseServer::Named(address) if !address.0.is_configuration_name())
+            || self.budget.0.reading_steps.0 <= 0
             || self.budget.0.reading_depth.0 <= 0
             || self.kilobits.0 <= 0
             || self.history_length.0 < 0
@@ -98,14 +120,8 @@ impl ApplyingConfiguration for Configuration {
                 }
             }
             Set::RemoveBackend(name) => {
-                let Some(index) = self
-                    .backend_vector
-                    .iter()
-                    .position(|backend| &backend.backend_name == name)
-                else {
-                    return Err(Error::UnknownBackend(name.clone()));
-                };
-                self.backend_vector.remove(index);
+                self.backend_vector
+                    .retain(|backend| &backend.backend_name != name);
                 self.order.0.retain(|kept| kept != name);
             }
             Set::Order(order) => self.order = Order(order.clone()),
@@ -180,7 +196,9 @@ impl Transitioning for Record {
                         .iter()
                         .any(|backend| &backend.backend_name == name)
                     {
-                        return Err(Error::UnknownBackend(name.clone()));
+                        return Ok(Output::Turning(Turning::UnknownBackend(UnknownBackend(
+                            name.clone(),
+                        ))));
                     }
                 }
                 let id = execution
@@ -245,13 +263,13 @@ impl Transitioning for Record {
                         signal_listener::NoSuchJob(id.clone()),
                     )));
                 };
+                if !job.terminal() {
+                    return Ok(Output::Requeueing(Requeueing::InProgress(job.status())));
+                }
                 if matches!(job.audio, Audio::Erased) {
                     return Ok(Output::Requeueing(Requeueing::NoAudio(
                         signal_listener::NoAudio(id.clone()),
                     )));
-                }
-                if !job.terminal() {
-                    return Err(Error::WrongState(id.clone()));
                 }
                 job.state = State::Transcribing;
                 job.handing_option = None;
@@ -264,16 +282,21 @@ impl Transitioning for Record {
                     .iter()
                     .find(|job| &job.job_id == id)
                     .ok_or_else(|| Error::NoSuchJob(id.clone()))?;
-                let mut backends = Vec::new();
-                for name in &job.backend_name_vector {
-                    backends.push(
-                        self.configuration
-                            .backend_vector
-                            .iter()
-                            .find(|backend| &backend.backend_name == name)
-                            .cloned()
-                            .ok_or_else(|| Error::UnknownBackend(name.clone()))?,
-                    );
+                let resolve = |names: &[BackendName]| -> Vec<Backend> {
+                    names
+                        .iter()
+                        .filter_map(|name| {
+                            self.configuration
+                                .backend_vector
+                                .iter()
+                                .find(|backend| &backend.backend_name == name)
+                                .cloned()
+                        })
+                        .collect()
+                };
+                let mut backends = resolve(&job.backend_name_vector);
+                if backends.is_empty() {
+                    backends = resolve(&self.configuration.order.0);
                 }
                 Ok(Output::Trial(Trial_Data {
                     backend_vector: backends,
@@ -387,7 +410,7 @@ impl Transitioning for Record {
             Input::Pending => Ok(Output::Standing(
                 self.job_vector
                     .iter()
-                    .filter(|job| !job.terminal())
+                    .filter(|job| job.state != State::Delivered)
                     .map(ViewingJob::status)
                     .collect(),
             )),
@@ -418,8 +441,11 @@ impl Transitioning for Record {
                         Ok(Output::Applying(Applying::Applied(set.clone())))
                     }
                     Err(Error::UnknownBackend(name)) => Ok(Output::Applying(
-                        Applying::UnknownBackend(meta_signal_listener::UnknownBackend(name)),
+                        Applying::UnknownBackend(UnknownBackend(name)),
                     )),
+                    Err(Error::InvalidConfiguration) => {
+                        Ok(Output::Applying(Applying::InvalidValue))
+                    }
                     Err(error) => Err(error),
                 }
             }

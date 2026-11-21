@@ -4,7 +4,7 @@ Library
   :listener_library:Moment :listener_library:Text :listener_library:JobState
   :listener_library:Past :listener_library:Ready :listener_library:Backend
   :listener_library:RecordingSettings :listener_library:Term :listener_library:Kilobits :listener_library:Source
-  :meta_signal_listener:Set :meta_signal_listener:UnknownBackend
+  :meta_signal_listener:Set :listener_library:UnknownBackend
   :signal_listener:NoSuchJob :signal_listener:NoAudio ]
 [ Input.[ Turn.Options Drop Interrupt.JobId Requeue.JobId Tries.JobId
     Record.{ JobId Hearing } Finish.{ JobId Handing } Prune
@@ -18,12 +18,12 @@ Library
   Changes.{ Vector<JobState> Retired.Vector<JobId> Option<Set> }
   Committed.{ Output Changes }
   Recovery.{ Hear.Vector<JobId> Next }
-  Turning.[ Fresh.{ Kilobits Source AudioLocation RecordingSettings } Running.JobId NoBackend ]
+  Turning.[ Fresh.{ Kilobits Source AudioLocation RecordingSettings } Running.JobId NoBackend UnknownBackend ]
   Dropping.[ Dropped.JobId NothingRecording ]
   Interrupting.[ Interrupted.JobId NothingRecording ]
-  Requeueing.[ Requeued.JobId NoSuchJob NoAudio ]
+  Requeueing.[ Requeued.JobId NoSuchJob NoAudio InProgress.JobState ]
   Next.[ Deliverable.Ready Nothing ]
   Lasting.[ Ready NothingKept ] Finding.[ Ready NoSuchJob NothingKept ]
-  Applying.[ Applied.Set UnknownBackend ] ]
+  Applying.[ Applied.Set UnknownBackend InvalidValue ] ]
 []
 []

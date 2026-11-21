@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "bitflags"
+version = "2.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -95,20 +101,6 @@ dependencies = [
 
 [[package]]
 name = "ethos-zero"
-version = "30.0.0"
-source = "git+https://github.com/LiGoldragon/ethos-zero?rev=b97d952#b97d9526909a1ecebf61339f5723eaca53de5dca"
-dependencies = [
- "datom-codec",
- "prettyplease",
- "proc-macro2",
- "protos",
- "quote",
- "rkyv",
- "syn 3.0.5",
-]
-
-[[package]]
-name = "ethos-zero"
 version = "30.0.1"
 source = "git+https://github.com/LiGoldragon/ethos-zero?rev=2999292dc67c8608e54d32c333c550b29153cbff#2999292dc67c8608e54d32c333c550b29153cbff"
 dependencies = [
@@ -120,6 +112,12 @@ dependencies = [
  "rkyv",
  "syn 3.0.5",
 ]
+
+[[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "futures-channel"
@@ -184,6 +182,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "getrandom"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "r-efi",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -217,6 +226,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
 name = "listener-emission"
 version = "0.1.0"
 dependencies = [
@@ -229,7 +244,7 @@ dependencies = [
 [[package]]
 name = "listener-library"
 version = "0.1.0"
-source = "git+https://github.com/LiGoldragon/listener-library?rev=3549987a7fa5eaab826f21521d5d6a3a23a7d8d7#3549987a7fa5eaab826f21521d5d6a3a23a7d8d7"
+source = "git+https://github.com/LiGoldragon/listener-library?rev=d0f571a18e0aa5fb8ecd6454fc5bf813a52edf96#d0f571a18e0aa5fb8ecd6454fc5bf813a52edf96"
 dependencies = [
  "datom-codec",
  "ethos-zero 30.0.1",
@@ -254,6 +269,7 @@ dependencies = [
  "meta-signal-listener",
  "rkyv",
  "signal-listener",
+ "tempfile",
 ]
 
 [[package]]
@@ -291,7 +307,7 @@ dependencies = [
 [[package]]
 name = "meta-signal-listener"
 version = "1.0.0"
-source = "git+https://github.com/LiGoldragon/meta-signal-listener?rev=b85ed9632e1483234b56ece0c0e675cb69b7990e#b85ed9632e1483234b56ece0c0e675cb69b7990e"
+source = "git+https://github.com/LiGoldragon/meta-signal-listener?rev=0cf47f03e4c99ab424f5db6171875dd9f929161a#0cf47f03e4c99ab424f5db6171875dd9f929161a"
 dependencies = [
  "datom-codec",
  "ethos-zero 30.0.1",
@@ -336,10 +352,10 @@ dependencies = [
 [[package]]
 name = "nexus"
 version = "0.9.0"
-source = "git+https://github.com/LiGoldragon/nexus?rev=ea4db5a51083f114c624fc23c023c7a255376846#ea4db5a51083f114c624fc23c023c7a255376846"
+source = "git+https://github.com/LiGoldragon/nexus?rev=681a99ba307acd9cce6d5c120846072f1cedd814#681a99ba307acd9cce6d5c120846072f1cedd814"
 dependencies = [
  "datom-codec",
- "ethos-zero 30.0.0",
+ "ethos-zero 30.0.1",
  "futures-util",
  "protos",
  "rkyv",
@@ -417,6 +433,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "r-efi"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
 name = "rancor"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -474,6 +496,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustix"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -505,7 +540,7 @@ dependencies = [
 [[package]]
 name = "signal-listener"
 version = "1.0.0"
-source = "git+https://github.com/LiGoldragon/signal-listener?rev=57f69f061b797bdbdcce3d831b9d3a85513b835f#57f69f061b797bdbdcce3d831b9d3a85513b835f"
+source = "git+https://github.com/LiGoldragon/signal-listener?rev=5e588a2e975ff80781ab9411779281f1fc63d109#5e588a2e975ff80781ab9411779281f1fc63d109"
 dependencies = [
  "datom-codec",
  "ethos-zero 30.0.1",
@@ -556,6 +591,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom",
+ "once_cell",
+ "rustix",
+ "windows-sys",
 ]
 
 [[package]]
@@ -643,7 +691,7 @@ dependencies = [
 [[package]]
 name = "translator"
 version = "0.2.0"
-source = "git+https://github.com/LiGoldragon/translator?rev=8d26df34e13291f34fcda85513c86e6f7c271405#8d26df34e13291f34fcda85513c86e6f7c271405"
+source = "git+https://github.com/LiGoldragon/translator?rev=77ecf05ff43d2063cf4336287dd4bf281ca2e69f#77ecf05ff43d2063cf4336287dd4bf281ca2e69f"
 dependencies = [
  "datom-codec",
  "protos",

@@ -16,6 +16,10 @@ pub use store::{Memory, MemoryDefinition};
 #[derive(Debug)]
 pub enum Error {
     Storage(memory::Error),
+    File(std::io::Error),
+    MissingStore,
+    StoreAlreadyExists,
+    StoreNotRegular,
     Poisoned,
     MissingRecord,
     MissingIdentity,
@@ -30,6 +34,11 @@ impl From<memory::Error> for Error {
         Self::Storage(error)
     }
 }
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        Self::File(error)
+    }
+}
 impl std::fmt::Display for Error {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, formatter)
@@ -37,9 +46,13 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
-/// Opens only the configured new Memory; no legacy locations are accepted.
+/// Creates the initial record before installing a fresh database at its final path.
+pub trait CreatingMemory {
+    fn create(self, configuration: Configuration) -> Result<Memory, Error>;
+}
+/// Opens the configured existing Memory; the persisted configuration is authoritative.
 pub trait OpeningMemory {
-    fn open(self, configuration: Configuration) -> Result<Memory, Error>;
+    fn open(self) -> Result<Memory, Error>;
 }
 /// Serializes state transformation, durable commit and returned change data.
 pub trait ExecutingMemory {

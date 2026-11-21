@@ -129,6 +129,7 @@ pub enum Turning {
     Fresh(Fresh_Data),
     Running(listener_library::JobId),
     NoBackend,
+    UnknownBackend(listener_library::UnknownBackend),
 }
 #[rustfmt::skip]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
@@ -151,6 +152,7 @@ pub enum Requeueing {
     Requeued(listener_library::JobId),
     NoSuchJob(signal_listener::NoSuchJob),
     NoAudio(signal_listener::NoAudio),
+    InProgress(listener_library::JobState),
 }
 #[rustfmt::skip]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
@@ -179,5 +181,6 @@ pub enum Finding {
 #[cfg_attr(feature = "datom", derive(datom_codec::Datomizable, datom_codec::Composing))]
 pub enum Applying {
     Applied(meta_signal_listener::Set),
-    UnknownBackend(meta_signal_listener::UnknownBackend),
+    UnknownBackend(listener_library::UnknownBackend),
+    InvalidValue,
 }
