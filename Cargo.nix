@@ -1997,8 +1997,8 @@ rec {
         workspace_member = null;
         src = pkgs.fetchgit {
           url = "https://github.com/LiGoldragon/listener-library";
-          rev = "5dbc60f59084a388bb0348d528b3da92bf53aedd";
-          sha256 = "164957bhyafzrjnz851f26ms5hxv7bgqqvvz55hzfvxwqdj51m7f";
+          rev = "9233d4df04a95f0ddeadcea6133bc9593ff4b541";
+          sha256 = "0dzhm1fs4vyinv9zsalnv6rnn7d51y73dvq9x4iq0f8xjxbidgg6";
         };
         libName = "listener_library";
         dependencies = [
@@ -2394,8 +2394,8 @@ rec {
         workspace_member = null;
         src = pkgs.fetchgit {
           url = "https://github.com/LiGoldragon/meta-signal-listener";
-          rev = "e9d2730eb0aef21371a53516a8dca88a9988853c";
-          sha256 = "0rf46w5s6hxdrcm560v196197hyvrx27140mpw9mr7qrd1zjhba6";
+          rev = "95f5bb95dce3beff77464165b023966706cc7b38";
+          sha256 = "102cj1q5h436hlcir4jyb79snh84yd5iv9yyxibirdcj4jj996ss";
         };
         libName = "meta_signal_listener";
         dependencies = [
@@ -4019,8 +4019,8 @@ rec {
         workspace_member = null;
         src = pkgs.fetchgit {
           url = "https://github.com/LiGoldragon/signal-listener";
-          rev = "5052fd8f5d3c1609431dc75d6f85306a1c3a5e18";
-          sha256 = "1isr9k1z5npw7g3wxlbb3lmmyhwdb8cvfif8jj6drzmkl57n0w61";
+          rev = "df61083c75e7e622c29fe75290a9114ad29dfe03";
+          sha256 = "1pvga6x38cij66qv9aqr0b5q5wrj34ml82dvmzdiak6xdq3fmr73";
         };
         libName = "signal_listener";
         dependencies = [

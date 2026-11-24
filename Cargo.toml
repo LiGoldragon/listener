@@ -13,9 +13,9 @@ repository = "https://github.com/LiGoldragon/listener"
 publish = false
 
 [workspace.dependencies]
-listener-library = { git = "https://github.com/LiGoldragon/listener-library", rev = "5dbc60f59084a388bb0348d528b3da92bf53aedd", default-features = false }
-signal-listener = { git = "https://github.com/LiGoldragon/signal-listener", rev = "5052fd8f5d3c1609431dc75d6f85306a1c3a5e18", default-features = false }
-meta-signal-listener = { git = "https://github.com/LiGoldragon/meta-signal-listener", rev = "e9d2730eb0aef21371a53516a8dca88a9988853c", default-features = false }
+listener-library = { git = "https://github.com/LiGoldragon/listener-library", rev = "9233d4df04a95f0ddeadcea6133bc9593ff4b541", default-features = false }
+signal-listener = { git = "https://github.com/LiGoldragon/signal-listener", rev = "df61083c75e7e622c29fe75290a9114ad29dfe03", default-features = false }
+meta-signal-listener = { git = "https://github.com/LiGoldragon/meta-signal-listener", rev = "95f5bb95dce3beff77464165b023966706cc7b38", default-features = false }
 nexus = { git = "https://github.com/LiGoldragon/nexus", rev = "681a99ba307acd9cce6d5c120846072f1cedd814", default-features = false }
 translator = { git = "https://github.com/LiGoldragon/translator", rev = "cb4f6f4e5b3ef07f41d749e669dda58a6bcbf585", default-features = false }
 signal = { git = "https://github.com/LiGoldragon/signal", rev = "4f5cbb9", default-features = false }

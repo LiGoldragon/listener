@@ -613,7 +613,7 @@ dependencies = [
 [[package]]
 name = "listener-library"
 version = "0.1.0"
-source = "git+https://github.com/LiGoldragon/listener-library?rev=5dbc60f59084a388bb0348d528b3da92bf53aedd#5dbc60f59084a388bb0348d528b3da92bf53aedd"
+source = "git+https://github.com/LiGoldragon/listener-library?rev=9233d4df04a95f0ddeadcea6133bc9593ff4b541#9233d4df04a95f0ddeadcea6133bc9593ff4b541"
 dependencies = [
  "datom-codec",
  "ethos-zero 30.0.1",
@@ -721,7 +721,7 @@ dependencies = [
 [[package]]
 name = "meta-signal-listener"
 version = "1.0.0"
-source = "git+https://github.com/LiGoldragon/meta-signal-listener?rev=e9d2730eb0aef21371a53516a8dca88a9988853c#e9d2730eb0aef21371a53516a8dca88a9988853c"
+source = "git+https://github.com/LiGoldragon/meta-signal-listener?rev=95f5bb95dce3beff77464165b023966706cc7b38#95f5bb95dce3beff77464165b023966706cc7b38"
 dependencies = [
  "datom-codec",
  "ethos-zero 30.0.1",
@@ -1212,7 +1212,7 @@ dependencies = [
 [[package]]
 name = "signal-listener"
 version = "1.0.0"
-source = "git+https://github.com/LiGoldragon/signal-listener?rev=5052fd8f5d3c1609431dc75d6f85306a1c3a5e18#5052fd8f5d3c1609431dc75d6f85306a1c3a5e18"
+source = "git+https://github.com/LiGoldragon/signal-listener?rev=df61083c75e7e622c29fe75290a9114ad29dfe03#df61083c75e7e622c29fe75290a9114ad29dfe03"
 dependencies = [
  "datom-codec",
  "ethos-zero 30.0.1",

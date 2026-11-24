@@ -42,6 +42,17 @@ The secret program is called with the configured secret-entry name as its sole a
 
 OpenAI transcription posts multipart audio, model, language, prompt and `response_format=json` to `/v1/audio/transcriptions`, with bearer authentication. Gemini posts one user content with prompt and base64 inline `audio/ogg` to `/v1beta/models/<model>:generateContent`, with `x-goog-api-key`. The configured service address is the base, and language, instruction and terms shape the request. HTTPS is required outside literal loopback. Redirects are not followed.
 
+### OpenAI Realtime
+
+Configure a dedicated backend with the transcription-only WebSocket endpoint, its model and its credential entry. For example:
+
+```datom
+Configure.Backend.{ realtime OpenAiRealtimeTranscription «wss://api.openai.com/v1/realtime?intent=transcription» gpt-live-transcribe «openai/api-key» «» «» 60 }
+Configure.Order.[ realtime ]
+```
+
+After the second Toggle seals the recording, the Translator decodes the kept Ogg Opus file to 24 kHz mono signed 16-bit little-endian PCM. It opens one TLS transcription session, appends the audio, commits one input turn, and returns the final text for that turn exactly as received. This protocol sends no language, instruction or terms, and exposes no partial text. The timeout covers the credential read, connection, decode and transcription together. The default package ships the transport and its FFmpeg decoder alongside the Translator.
+
 ## Recovery
 
 Open repairs the tail of an interrupted Ogg recording through the last complete sound page and re-hears retained Recording and Transcribing jobs. Unfinished attempts may recur; a completed hearing commits its transcript and preceding failures together. A persisted outstanding delivery claim is atomically settled as Kept on open: the desktop effect may already have happened. It is never replayed automatically; Recall is explicit. When several jobs are already Waiting behind an occupied claim, they drain in recording order even under AsReady; AsReady can claim an idle handoff without waiting for an earlier transcription.

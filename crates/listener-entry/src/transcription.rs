@@ -87,6 +87,13 @@ pub trait Transcribing {
 }
 impl Transcribing for Transcribe_Data {
     async fn transcribe(self) -> Result<Heard, Failure> {
+        let protocol = match self.backend.protocol {
+            Protocol::OpenAiRealtimeTranscription => {
+                return self.realtime().await.map_err(Into::into);
+            }
+            Protocol::OpenAiTranscription => BatchProtocol::OpenAi,
+            Protocol::Gemini => BatchProtocol::Gemini,
+        };
         let duration = u64::try_from(self.backend.timeout.0.0)
             .ok()
             .filter(|seconds| *seconds > 0)
@@ -113,6 +120,7 @@ impl Transcribing for Transcribe_Data {
             );
         }
         let work = Exchange {
+            protocol,
             backend,
             key,
             prompt,
@@ -132,7 +140,63 @@ impl Transcribing for Transcribe_Data {
     }
 }
 
+trait RealtimeTranscribing {
+    async fn realtime(self) -> Result<Heard, BackendFailure>;
+}
+
+impl RealtimeTranscribing for Transcribe_Data {
+    async fn realtime(self) -> Result<Heard, BackendFailure> {
+        let helper = std::env::current_exe()
+            .map_err(|_| BackendFailure::Network)?
+            .with_file_name("listener-openai-realtime-transcription");
+        let result = Command::new(helper)
+            .args([
+                "--endpoint",
+                &self.backend.service_address.0,
+                "--model",
+                &self.backend.model_name.0,
+                "--secret-program",
+                &self.program.0,
+                "--secret-entry",
+                &self.backend.secret_entry.0,
+                "--timeout",
+                &self.backend.timeout.0.0.to_string(),
+                "--audio",
+            ])
+            .arg(self.audio_location.audio_path())
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|_| BackendFailure::Network)?;
+        if !result.status.success() {
+            return Err(BackendFailure::Network);
+        }
+        let value: Value =
+            serde_json::from_slice(&result.stdout).map_err(|_| BackendFailure::Malformed)?;
+        let text = value
+            .get("transcript")
+            .and_then(Value::as_str)
+            .ok_or(BackendFailure::Malformed)?;
+        let id = value
+            .get("item_id")
+            .and_then(Value::as_str)
+            .ok_or(BackendFailure::Malformed)?;
+        Ok(Heard {
+            text: Text(text.to_owned()),
+            provider_id_option: Some(ProviderId(id.to_owned())),
+        })
+    }
+}
+
+enum BatchProtocol {
+    OpenAi,
+    Gemini,
+}
+
 struct Exchange {
+    protocol: BatchProtocol,
     backend: Backend,
     key: Credential,
     prompt: String,
@@ -156,9 +220,9 @@ impl Exchanging for Exchange {
                 .proxy(None)
                 .build(),
         );
-        match self.backend.protocol {
-            Protocol::OpenAiTranscription => self.open_ai(&agent, &endpoint, &audio),
-            Protocol::Gemini => self.gemini(&agent, &endpoint, &audio),
+        match self.protocol {
+            BatchProtocol::OpenAi => self.open_ai(&agent, &endpoint, &audio),
+            BatchProtocol::Gemini => self.gemini(&agent, &endpoint, &audio),
         }
     }
     fn endpoint(&self) -> Result<String, BackendFailure> {
@@ -181,9 +245,9 @@ impl Exchanging for Exchange {
             return Err(BackendFailure::Address);
         }
         let base = base.trim_end_matches('/');
-        match self.backend.protocol {
-            Protocol::OpenAiTranscription => Ok(format!("{base}/v1/audio/transcriptions")),
-            Protocol::Gemini => {
+        match self.protocol {
+            BatchProtocol::OpenAi => Ok(format!("{base}/v1/audio/transcriptions")),
+            BatchProtocol::Gemini => {
                 let model = &self.backend.model_name.0;
                 if model.is_empty()
                     || !model
