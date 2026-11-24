@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 typedef struct {
@@ -362,6 +363,11 @@ int listener_recover_audio(int audio) {
             /* A job has one contiguous logical stream, written by this recorder. */
             if (page.header_len < 27 || (size_t)page.header_len > sizeof(header)) goto done;
             if ((page.header[5] & 4) != 0) {
+                off_t eos_end = offset + read_page;
+                struct stat status;
+                if (fstat(audio, &status) != 0
+                    || (status.st_size > eos_end && ftruncate(audio, eos_end) != 0)
+                    || fdatasync(audio) != 0) goto done;
                 result = LISTENER_STOPPED;
                 goto done;
             }
