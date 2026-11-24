@@ -6,7 +6,6 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "__final": true,
         "lastModified": 1795562753,
         "narHash": "sha256-L87sVTWw3ghvgx4DPNlx5cqP5fJUye4wCriAfbishZ0=",
         "owner": "LiGoldragon",
