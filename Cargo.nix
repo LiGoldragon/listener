@@ -428,16 +428,16 @@ rec {
         };
         resolvedDefaultFeatures = [ "datom" "default" ];
       };
-      "ethos-zero 30.0.1" = rec {
+      "ethos-zero 31.1.2" = rec {
         crateName = "ethos-zero";
-        version = "30.0.1";
+        version = "31.1.2";
         edition = "2024";
         crateBin = [];
         workspace_member = null;
         src = pkgs.fetchgit {
           url = "https://github.com/LiGoldragon/ethos-zero";
-          rev = "2999292dc67c8608e54d32c333c550b29153cbff";
-          sha256 = "0555dxgccwc5nmg6768846gc3k951426zhx4rq9vdgp0knb71j48";
+          rev = "9abd9fe56a2b1b84fb858ae4c8cb74435e063a04";
+          sha256 = "19zng1kmric7prrdnhq18jwy9bwkxhmy1pj4yrvvs88q5304y48";
         };
         libName = "ethos_zero";
         dependencies = [
@@ -786,7 +786,7 @@ rec {
         buildDependencies = [
           {
             name = "ethos-zero";
-            packageId = "ethos-zero 30.0.1";
+            packageId = "ethos-zero 31.1.2";
           }
         ];
         features = {
@@ -859,7 +859,7 @@ rec {
         buildDependencies = [
           {
             name = "ethos-zero";
-            packageId = "ethos-zero 30.0.1";
+            packageId = "ethos-zero 31.1.2";
           }
         ];
         features = {
@@ -908,7 +908,7 @@ rec {
         buildDependencies = [
           {
             name = "ethos-zero";
-            packageId = "ethos-zero 30.0.1";
+            packageId = "ethos-zero 31.1.2";
           }
         ];
         features = {
@@ -943,7 +943,7 @@ rec {
         buildDependencies = [
           {
             name = "ethos-zero";
-            packageId = "ethos-zero 30.0.1";
+            packageId = "ethos-zero 31.1.2";
           }
         ];
         features = {
@@ -1064,7 +1064,7 @@ rec {
         buildDependencies = [
           {
             name = "ethos-zero";
-            packageId = "ethos-zero 30.0.1";
+            packageId = "ethos-zero 31.1.2";
           }
         ];
         features = {
@@ -1736,7 +1736,7 @@ rec {
         buildDependencies = [
           {
             name = "ethos-zero";
-            packageId = "ethos-zero 30.0.1";
+            packageId = "ethos-zero 31.1.2";
           }
         ];
         features = {
