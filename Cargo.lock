@@ -109,8 +109,8 @@ dependencies = [
 
 [[package]]
 name = "ethos-zero"
-version = "30.0.1"
-source = "git+https://github.com/LiGoldragon/ethos-zero?rev=2999292dc67c8608e54d32c333c550b29153cbff#2999292dc67c8608e54d32c333c550b29153cbff"
+version = "31.1.2"
+source = "git+https://github.com/LiGoldragon/ethos-zero?rev=9abd9fe56a2b1b84fb858ae4c8cb74435e063a04#9abd9fe56a2b1b84fb858ae4c8cb74435e063a04"
 dependencies = [
  "datom-codec",
  "prettyplease",
@@ -221,7 +221,7 @@ name = "listener-emission"
 version = "0.1.0"
 dependencies = [
  "datom-codec",
- "ethos-zero 30.0.1",
+ "ethos-zero 31.1.2",
  "listener-library",
  "rkyv",
 ]
@@ -232,7 +232,7 @@ version = "0.1.0"
 source = "git+https://github.com/LiGoldragon/listener-library?rev=3549987a7fa5eaab826f21521d5d6a3a23a7d8d7#3549987a7fa5eaab826f21521d5d6a3a23a7d8d7"
 dependencies = [
  "datom-codec",
- "ethos-zero 30.0.1",
+ "ethos-zero 31.1.2",
  "futures-channel",
  "futures-util",
  "mio",
@@ -248,7 +248,7 @@ name = "listener-memory"
 version = "0.1.0"
 dependencies = [
  "datom-codec",
- "ethos-zero 30.0.1",
+ "ethos-zero 31.1.2",
  "listener-library",
  "memory",
  "meta-signal-listener",
@@ -261,7 +261,7 @@ name = "listener-recording"
 version = "0.1.0"
 dependencies = [
  "datom-codec",
- "ethos-zero 30.0.1",
+ "ethos-zero 31.1.2",
  "listener-library",
  "rkyv",
 ]
@@ -294,7 +294,7 @@ version = "1.0.0"
 source = "git+https://github.com/LiGoldragon/meta-signal-listener?rev=b85ed9632e1483234b56ece0c0e675cb69b7990e#b85ed9632e1483234b56ece0c0e675cb69b7990e"
 dependencies = [
  "datom-codec",
- "ethos-zero 30.0.1",
+ "ethos-zero 31.1.2",
  "listener-library",
  "rkyv",
  "signal",
@@ -508,7 +508,7 @@ version = "1.0.0"
 source = "git+https://github.com/LiGoldragon/signal-listener?rev=57f69f061b797bdbdcce3d831b9d3a85513b835f#57f69f061b797bdbdcce3d831b9d3a85513b835f"
 dependencies = [
  "datom-codec",
- "ethos-zero 30.0.1",
+ "ethos-zero 31.1.2",
  "listener-library",
  "rkyv",
  "signal",

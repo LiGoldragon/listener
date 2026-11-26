@@ -3,7 +3,7 @@ Emission
   :listener_library:Term :listener_library:Text :listener_library:ProviderId
   :listener_library:Failure :listener_library:Try :listener_library:JobId
   :listener_library:Interruption ]
-[ Transcribe.{ Program AudioLocation Backend Vector<Term> }
+[ Transcribe.{ Program AudioLocation Backend ⟦ Term ⟧ }
   Paste.{ Program Text } Copy.{ Program Text } Notify.Notice ]
 [ Transcription.[ Heard.{ Text Option<ProviderId> } Failure ]
   Pasting.[ Pasted Failure ] Copying.[ Copied Failure ]

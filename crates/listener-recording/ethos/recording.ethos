@@ -2,7 +2,7 @@ Library
 [ :listener_library:JobId :listener_library:Kilobits :listener_library:Source
   :listener_library:RecordingSettings :listener_library:AudioLocation ]
 [ Capture.{ Kilobits Source AudioLocation RecordingSettings } Stop.JobId
-  Erase.Vector<AudioLocation> Capturing.[ Begun NoMicrophone Unwritable ]
-  Stopped.{} Erased.Vector<AudioLocation> ]
+  Erase.⟦ AudioLocation ⟧ Capturing.[ Begun NoMicrophone Unwritable ]
+  Stopped.{} Erased.⟦ AudioLocation ⟧ ]
 []
 []

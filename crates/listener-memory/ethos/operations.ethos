@@ -8,16 +8,16 @@ Library
   :signal_listener:NoSuchJob :signal_listener:NoAudio ]
 [ Input.[ Turn.Options Drop Interrupt.JobId Requeue.JobId Tries.JobId
     Record.{ JobId Hearing } Finish.{ JobId Handing } Prune
-    Forget.Vector<AudioLocation> Last Find.JobId Pending Recollect Apply.Set Settings
+    Forget.⟦ AudioLocation ⟧ Last Find.JobId Pending Recollect Apply.Set Settings
     Import.{ Moment Text } Recover ]
   Output.[ Turning Dropping Interrupting Requeueing
-    Trial.{ Vector<Backend> Vector<Term> } Next Pruned.Vector<AudioLocation>
-    Forgotten Lasting Finding Standing.Vector<JobState> Recollected.Vector<Past>
+    Trial.{ ⟦ Backend ⟧ ⟦ Term ⟧ } Next Pruned.⟦ AudioLocation ⟧
+    Forgotten Lasting Finding Standing.⟦ JobState ⟧ Recollected.⟦ Past ⟧
     Applying Configuration Imported.JobId Recovered.Recovery ]
   Execution.{ Input Moment Option<JobId> }
-  Changes.{ Vector<JobState> Retired.Vector<JobId> Option<Set> }
+  Changes.{ ⟦ JobState ⟧ Retired.⟦ JobId ⟧ Option<Set> }
   Committed.{ Output Changes }
-  Recovery.{ Hear.Vector<JobId> Next }
+  Recovery.{ Hear.⟦ JobId ⟧ Next }
   Turning.[ Fresh.{ Kilobits Source AudioLocation RecordingSettings } Running.JobId NoBackend ]
   Dropping.[ Dropped.JobId NothingRecording ]
   Interrupting.[ Interrupted.JobId NothingRecording ]
